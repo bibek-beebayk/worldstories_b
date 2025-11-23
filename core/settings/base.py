@@ -28,7 +28,7 @@ INSTALLED_APPS = [
     "solo",
 
     "apps.users",
-    # "apps.config",
+    "apps.story",
     # "apps.vacancy",
     # "apps.blog"
 ]
