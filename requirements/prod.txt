@@ -1,0 +1,6 @@
+-r base.txt
+gunicorn
+sentry-sdk
+whitenoise
+django-storages
+boto3

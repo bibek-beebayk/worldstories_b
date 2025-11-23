@@ -1,0 +1,12 @@
+Django==5.0.8
+psycopg2-binary
+django-extensions
+djangorestframework
+djangorestframework-simplejwt
+django-versatileimagefield
+django-storages
+django-filter
+django-jazzmin
+django-ckeditor-5
+django-cors-headers
+django-solo
