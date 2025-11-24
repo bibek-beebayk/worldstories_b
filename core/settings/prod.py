@@ -6,18 +6,18 @@ SECRET_KEY = "django-insecure-mrk3h^2+7cas%6q$(6_gt!tixkx)=-)=m)l)id-c1qbm&r2df_
 
 DEBUG = False
 
-ALLOWED_HOSTS = ["*"]
+ALLOWED_HOSTS = ["worldstories-b-production.up.railway.app"]
 
 CSRF_TRUSTED_ORIGINS = [
-    "https://worldstories-b-production.up.railway.app",
+    "https://worldstories-b-production.up.railway.app", "https://worldstories-f-production.up.railway.app",
 ]
 
 CORS_ALLOWED_ORIGINS = [
-    "https://worldstories-b-production.up.railway.app",
+    "https://worldstories-b-production.up.railway.app", "https://worldstories-f-production.up.railway.app"
 ]
 
 CORS_ORIGIN_WHITELIST = [
-    "https://worldstories-b-production.up.railway.app",
+    "https://worldstories-b-production.up.railway.app", "https://worldstories-f-production.up.railway.app"
 ]
 
 MIDDLEWARE += [
