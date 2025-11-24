@@ -12,8 +12,8 @@ EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
 MEDIA_URL =  'media/'
 MEDIA_ROOT =  BASE_DIR / 'media'
 
-CSRF_TRUSTED_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173"]
-CORS_ALLOWED_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173"]
+CSRF_TRUSTED_ORIGINS = ["https://fetunnel.worldstories.net", "http://127.0.0.1:5173"]
+CORS_ALLOWED_ORIGINS = ["https://fetunnel.worldstories.net", "http://127.0.0.1:5173"]
 
 API_BASE = "http://localhost:8000/api/v1"
 

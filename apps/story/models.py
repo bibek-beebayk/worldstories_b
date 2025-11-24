@@ -1,9 +1,11 @@
 from django.db import models
+from django_ckeditor_5.fields import CKEditor5Field
 
 STORY_TYPE_CHOICES = [
     ("Short Story", "Short Story"),
     ("Novel", "Novel"),
     ("Poetry", "Poetry"),
+    ("Non Fiction", "Non Fiction"),
 ]
 
 # STORY_STATUS_CHOICES = [
@@ -41,7 +43,7 @@ class Story(models.Model):
     # content = models.TextField()
     slug = models.SlugField(max_length=256, unique=True)
     about = models.TextField(blank=True, null=True)
-    genres = models.ManyToManyField(Genre)
+    genres = models.ManyToManyField(Genre, related_name="stories")
     story_type = models.CharField(
         max_length=50, choices=STORY_TYPE_CHOICES, default="Short Story"
     )
@@ -50,15 +52,31 @@ class Story(models.Model):
     cover_image = models.URLField(blank=True, null=True)
     is_completed = models.BooleanField(default=False)
     tags = models.ManyToManyField(Tag, blank=True)
+    rating = models.FloatField(default=0.0)
+    views = models.PositiveIntegerField(default=0)
+
+    # def rating(self):
+    #     # reviews = self.reviews.all()
+    #     # if reviews.exists():
+    #     #     return sum(review.rating for review in reviews) / reviews.count()
+    #     return 4.7
+    
+    # def views(self):
+    #     return 1234
 
     def __str__(self):
         return self.title
+    
+    class Meta:
+        verbose_name = "Story"
+        verbose_name_plural = "Stories"
 
 
 class Chapter(models.Model):
     story = models.ForeignKey(Story, on_delete=models.CASCADE, related_name="chapters")
     title = models.CharField(max_length=256)
-    content = models.TextField()
+    slug = models.SlugField(max_length=256, null=True)
+    content = CKEditor5Field('Text', config_name='extends')
     order = models.PositiveIntegerField()
 
     class Meta:

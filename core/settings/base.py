@@ -23,7 +23,7 @@ INSTALLED_APPS = [
     # 'rest_framework.authtoken',
     # "versatileimagefield",
     "django_filters",
-    # "django_ckeditor_5",
+    "django_ckeditor_5",
     "corsheaders",
     "solo",
 
@@ -143,10 +143,10 @@ REST_FRAMEWORK = {
         # 'rest_framework.permissions.DjangoModelPermissionsOrAnonReadOnly',
         "rest_framework.permissions.AllowAny"
     ],
-    "DEFAULT_RENDERER_CLASSES": [
-        "core.libs.renderers.CustomRenderer",
-        # "rest_framework.renderers.BrowsableAPIRenderer"
-    ],
+    # "DEFAULT_RENDERER_CLASSES": [
+    #     # "core.libs.renderers.CustomRenderer",
+    #     "rest_framework.renderers.BrowsableAPIRenderer"
+    # ],
     "DEFAULT_AUTHENTICATION_CLASSES": [
         "rest_framework_simplejwt.authentication.JWTAuthentication",
         # "rest_framework.authentication.SessionAuthentication"
