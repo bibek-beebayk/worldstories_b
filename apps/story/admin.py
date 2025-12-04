@@ -1,5 +1,5 @@
 from django.contrib import admin
-from .models import Story, Genre, Tag, Author, Chapter
+from .models import Audio, Story, Genre, Tag, Author, Chapter
 
 
 class ChapterInline(admin.StackedInline):
@@ -7,10 +7,14 @@ class ChapterInline(admin.StackedInline):
     extra = 0
     prepopulated_fields = {"slug": ("title",)}
 
+class AudioInline(admin.StackedInline):
+    model = Audio
+    extra = 0
+
 
 @admin.register(Story)
 class StoryAdmin(admin.ModelAdmin):
-    inlines = [ChapterInline]
+    inlines = [ChapterInline, AudioInline]
     prepopulated_fields = {"slug": ("title",)}
 
 

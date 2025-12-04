@@ -34,6 +34,9 @@ class Author(models.Model):
     bio = models.TextField(blank=True, null=True)
     image = models.URLField(blank=True, null=True)
 
+    def stories_count(self):
+        return self.stories.count()
+
     def __str__(self):
         return self.name
 
@@ -47,7 +50,7 @@ class Story(models.Model):
     story_type = models.CharField(
         max_length=50, choices=STORY_TYPE_CHOICES, default="Short Story"
     )
-    author = models.ForeignKey(Author, on_delete=models.CASCADE, blank=True, null=True)
+    author = models.ForeignKey(Author, on_delete=models.CASCADE, blank=True, null=True, related_name="stories")
     published_date = models.DateField(blank=True, null=True)
     cover_image = models.URLField(blank=True, null=True)
     is_completed = models.BooleanField(default=False)
@@ -63,6 +66,11 @@ class Story(models.Model):
     
     # def views(self):
     #     return 1234
+
+    def has_audio(self):
+        # TODO
+        # return hasattr(self, 'audio')
+        return self.audios.exists()
 
     def __str__(self):
         return self.title
@@ -85,3 +93,19 @@ class Chapter(models.Model):
 
     def __str__(self):
         return f"{self.story.title} - Chapter {self.order}: {self.title}"
+    
+
+class Audio(models.Model):
+    story = models.ForeignKey(Story, on_delete=models.CASCADE, related_name="audios")
+    title = models.CharField(max_length=256)
+    slug = models.SlugField(max_length=256, null=True)
+    audio_file = models.FileField(upload_to='story_audios/')
+    uploaded_at = models.DateTimeField(auto_now_add=True)
+    order = models.PositiveIntegerField(default=1)
+
+    def __str__(self):
+        return f"Audio for {self.story.title} uploaded at {self.uploaded_at}"
+    
+    class Meta:
+        unique_together = ("story", "order")
+        ordering = ["order"]

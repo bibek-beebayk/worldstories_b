@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import Story, Genre, Chapter, Tag, Author
+from .models import Audio, Story, Genre, Chapter, Tag, Author
 
 
 class GenreSerializer(serializers.ModelSerializer):
@@ -16,7 +16,7 @@ class GenreSerializer(serializers.ModelSerializer):
 class AuthorSerializer(serializers.ModelSerializer):
     class Meta:
         model = Author
-        fields = ["id", "name", "bio", "image"]
+        fields = ["id", "name", "bio", "image", "stories_count"]
 
 
 class StoryListSerializer(serializers.ModelSerializer):
@@ -31,7 +31,14 @@ class StoryListSerializer(serializers.ModelSerializer):
             "cover_image",
             "rating",
             "views",
+            "has_audio"
         ]
+
+
+class ChapterListSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Chapter
+        fields = ["id", "title", "order", "slug"]
 
 
 class ChapterSerializer(serializers.ModelSerializer):
@@ -40,11 +47,24 @@ class ChapterSerializer(serializers.ModelSerializer):
         fields = ["id", "title", "order", "content", "slug"]
 
 
+class AudioSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Audio
+        fields = ["id", "title", "slug", "audio_file", "order"]
+
+
+class AudioListSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Audio
+        fields = ["id", "title", "slug", "order"]
+
+
 class StoryDetailSerializer(serializers.ModelSerializer):
     genres = GenreSerializer(many=True, read_only=True)
     author = AuthorSerializer(read_only=True)
     chapter_count = serializers.SerializerMethodField()
-    chapters = ChapterSerializer(many=True, read_only=True)
+    chapters = ChapterListSerializer(many=True, read_only=True)
+    audios = AudioSerializer(many=True, read_only=True)
 
     def get_chapter_count(self, obj):
         return obj.chapters.count()
@@ -67,4 +87,5 @@ class StoryDetailSerializer(serializers.ModelSerializer):
             "views",
             "chapter_count",
             "chapters",
+            "audios",
         ]
