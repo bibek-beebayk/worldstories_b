@@ -10,3 +10,5 @@ django-jazzmin
 django-ckeditor-5
 django-cors-headers
 django-solo
+google-auth
+requests

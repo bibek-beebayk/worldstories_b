@@ -29,7 +29,7 @@ INSTALLED_APPS = [
 
     "apps.users",
     "apps.story",
-    # "apps.vacancy",
+    "apps.stats",
     # "apps.blog"
 ]
 
@@ -168,6 +168,7 @@ SIMPLEJWT = {
 # USERNAME_FIELD = "email"
 # USE_OTP_VALIDATION = True
 # OTP_LENGTH = 4
+OTP_LENGTH = 4
 
 
 # Custom Response
