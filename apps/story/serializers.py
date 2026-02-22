@@ -20,6 +20,11 @@ class AuthorSerializer(serializers.ModelSerializer):
 
 
 class StoryListSerializer(serializers.ModelSerializer):
+    genres = serializers.SerializerMethodField()
+
+    def get_genres(self, obj):
+        return list(obj.genres.values_list("name", flat=True)[:2])
+
     class Meta:
         model = Story
         fields = [
@@ -31,7 +36,8 @@ class StoryListSerializer(serializers.ModelSerializer):
             "cover_image",
             "rating",
             "views",
-            "has_audio"
+            "has_audio",
+            "genres",
         ]
 
 
