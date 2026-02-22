@@ -7,6 +7,7 @@ from django.conf.urls.static import static
 from rest_framework.routers import DefaultRouter
 from rest_framework_simplejwt.views import TokenRefreshView
 from apps.story import api as story_api
+from apps.stats import views as stats_views
 from apps.users import api as users_api
 
 router = DefaultRouter()
@@ -24,6 +25,11 @@ urlpatterns = [
     path("api/originals/", story_api.OriginalsDataAPIView.as_view(), name="originals-data"),
     path("api/discover/", story_api.DiscoverDataAPIView.as_view(), name="discover-data"),
     path("api/search/", story_api.SearchStoryAPIView.as_view(), name="search-data"),
+    path(
+        "api/reading-progress/<slug:story_slug>/",
+        stats_views.ReadingProgressAPIView.as_view(),
+        name="reading-progress",
+    ),
     path("api/genres/", story_api.GenreListAPIView.as_view(), name="genre-list"),
     path("ckeditor5/", include("django_ckeditor_5.urls")),
 ] + static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)

@@ -42,3 +42,33 @@ class ReadingProgress(models.Model):
 
     def __str__(self):
         return f"{self.user} - {self.story} ({self.progress:.2%})"
+
+
+class ChapterReadingProgress(models.Model):
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="chapter_reading_progress",
+    )
+    story = models.ForeignKey(
+        Story,
+        on_delete=models.CASCADE,
+        related_name="chapter_reading_progress",
+    )
+    chapter = models.ForeignKey(
+        Chapter,
+        on_delete=models.CASCADE,
+        related_name="chapter_reading_progress",
+    )
+    progress = models.FloatField(default=0.0)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = ("user", "chapter")
+        indexes = [
+            models.Index(fields=["user", "story"]),
+            models.Index(fields=["user", "chapter"]),
+        ]
+
+    def __str__(self):
+        return f"{self.user} - {self.chapter} ({self.progress:.2%})"
