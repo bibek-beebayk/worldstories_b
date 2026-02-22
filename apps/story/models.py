@@ -1,5 +1,7 @@
 from django.db import models
 from django_ckeditor_5.fields import CKEditor5Field
+from django.core.validators import MinValueValidator, MaxValueValidator
+from django.conf import settings
 
 STORY_TYPE_CHOICES = [
     ("Short Story", "Short Story"),
@@ -109,3 +111,23 @@ class Audio(models.Model):
     class Meta:
         unique_together = ("story", "order")
         ordering = ["order"]
+
+
+class Review(models.Model):
+    story = models.ForeignKey(Story, on_delete=models.CASCADE, related_name="reviews")
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="story_reviews"
+    )
+    rating = models.PositiveSmallIntegerField(
+        validators=[MinValueValidator(1), MaxValueValidator(5)]
+    )
+    comment = models.TextField(blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = ("story", "user")
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"{self.story.title} review by {self.user}"

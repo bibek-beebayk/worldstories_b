@@ -23,6 +23,7 @@ urlpatterns = [
     path("api/trending/", story_api.TrendingDataAPIView.as_view(), name="trending-data"),
     path("api/originals/", story_api.OriginalsDataAPIView.as_view(), name="originals-data"),
     path("api/discover/", story_api.DiscoverDataAPIView.as_view(), name="discover-data"),
+    path("api/search/", story_api.SearchStoryAPIView.as_view(), name="search-data"),
     path("api/genres/", story_api.GenreListAPIView.as_view(), name="genre-list"),
     path("ckeditor5/", include("django_ckeditor_5.urls")),
 ] + static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
