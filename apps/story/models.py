@@ -131,3 +131,18 @@ class Review(models.Model):
 
     def __str__(self):
         return f"{self.story.title} review by {self.user}"
+
+
+class Favorite(models.Model):
+    story = models.ForeignKey(Story, on_delete=models.CASCADE, related_name="favorites")
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="story_favorites"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ("story", "user")
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"{self.user} favorited {self.story}"

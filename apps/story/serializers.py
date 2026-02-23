@@ -22,12 +22,23 @@ class AuthorSerializer(serializers.ModelSerializer):
 class StoryListSerializer(serializers.ModelSerializer):
     genres = serializers.SerializerMethodField()
     reviews_count = serializers.SerializerMethodField()
+    is_favorite = serializers.SerializerMethodField()
+    favorites_count = serializers.SerializerMethodField()
 
     def get_genres(self, obj):
         return list(obj.genres.values_list("name", flat=True)[:2])
     
     def get_reviews_count(self, obj):
         return obj.reviews.count()
+
+    def get_is_favorite(self, obj):
+        request = self.context.get("request")
+        if not request or not request.user or not request.user.is_authenticated:
+            return False
+        return obj.favorites.filter(user=request.user).exists()
+
+    def get_favorites_count(self, obj):
+        return obj.favorites.count()
 
     class Meta:
         model = Story
@@ -43,6 +54,8 @@ class StoryListSerializer(serializers.ModelSerializer):
             "has_audio",
             "genres",
             "reviews_count",
+            "is_favorite",
+            "favorites_count",
         ]
 
 
@@ -75,6 +88,8 @@ class StoryDetailSerializer(serializers.ModelSerializer):
     author = AuthorSerializer(read_only=True)
     chapter_count = serializers.SerializerMethodField()
     reviews_count = serializers.SerializerMethodField()
+    is_favorite = serializers.SerializerMethodField()
+    favorites_count = serializers.SerializerMethodField()
     chapters = ChapterListSerializer(many=True, read_only=True)
     audios = AudioSerializer(many=True, read_only=True)
 
@@ -83,6 +98,15 @@ class StoryDetailSerializer(serializers.ModelSerializer):
     
     def get_reviews_count(self, obj):
         return obj.reviews.count()
+
+    def get_is_favorite(self, obj):
+        request = self.context.get("request")
+        if not request or not request.user or not request.user.is_authenticated:
+            return False
+        return obj.favorites.filter(user=request.user).exists()
+
+    def get_favorites_count(self, obj):
+        return obj.favorites.count()
 
     class Meta:
         model = Story
@@ -101,6 +125,8 @@ class StoryDetailSerializer(serializers.ModelSerializer):
             "rating",
             "views",
             "reviews_count",
+            "is_favorite",
+            "favorites_count",
             "chapter_count",
             "chapters",
             "audios",

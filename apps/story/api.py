@@ -5,7 +5,7 @@ from django.db.models import Sum, Avg
 from django.db.models import Q
 
 from apps.story.filters import StoryFilter
-from .models import Genre, Story, Chapter, Audio, Author, Review
+from .models import Genre, Story, Chapter, Audio, Author, Review, Favorite
 from .serializers import (
     GenreSerializer,
     StoryListSerializer,
@@ -49,6 +49,15 @@ class StoryViewSet(ReadOnlyModelViewSet):
         if self.action == "retrieve":
             return StoryDetailSerializer
         return StoryListSerializer
+
+    def _favorite_payload(self, story, user):
+        is_favorite = False
+        if user and user.is_authenticated:
+            is_favorite = Favorite.objects.filter(story=story, user=user).exists()
+        return {
+            "is_favorite": is_favorite,
+            "favorites_count": story.favorites.count(),
+        }
 
     @action(detail=True, methods=["get"], url_path=r"chapters/(?P<chapter_slug>[^/.]+)")
     def chapter(self, request, slug=None, chapter_slug=None):
@@ -136,6 +145,23 @@ class StoryViewSet(ReadOnlyModelViewSet):
         review.delete()
         self._update_story_rating(story)
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @action(detail=True, methods=["post", "delete"], url_path="favorite")
+    def favorite(self, request, slug=None):
+        if not request.user.is_authenticated:
+            return Response(
+                {"detail": "Authentication credentials were not provided."},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+
+        story = self.get_object()
+
+        if request.method == "POST":
+            Favorite.objects.get_or_create(story=story, user=request.user)
+            return Response(self._favorite_payload(story, request.user), status=status.HTTP_200_OK)
+
+        Favorite.objects.filter(story=story, user=request.user).delete()
+        return Response(self._favorite_payload(story, request.user), status=status.HTTP_200_OK)
 
 
 class GenreListAPIView(APIView):
