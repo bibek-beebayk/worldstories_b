@@ -1,7 +1,7 @@
 from rest_framework import serializers
 
-from apps.story.models import Chapter
-from apps.stats.models import ReadingProgress
+from apps.story.models import Chapter, Audio
+from apps.stats.models import ReadingProgress, AudioReadingProgress
 
 
 class ChapterProgressSerializer(serializers.Serializer):
@@ -58,4 +58,70 @@ class ReadingProgressWriteSerializer(serializers.Serializer):
                     {"chapter_slug": "Invalid chapter for this story."}
                 )
         attrs["chapter"] = chapter
+        return attrs
+
+
+class AudioProgressSerializer(serializers.Serializer):
+    audio_slug = serializers.CharField()
+    progress = serializers.FloatField()
+    position_seconds = serializers.FloatField()
+    duration_seconds = serializers.FloatField()
+
+
+class AudioReadingProgressSerializer(serializers.ModelSerializer):
+    audio_slug = serializers.SerializerMethodField()
+    overall_progress = serializers.SerializerMethodField()
+    audio_progresses = serializers.SerializerMethodField()
+
+    class Meta:
+        model = AudioReadingProgress
+        fields = [
+            "audio_slug",
+            "progress",
+            "position_seconds",
+            "duration_seconds",
+            "overall_progress",
+            "audio_progresses",
+            "updated_at",
+        ]
+
+    def get_audio_slug(self, obj):
+        return obj.audio.slug if obj.audio else None
+
+    def get_overall_progress(self, obj):
+        return self.context.get("overall_progress", 0.0)
+
+    def get_audio_progresses(self, obj):
+        audio_progress_map = self.context.get("audio_progress_map", {})
+        return [
+            {
+                "audio_slug": audio_slug,
+                "progress": values["progress"],
+                "position_seconds": values["position_seconds"],
+                "duration_seconds": values["duration_seconds"],
+            }
+            for audio_slug, values in audio_progress_map.items()
+        ]
+
+
+class AudioReadingProgressWriteSerializer(serializers.Serializer):
+    audio_slug = serializers.CharField(required=False, allow_blank=True)
+    progress = serializers.FloatField(min_value=0.0, max_value=1.0)
+    position_seconds = serializers.FloatField(required=False, min_value=0.0, default=0.0)
+    duration_seconds = serializers.FloatField(required=False, min_value=0.0, default=0.0)
+
+    def validate_audio_slug(self, value):
+        return value.strip()
+
+    def validate(self, attrs):
+        story = self.context["story"]
+        audio_slug = attrs.get("audio_slug")
+        audio = None
+        if audio_slug:
+            audio = Audio.objects.filter(story=story, slug=audio_slug).first()
+            if not audio:
+                raise serializers.ValidationError(
+                    {"audio_slug": "Invalid audio for this story."}
+                )
+        attrs["audio"] = audio
         return attrs

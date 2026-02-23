@@ -30,6 +30,11 @@ urlpatterns = [
         stats_views.ReadingProgressAPIView.as_view(),
         name="reading-progress",
     ),
+    path(
+        "api/audio-progress/<slug:story_slug>/",
+        stats_views.AudioReadingProgressAPIView.as_view(),
+        name="audio-reading-progress",
+    ),
     path("api/genres/", story_api.GenreListAPIView.as_view(), name="genre-list"),
     path("ckeditor5/", include("django_ckeditor_5.urls")),
 ] + static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)

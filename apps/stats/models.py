@@ -1,7 +1,7 @@
 from django.conf import settings
 from django.db import models
 
-from apps.story.models import Story, Chapter
+from apps.story.models import Story, Chapter, Audio
 
 
 class ReadingProgress(models.Model):
@@ -72,3 +72,35 @@ class ChapterReadingProgress(models.Model):
 
     def __str__(self):
         return f"{self.user} - {self.chapter} ({self.progress:.2%})"
+
+
+class AudioReadingProgress(models.Model):
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="audio_reading_progress",
+    )
+    story = models.ForeignKey(
+        Story,
+        on_delete=models.CASCADE,
+        related_name="audio_reading_progress",
+    )
+    audio = models.ForeignKey(
+        Audio,
+        on_delete=models.CASCADE,
+        related_name="audio_reading_progress",
+    )
+    progress = models.FloatField(default=0.0)
+    position_seconds = models.FloatField(default=0.0)
+    duration_seconds = models.FloatField(default=0.0)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = ("user", "audio")
+        indexes = [
+            models.Index(fields=["user", "story"]),
+            models.Index(fields=["user", "audio"]),
+        ]
+
+    def __str__(self):
+        return f"{self.user} - {self.audio} ({self.progress:.2%})"
