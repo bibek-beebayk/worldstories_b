@@ -30,6 +30,9 @@ class User(AbstractBaseUser, PermissionsMixin):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     email = models.EmailField(_("email address"), unique=True)
     username = models.CharField(max_length=255, unique=True)
+    display_name = models.CharField(max_length=255, blank=True, null=True)
+    bio = models.TextField(blank=True, null=True)
+    avatar_url = models.URLField(blank=True, null=True)
 
     date_joined = models.DateTimeField(default=timezone.now)
     last_login = models.DateTimeField(null=True, blank=True)
@@ -77,7 +80,9 @@ class User(AbstractBaseUser, PermissionsMixin):
         res = {
             "otp_verified": self.otp_verified,
             "email": self.email,
-            "username": self.username
+            "username": self.username,
+            "display_name": self.display_name,
+            "avatar_url": self.avatar_url,
         }
         return res
 

@@ -2,6 +2,9 @@ from django.contrib.auth import authenticate
 from django.contrib.auth import get_user_model
 from rest_framework import serializers
 
+from apps.story.models import Favorite, Review
+from apps.story.serializers import StoryListSerializer
+
 
 User = get_user_model()
 
@@ -56,3 +59,85 @@ class OTPValidateSerializer(serializers.Serializer):
 
 class OTPResendSerializer(serializers.Serializer):
     email = serializers.EmailField()
+
+
+class UserProfileSerializer(serializers.ModelSerializer):
+    favorites_count = serializers.SerializerMethodField()
+    reviews_count = serializers.SerializerMethodField()
+    reading_in_progress_count = serializers.SerializerMethodField()
+    listening_in_progress_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = User
+        fields = [
+            "id",
+            "email",
+            "username",
+            "display_name",
+            "bio",
+            "avatar_url",
+            "date_joined",
+            "favorites_count",
+            "reviews_count",
+            "reading_in_progress_count",
+            "listening_in_progress_count",
+        ]
+
+    def get_favorites_count(self, obj):
+        return Favorite.objects.filter(user=obj).count()
+
+    def get_reviews_count(self, obj):
+        return Review.objects.filter(user=obj).count()
+
+    def get_reading_in_progress_count(self, obj):
+        return obj.reading_progress.filter(progress__gt=0, progress__lt=1).count()
+
+    def get_listening_in_progress_count(self, obj):
+        return obj.audio_reading_progress.filter(progress__gt=0, progress__lt=1).count()
+
+
+class UserProfileUpdateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = User
+        fields = ["username", "display_name", "bio", "avatar_url"]
+
+    def validate_username(self, value):
+        username = value.strip()
+        instance = self.instance
+        if User.objects.exclude(id=getattr(instance, "id", None)).filter(username=username).exists():
+            raise serializers.ValidationError("This username is already taken.")
+        return username
+
+
+class ContinueReadingItemSerializer(serializers.Serializer):
+    story = StoryListSerializer()
+    chapter_slug = serializers.CharField(allow_null=True)
+    chapter_title = serializers.CharField(allow_null=True)
+    chapter_progress = serializers.FloatField()
+    overall_progress = serializers.FloatField()
+    updated_at = serializers.DateTimeField()
+
+
+class ContinueListeningItemSerializer(serializers.Serializer):
+    story = StoryListSerializer()
+    audio_slug = serializers.CharField(allow_null=True)
+    audio_title = serializers.CharField(allow_null=True)
+    audio_progress = serializers.FloatField()
+    overall_progress = serializers.FloatField()
+    updated_at = serializers.DateTimeField()
+
+
+class FavoriteItemSerializer(serializers.ModelSerializer):
+    story = StoryListSerializer(read_only=True)
+
+    class Meta:
+        model = Favorite
+        fields = ["id", "story", "created_at"]
+
+
+class MyReviewItemSerializer(serializers.ModelSerializer):
+    story = StoryListSerializer(read_only=True)
+
+    class Meta:
+        model = Review
+        fields = ["id", "story", "rating", "comment", "created_at", "updated_at"]
