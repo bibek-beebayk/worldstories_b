@@ -152,7 +152,7 @@ REST_FRAMEWORK = {
         # "rest_framework.authentication.SessionAuthentication"
     ],
     "DEFAULT_PAGINATION_CLASS": "core.libs.pagination.PageNumberPagination",
-    "PAGE_SIZE": 10,
+    "PAGE_SIZE": 20,
 }
 
 SIMPLEJWT = {
@@ -169,6 +169,10 @@ SIMPLEJWT = {
 # USE_OTP_VALIDATION = True
 # OTP_LENGTH = 4
 OTP_LENGTH = 4
+
+# OAuth
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 
 
 # Custom Response

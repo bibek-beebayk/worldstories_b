@@ -8,6 +8,7 @@ from django.conf import settings
 from rest_framework import status
 from django.core.mail import send_mail
 from django.db import transaction
+import os
 from .models import OTP
 from apps.story.models import Favorite, Review
 from apps.story.serializers import StoryListSerializer
@@ -221,9 +222,14 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
     @action(detail=False, methods=["post"], url_path="google-login")
     def google_login(self, request):
         token = request.data.get("token")
+        google_client_id = getattr(settings, "GOOGLE_CLIENT_ID", "") or os.environ.get(
+            "GOOGLE_CLIENT_ID", ""
+        )
 
         if not token:
             return Response({"error": "Token missing"}, status=400)
+        if not google_client_id:
+            return Response({"error": "Google OAuth is not configured."}, status=500)
 
         try:
             from google.oauth2 import id_token
@@ -231,7 +237,7 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
 
             # Verify token
             idinfo = id_token.verify_oauth2_token(
-                token, google_requests.Request(), settings.GOOGLE_CLIENT_ID
+                token, google_requests.Request(), google_client_id
             )
 
             email = idinfo["email"]
