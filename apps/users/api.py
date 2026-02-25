@@ -8,11 +8,7 @@ from django.conf import settings
 from rest_framework import status
 from django.core.mail import send_mail
 from django.db import transaction
-from smtplib import SMTPException
 import logging
-import socket
-import time
-import hmac
 import os
 from .models import OTP
 from apps.story.models import Favorite, Review
@@ -30,7 +26,6 @@ from .serializers import (
     FavoriteItemSerializer,
     MyReviewItemSerializer,
 )
-from rest_framework.views import APIView
 
 
 User = get_user_model()
@@ -50,72 +45,6 @@ def build_unique_username(base_value: str) -> str:
         username = f"{base_username}{suffix}"
         suffix += 1
     return username
-
-
-def collect_smtp_diagnostics(extra_ports=None):
-    host = getattr(settings, "EMAIL_HOST", "")
-    configured_port = int(getattr(settings, "EMAIL_PORT", 0) or 0)
-    email_timeout = int(getattr(settings, "EMAIL_TIMEOUT", 20) or 20)
-    ports_to_check = [configured_port]
-    for port in (extra_ports or []):
-        if port and port not in ports_to_check:
-            ports_to_check.append(port)
-
-    result = {
-        "email_backend": getattr(settings, "EMAIL_BACKEND", ""),
-        "email_host": host,
-        "email_port": configured_port,
-        "email_use_tls": getattr(settings, "EMAIL_USE_TLS", ""),
-        "email_use_ssl": getattr(settings, "EMAIL_USE_SSL", ""),
-        "email_timeout": email_timeout,
-        "default_from_email": getattr(settings, "DEFAULT_FROM_EMAIL", ""),
-        "smtp_user_configured": bool(getattr(settings, "EMAIL_HOST_USER", "")),
-        "smtp_password_configured": bool(getattr(settings, "EMAIL_HOST_PASSWORD", "")),
-        "dns_lookup": "",
-        "ports": {},
-    }
-
-    if not host:
-        result["dns_lookup"] = "skipped (missing host)"
-        return result
-
-    try:
-        resolved = socket.getaddrinfo(host, configured_port or 0, type=socket.SOCK_STREAM)
-        result["dns_lookup"] = f"ok ({len(resolved)} records)"
-    except OSError as exc:
-        result["dns_lookup"] = f"failed: {exc}"
-        for port in ports_to_check:
-            result["ports"][str(port)] = "skipped (dns failed)"
-        return result
-
-    for port in ports_to_check:
-        if not port:
-            continue
-        started = time.monotonic()
-        try:
-            with socket.create_connection((host, int(port)), timeout=10):
-                elapsed_ms = int((time.monotonic() - started) * 1000)
-                result["ports"][str(port)] = f"ok ({elapsed_ms}ms)"
-        except OSError as exc:
-            elapsed_ms = int((time.monotonic() - started) * 1000)
-            result["ports"][str(port)] = f"failed after {elapsed_ms}ms: {exc}"
-    return result
-
-
-def can_use_email_test_endpoint(request):
-    if settings.DEBUG:
-        return True
-
-    user = getattr(request, "user", None)
-    if user and user.is_authenticated and user.is_staff:
-        return True
-
-    configured_key = str(getattr(settings, "EMAIL_TEST_API_KEY", "") or "").strip()
-    provided_key = str(request.headers.get("X-Email-Test-Key", "") or "").strip()
-
-    if configured_key and provided_key and hmac.compare_digest(configured_key, provided_key):
-        return True
-    return False
 
 
 class AuthenticationViewSet(viewsets.GenericViewSet):
@@ -165,157 +94,30 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
 
     @action(detail=False, methods=["post"])
     def register(self, request):
-        serializer = RegisterSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        email = serializer.validated_data["email"].lower()
-        password = serializer.validated_data["password"]
-
-        with transaction.atomic():
-            user = User.objects.filter(email=email).first()
-
-            if user and user.otp_verified:
-                return Response(
-                    {"message": "A user with this email already exists."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-
-            if not user:
-                user = serializer.create({"email": email, "password": password})
-            else:
-                user.set_password(password)
-                user.save(update_fields=["password"])
-
-            OTP.objects.filter(
-                user=user, otp_type="Registration", is_used=False
-            ).update(is_used=True)
-            otp = OTP.create(user.id, "Registration")
-
-        try:
-            self._send_registration_otp(user.email, otp.otp)
-        except Exception:
-            logger.exception(
-                "OTP email send failed",
-                extra={
-                    "recipient": user.email,
-                    "email_backend": getattr(settings, "EMAIL_BACKEND", ""),
-                    "email_host": getattr(settings, "EMAIL_HOST", ""),
-                    "email_port": getattr(settings, "EMAIL_PORT", ""),
-                },
-            )
-            return Response(
-                {"message": "Could not send OTP email. Please try again."},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
-
         return Response(
-            {
-                "otp_required": True,
-                "email": user.email,
-                "message": "OTP sent to your email.",
-            },
-            status=status.HTTP_201_CREATED,
+            {"message": "Email/password registration is disabled. Use Google login."},
+            status=status.HTTP_410_GONE,
         )
 
     @action(detail=False, methods=["post"], url_path="validate-otp")
     def validate_otp(self, request):
-        serializer = OTPValidateSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-
-        email = serializer.validated_data["email"].lower()
-        otp_input = serializer.validated_data["otp"]
-
-        user = User.objects.filter(email=email).first()
-        if not user:
-            return Response(
-                {"message": "User not found."}, status=status.HTTP_404_NOT_FOUND
-            )
-
-        otp_obj = OTP.objects.filter(
-            user=user, otp_type="Registration", otp=otp_input, is_used=False
-        ).first()
-        if not otp_obj:
-            return Response(
-                {"message": "Invalid OTP."}, status=status.HTTP_400_BAD_REQUEST
-            )
-
-        if otp_obj.is_expired:
-            otp_obj.is_used = True
-            otp_obj.save(update_fields=["is_used"])
-            return Response(
-                {"message": "OTP expired. Please request a new one."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        otp_obj.is_used = True
-        otp_obj.save(update_fields=["is_used"])
-        user.otp_verified = True
-        user.save(update_fields=["otp_verified"])
-
-        tokens = get_tokens(user)
         return Response(
-            {
-                **tokens,
-                "user": {
-                    "id": user.id,
-                    "email": user.email,
-                    "username": user.username,
-                },
-            }
+            {"message": "OTP verification is disabled. Use Google login."},
+            status=status.HTTP_410_GONE,
         )
 
     @action(detail=False, methods=["post"], url_path="resend-otp")
     def resend_otp(self, request):
-        serializer = OTPResendSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        email = serializer.validated_data["email"].lower()
-
-        user = User.objects.filter(email=email).first()
-        if not user:
-            return Response(
-                {"message": "User not found."}, status=status.HTTP_404_NOT_FOUND
-            )
-
-        if user.otp_verified:
-            return Response(
-                {"message": "User is already verified."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        OTP.objects.filter(user=user, otp_type="Registration", is_used=False).update(
-            is_used=True
+        return Response(
+            {"message": "OTP resend is disabled. Use Google login."},
+            status=status.HTTP_410_GONE,
         )
-        otp = OTP.create(user.id, "Registration")
-
-        try:
-            self._send_registration_otp(user.email, otp.otp)
-        except Exception:
-            return Response(
-                {"message": "Could not send OTP email. Please try again."},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
-
-        return Response({"message": "OTP resent successfully."})
 
     @action(detail=False, methods=["post"])
     def login(self, request):
-        serializer = LoginSerializer(data=request.data, context={"request": request})
-        serializer.is_valid(raise_exception=True)
-        user = serializer.validated_data["user"]
-        if not user.otp_verified:
-            return Response(
-                {"message": "Please verify your email with OTP before logging in."},
-                status=status.HTTP_403_FORBIDDEN,
-            )
-        tokens = get_tokens(user)
         return Response(
-            {
-                **tokens,
-                "user": {
-                    "id": user.id,
-                    "email": user.email,
-                    "username": user.username,
-                },
-            }
+            {"message": "Email/password login is disabled. Use Google login."},
+            status=status.HTTP_410_GONE,
         )
 
     @action(detail=False, methods=["post"], url_path="google-login")
@@ -567,91 +369,3 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
             return self.get_paginated_response(serializer.data)
         serializer = MyReviewItemSerializer(queryset, many=True, context={"request": request})
         return Response(serializer.data)
-
-
-class TestEmailAPIView(APIView):
-    permission_classes = [AllowAny]
-
-    def post(self, request):
-        if not can_use_email_test_endpoint(request):
-            return Response(
-                {
-                    "message": "Not allowed.",
-                    "hint": "Use staff authentication or provide valid X-Email-Test-Key in production.",
-                },
-                status=status.HTTP_403_FORBIDDEN,
-            )
-
-        recipient = (request.data.get("to") or "").strip()
-        subject = (request.data.get("subject") or "").strip() or "WorldStories Test Email"
-        message = (request.data.get("message") or "").strip() or "Test email from WorldStories."
-
-        if not recipient:
-            return Response(
-                {"message": "'to' email is required."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        diagnostics = collect_smtp_diagnostics()
-        logger.info(
-            "Test email requested",
-            extra={"recipient": recipient, **diagnostics},
-        )
-
-        try:
-            send_mail(
-                subject=subject,
-                message=message,
-                from_email=getattr(
-                    settings,
-                    "DEFAULT_FROM_EMAIL",
-                    getattr(settings, "EMAIL_HOST_USER", None),
-                ),
-                recipient_list=[recipient],
-                fail_silently=False,
-            )
-            logger.info(
-                "Test email sent successfully",
-                extra={"recipient": recipient, **diagnostics},
-            )
-        except (OSError, SMTPException) as exc:
-            logger.exception(
-                "Test email send failed",
-                extra={"recipient": recipient, **diagnostics},
-            )
-            return Response(
-                {
-                    "message": "SMTP connection failed.",
-                    "detail": str(exc),
-                    "email_host": getattr(settings, "EMAIL_HOST", ""),
-                    "email_port": getattr(settings, "EMAIL_PORT", ""),
-                    "diagnostics": diagnostics,
-                    "hint": "Server cannot reach SMTP host/port. Check network egress/firewall and SMTP host/port.",
-                },
-                status=status.HTTP_502_BAD_GATEWAY,
-        )
-        return Response({"message": f"Email sent to {recipient}."}, status=status.HTTP_200_OK)
-
-
-class TestEmailConfigAPIView(APIView):
-    permission_classes = [AllowAny]
-
-    def get(self, request):
-        if not can_use_email_test_endpoint(request):
-            return Response(
-                {
-                    "message": "Not allowed.",
-                    "hint": "Use staff authentication or provide valid X-Email-Test-Key in production.",
-                },
-                status=status.HTTP_403_FORBIDDEN,
-            )
-
-        diagnostics = collect_smtp_diagnostics(extra_ports=[587, 465])
-        logger.info("SMTP self-check requested", extra=diagnostics)
-        return Response(
-            {
-                "message": "SMTP diagnostics generated.",
-                "diagnostics": diagnostics,
-            },
-            status=status.HTTP_200_OK,
-        )
