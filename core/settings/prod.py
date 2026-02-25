@@ -70,5 +70,13 @@ AWS_QUERYSTRING_AUTH = False
 AWS_S3_FILE_OVERWRITE = False
 
 R2_PUBLIC_BASE_URL = os.environ.get("R2_PUBLIC_BASE_URL", "").rstrip("/")
-if R2_PUBLIC_BASE_URL:
+AWS_S3_CUSTOM_DOMAIN = os.environ.get("AWS_S3_CUSTOM_DOMAIN", "")
+if not AWS_S3_CUSTOM_DOMAIN and R2_PUBLIC_BASE_URL:
+    AWS_S3_CUSTOM_DOMAIN = (
+        R2_PUBLIC_BASE_URL.replace("https://", "").replace("http://", "").strip("/")
+    )
+if AWS_S3_CUSTOM_DOMAIN:
+    AWS_S3_URL_PROTOCOL = "https:"
+    MEDIA_URL = f"{AWS_S3_URL_PROTOCOL}//{AWS_S3_CUSTOM_DOMAIN}/"
+elif R2_PUBLIC_BASE_URL:
     MEDIA_URL = f"{R2_PUBLIC_BASE_URL}/"
