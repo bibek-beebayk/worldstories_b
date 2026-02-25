@@ -94,6 +94,8 @@ class AudioListSerializer(serializers.ModelSerializer):
 
 class StoryDetailSerializer(serializers.ModelSerializer):
     cover_image = serializers.SerializerMethodField()
+    pdf_file = serializers.SerializerMethodField()
+    epub_file = serializers.SerializerMethodField()
     genres = GenreSerializer(many=True, read_only=True)
     author = AuthorSerializer(read_only=True)
     chapter_count = serializers.SerializerMethodField()
@@ -126,6 +128,22 @@ class StoryDetailSerializer(serializers.ModelSerializer):
             return obj.cover_image_file.url
         return obj.cover_image or ""
 
+    def get_pdf_file(self, obj):
+        if not obj.pdf_file:
+            return None
+        request = self.context.get("request")
+        if request:
+            return request.build_absolute_uri(obj.pdf_file.url)
+        return obj.pdf_file.url
+
+    def get_epub_file(self, obj):
+        if not obj.epub_file:
+            return None
+        request = self.context.get("request")
+        if request:
+            return request.build_absolute_uri(obj.epub_file.url)
+        return obj.epub_file.url
+
     class Meta:
         model = Story
         fields = [
@@ -138,6 +156,8 @@ class StoryDetailSerializer(serializers.ModelSerializer):
             "author",
             "published_date",
             "cover_image",
+            "pdf_file",
+            "epub_file",
             "is_completed",
             "tags",
             "rating",
@@ -196,6 +216,7 @@ class SubmissionSerializer(serializers.ModelSerializer):
             "cover_image_file",
             "notes",
             "pdf_file",
+            "epub_file",
             "status",
             "reviewer_notes",
             "published_story",
@@ -227,6 +248,11 @@ class SubmissionSerializer(serializers.ModelSerializer):
     def validate_pdf_file(self, value):
         if value and not value.name.lower().endswith(".pdf"):
             raise serializers.ValidationError("Only PDF files are allowed.")
+        return value
+
+    def validate_epub_file(self, value):
+        if value and not value.name.lower().endswith(".epub"):
+            raise serializers.ValidationError("Only EPUB files are allowed.")
         return value
 
     def create(self, validated_data):

@@ -35,6 +35,8 @@ def _publish_submission(submission: Submission, reviewer) -> Story:
         published_date=timezone.now().date(),
         cover_image=submission.cover_image or None,
         cover_image_file=submission.cover_image_file,
+        pdf_file=submission.pdf_file,
+        epub_file=submission.epub_file,
         is_completed=False,
     )
     story.genres.set(submission.genres.all())
@@ -67,6 +69,45 @@ def _publish_submission(submission: Submission, reviewer) -> Story:
 class StoryAdmin(admin.ModelAdmin):
     inlines = [ChapterInline, AudioInline]
     prepopulated_fields = {"slug": ("title",)}
+    list_display = (
+        "title",
+        "story_type",
+        "author",
+        "is_completed",
+        "rating",
+        "views",
+        "published_date",
+        "chapters_count",
+        "audios_count",
+    )
+    search_fields = (
+        "title",
+        "slug",
+        "about",
+        "author__name",
+        "genres__name",
+        "tags__name",
+    )
+    list_filter = (
+        "story_type",
+        "is_completed",
+        "published_date",
+        "genres",
+        "tags",
+    )
+    ordering = ("-published_date", "-id")
+    date_hierarchy = "published_date"
+    list_select_related = ("author",)
+    filter_horizontal = ("genres", "tags")
+    autocomplete_fields = ("author",)
+
+    @admin.display(description="Chapters")
+    def chapters_count(self, obj):
+        return obj.chapters.count()
+
+    @admin.display(description="Audios")
+    def audios_count(self, obj):
+        return obj.audios.count()
 
 
 @admin.register(Genre)
@@ -81,7 +122,7 @@ class TagAdmin(admin.ModelAdmin):
 
 @admin.register(Author)
 class AuthorAdmin(admin.ModelAdmin):
-    pass
+    search_fields = ("name", "bio")
 
 
 @admin.register(Chapter)

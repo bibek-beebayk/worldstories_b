@@ -3,6 +3,7 @@ from rest_framework.views import APIView
 from rest_framework.generics import ListAPIView
 from django.db.models import Sum, Avg
 from django.db.models import Q
+from django.http import FileResponse
 from rest_framework.parsers import FormParser, MultiPartParser, JSONParser
 
 from apps.story.filters import StoryFilter
@@ -165,6 +166,14 @@ class StoryViewSet(ReadOnlyModelViewSet):
 
         Favorite.objects.filter(story=story, user=request.user).delete()
         return Response(self._favorite_payload(story, request.user), status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["get"], url_path="pdf-stream")
+    def pdf_stream(self, request, slug=None):
+        story = self.get_object()
+        if not story.pdf_file:
+            return Response({"detail": "PDF file not available."}, status=status.HTTP_404_NOT_FOUND)
+        file_obj = story.pdf_file.open("rb")
+        return FileResponse(file_obj, content_type="application/pdf")
 
 
 class SubmissionViewSet(ModelViewSet):

@@ -62,6 +62,8 @@ class Story(models.Model):
     published_date = models.DateField(blank=True, null=True)
     cover_image = models.URLField(blank=True, null=True)
     cover_image_file = models.ImageField(upload_to="story_covers/", blank=True, null=True)
+    pdf_file = models.FileField(upload_to="story_files/pdfs/", blank=True, null=True)
+    epub_file = models.FileField(upload_to="story_files/epubs/", blank=True, null=True)
     is_completed = models.BooleanField(default=False)
     tags = models.ManyToManyField(Tag, blank=True)
     rating = models.FloatField(default=0.0)
@@ -172,6 +174,7 @@ class Submission(models.Model):
     )
     notes = models.TextField(blank=True, null=True)
     pdf_file = models.FileField(upload_to="submission_pdfs/", blank=True, null=True)
+    epub_file = models.FileField(upload_to="submission_epubs/", blank=True, null=True)
     status = models.CharField(
         max_length=20, choices=SUBMISSION_STATUS_CHOICES, default="pending"
     )
