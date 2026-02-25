@@ -26,6 +26,7 @@ INSTALLED_APPS = [
     "django_ckeditor_5",
     "corsheaders",
     "solo",
+    "storages",
 
     "apps.users",
     "apps.story",
