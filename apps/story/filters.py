@@ -1,10 +1,12 @@
 from django_filters import rest_framework as filters
+from django.db.models import Q
 from .models import Story
 
 class StoryFilter(filters.FilterSet):
     status = filters.CharFilter(method="filter_status", label="Status")
     genres = filters.CharFilter(method="filter_genres", label="Genres")
     sort = filters.CharFilter(method="filter_sort", label="Sort")
+    q = filters.CharFilter(method="filter_q", label="Query")
 
     def filter_status(self, queryset, name, value):
         if value.lower() == "completed":
@@ -29,6 +31,18 @@ class StoryFilter(filters.FilterSet):
             return queryset.order_by("-views")
         return queryset
 
+    def filter_q(self, queryset, name, value):
+        query = (value or "").strip()
+        if not query:
+            return queryset
+        return queryset.filter(
+            Q(title__icontains=query)
+            | Q(about__icontains=query)
+            | Q(author__name__icontains=query)
+            | Q(genres__name__icontains=query)
+            | Q(tags__name__icontains=query)
+        ).distinct()
+
     class Meta:
         model = Story
-        fields = ["status", "genres"]
+        fields = ["status", "genres", "sort", "q"]
