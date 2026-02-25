@@ -10,6 +10,12 @@ STORY_TYPE_CHOICES = [
     ("Non Fiction", "Non Fiction"),
 ]
 
+SUBMISSION_STATUS_CHOICES = [
+    ("pending", "Pending"),
+    ("approved", "Approved"),
+    ("rejected", "Rejected"),
+]
+
 # STORY_STATUS_CHOICES = [
 #     ("Draft", "Draft"),
 #     ("Published", "Published"),
@@ -55,6 +61,7 @@ class Story(models.Model):
     author = models.ForeignKey(Author, on_delete=models.CASCADE, blank=True, null=True, related_name="stories")
     published_date = models.DateField(blank=True, null=True)
     cover_image = models.URLField(blank=True, null=True)
+    cover_image_file = models.ImageField(upload_to="story_covers/", blank=True, null=True)
     is_completed = models.BooleanField(default=False)
     tags = models.ManyToManyField(Tag, blank=True)
     rating = models.FloatField(default=0.0)
@@ -146,3 +153,49 @@ class Favorite(models.Model):
 
     def __str__(self):
         return f"{self.user} favorited {self.story}"
+
+
+class Submission(models.Model):
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="story_submissions"
+    )
+    title = models.CharField(max_length=256)
+    about = models.TextField()
+    content = models.TextField()
+    story_type = models.CharField(
+        max_length=50, choices=STORY_TYPE_CHOICES, default="Short Story"
+    )
+    genres = models.ManyToManyField(Genre, related_name="submissions")
+    cover_image = models.URLField(blank=True, null=True)
+    cover_image_file = models.ImageField(
+        upload_to="submission_covers/", blank=True, null=True
+    )
+    notes = models.TextField(blank=True, null=True)
+    pdf_file = models.FileField(upload_to="submission_pdfs/", blank=True, null=True)
+    status = models.CharField(
+        max_length=20, choices=SUBMISSION_STATUS_CHOICES, default="pending"
+    )
+    reviewer_notes = models.TextField(blank=True, null=True)
+    reviewed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        blank=True,
+        null=True,
+        related_name="reviewed_submissions",
+    )
+    published_story = models.OneToOneField(
+        "Story",
+        on_delete=models.SET_NULL,
+        blank=True,
+        null=True,
+        related_name="submission",
+    )
+    reviewed_at = models.DateTimeField(blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"{self.title} ({self.status})"

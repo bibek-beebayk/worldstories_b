@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import Audio, Story, Genre, Chapter, Tag, Author, Review
+from .models import Audio, Story, Genre, Chapter, Tag, Author, Review, Submission
 
 
 class GenreSerializer(serializers.ModelSerializer):
@@ -24,6 +24,7 @@ class StoryListSerializer(serializers.ModelSerializer):
     reviews_count = serializers.SerializerMethodField()
     is_favorite = serializers.SerializerMethodField()
     favorites_count = serializers.SerializerMethodField()
+    cover_image = serializers.SerializerMethodField()
 
     def get_genres(self, obj):
         return list(obj.genres.values_list("name", flat=True)[:2])
@@ -39,6 +40,14 @@ class StoryListSerializer(serializers.ModelSerializer):
 
     def get_favorites_count(self, obj):
         return obj.favorites.count()
+
+    def get_cover_image(self, obj):
+        if obj.cover_image_file:
+            request = self.context.get("request")
+            if request:
+                return request.build_absolute_uri(obj.cover_image_file.url)
+            return obj.cover_image_file.url
+        return obj.cover_image or ""
 
     class Meta:
         model = Story
@@ -84,6 +93,7 @@ class AudioListSerializer(serializers.ModelSerializer):
 
 
 class StoryDetailSerializer(serializers.ModelSerializer):
+    cover_image = serializers.SerializerMethodField()
     genres = GenreSerializer(many=True, read_only=True)
     author = AuthorSerializer(read_only=True)
     chapter_count = serializers.SerializerMethodField()
@@ -107,6 +117,14 @@ class StoryDetailSerializer(serializers.ModelSerializer):
 
     def get_favorites_count(self, obj):
         return obj.favorites.count()
+
+    def get_cover_image(self, obj):
+        if obj.cover_image_file:
+            request = self.context.get("request")
+            if request:
+                return request.build_absolute_uri(obj.cover_image_file.url)
+            return obj.cover_image_file.url
+        return obj.cover_image or ""
 
     class Meta:
         model = Story
@@ -154,3 +172,92 @@ class ReviewWriteSerializer(serializers.ModelSerializer):
     class Meta:
         model = Review
         fields = ["rating", "comment"]
+
+
+class SubmissionSerializer(serializers.ModelSerializer):
+    user_email = serializers.EmailField(source="user.email", read_only=True)
+    genres = serializers.PrimaryKeyRelatedField(
+        queryset=Genre.objects.all(), many=True
+    )
+    cover_image = serializers.CharField(
+        required=False, allow_blank=True, allow_null=True
+    )
+
+    class Meta:
+        model = Submission
+        fields = [
+            "id",
+            "title",
+            "about",
+            "content",
+            "story_type",
+            "genres",
+            "cover_image",
+            "cover_image_file",
+            "notes",
+            "pdf_file",
+            "status",
+            "reviewer_notes",
+            "published_story",
+            "created_at",
+            "updated_at",
+            "user_email",
+        ]
+        read_only_fields = [
+            "status",
+            "reviewer_notes",
+            "published_story",
+            "created_at",
+            "updated_at",
+            "user_email",
+        ]
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        if instance.cover_image_file:
+            request = self.context.get("request")
+            if request:
+                data["cover_image"] = request.build_absolute_uri(instance.cover_image_file.url)
+            else:
+                data["cover_image"] = instance.cover_image_file.url
+        else:
+            data["cover_image"] = instance.cover_image or ""
+        return data
+
+    def validate_pdf_file(self, value):
+        if value and not value.name.lower().endswith(".pdf"):
+            raise serializers.ValidationError("Only PDF files are allowed.")
+        return value
+
+    def create(self, validated_data):
+        genres = validated_data.pop("genres", [])
+        submission = Submission.objects.create(user=self.context["request"].user, **validated_data)
+        submission.genres.set(genres)
+        return submission
+
+
+class SubmissionListSerializer(serializers.ModelSerializer):
+    genres = GenreSerializer(many=True, read_only=True)
+    cover_image = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Submission
+        fields = [
+            "id",
+            "title",
+            "story_type",
+            "genres",
+            "cover_image",
+            "status",
+            "published_story",
+            "created_at",
+            "updated_at",
+        ]
+
+    def get_cover_image(self, obj):
+        if obj.cover_image_file:
+            request = self.context.get("request")
+            if request:
+                return request.build_absolute_uri(obj.cover_image_file.url)
+            return obj.cover_image_file.url
+        return obj.cover_image or ""

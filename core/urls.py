@@ -13,6 +13,7 @@ from apps.users import api as users_api
 router = DefaultRouter()
 
 router.register("stories", story_api.StoryViewSet, basename="story")
+router.register("submissions", story_api.SubmissionViewSet, basename="submission")
 router.register("auth", users_api.AuthenticationViewSet, basename="auth")
 
 urlpatterns = [

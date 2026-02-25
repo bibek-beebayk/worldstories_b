@@ -1,11 +1,12 @@
-from rest_framework.viewsets import ReadOnlyModelViewSet
+from rest_framework.viewsets import ReadOnlyModelViewSet, ModelViewSet
 from rest_framework.views import APIView
 from rest_framework.generics import ListAPIView
 from django.db.models import Sum, Avg
 from django.db.models import Q
+from rest_framework.parsers import FormParser, MultiPartParser, JSONParser
 
 from apps.story.filters import StoryFilter
-from .models import Genre, Story, Chapter, Audio, Author, Review, Favorite
+from .models import Genre, Story, Chapter, Audio, Author, Review, Favorite, Submission
 from .serializers import (
     GenreSerializer,
     StoryListSerializer,
@@ -14,6 +15,8 @@ from .serializers import (
     AudioSerializer,
     ReviewSerializer,
     ReviewWriteSerializer,
+    SubmissionSerializer,
+    SubmissionListSerializer,
 )
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -164,6 +167,23 @@ class StoryViewSet(ReadOnlyModelViewSet):
         return Response(self._favorite_payload(story, request.user), status=status.HTTP_200_OK)
 
 
+class SubmissionViewSet(ModelViewSet):
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
+    permission_classes = [IsAuthenticated]
+    http_method_names = ["get", "post", "head", "options"]
+
+    def get_queryset(self):
+        queryset = Submission.objects.select_related("user").prefetch_related("genres")
+        if self.request.user.is_staff:
+            return queryset
+        return queryset.filter(user=self.request.user)
+
+    def get_serializer_class(self):
+        if self.action == "list":
+            return SubmissionListSerializer
+        return SubmissionSerializer
+
+
 class GenreListAPIView(APIView):
     def get(self, request):
         genres = Genre.objects.all()
@@ -191,19 +211,33 @@ class HomeDataAPIView(APIView):
         return Response(
             {
                 "featured_story": (
-                    StoryListSerializer(featured_story).data if featured_story else None
+                    StoryListSerializer(featured_story, context={"request": request}).data
+                    if featured_story
+                    else None
                 ),
-                "weekly_spotlight": StoryListSerializer(weekly_spotlight, many=True).data,
-                "new_trending": StoryListSerializer(new_trending, many=True).data,
+                "weekly_spotlight": StoryListSerializer(
+                    weekly_spotlight, many=True, context={"request": request}
+                ).data,
+                "new_trending": StoryListSerializer(
+                    new_trending, many=True, context={"request": request}
+                ).data,
                 "tabs": {
-                    "recommended": StoryListSerializer(recommended, many=True).data,
-                    "popular": StoryListSerializer(popular, many=True).data,
-                    "originals": StoryListSerializer(originals, many=True).data,
-                    "new": StoryListSerializer(new_releases, many=True).data,
+                    "recommended": StoryListSerializer(
+                        recommended, many=True, context={"request": request}
+                    ).data,
+                    "popular": StoryListSerializer(
+                        popular, many=True, context={"request": request}
+                    ).data,
+                    "originals": StoryListSerializer(
+                        originals, many=True, context={"request": request}
+                    ).data,
+                    "new": StoryListSerializer(
+                        new_releases, many=True, context={"request": request}
+                    ).data,
                 },
                 "sidebar": {
                     "recommended": StoryListSerializer(
-                        sidebar_recommended, many=True
+                        sidebar_recommended, many=True, context={"request": request}
                     ).data,
                     "stats": {
                         "creators": Author.objects.count(),
@@ -221,17 +255,24 @@ class TrendingDataAPIView(APIView):
         return Response(
             {
                 "today": StoryListSerializer(
-                    base_qs.order_by("-views", "-id")[:10], many=True
+                    base_qs.order_by("-views", "-id")[:10],
+                    many=True,
+                    context={"request": request},
                 ).data,
                 "week": StoryListSerializer(
-                    base_qs.order_by("-views", "-rating", "-id")[:10], many=True
+                    base_qs.order_by("-views", "-rating", "-id")[:10],
+                    many=True,
+                    context={"request": request},
                 ).data,
                 "month": StoryListSerializer(
-                    base_qs.order_by("-rating", "-views", "-id")[:10], many=True
+                    base_qs.order_by("-rating", "-views", "-id")[:10],
+                    many=True,
+                    context={"request": request},
                 ).data,
                 "alltime": StoryListSerializer(
                     base_qs.order_by("-views", "-rating", "-published_date")[:10],
                     many=True,
+                    context={"request": request},
                 ).data,
             }
         )
@@ -243,7 +284,9 @@ class OriginalsDataAPIView(APIView):
         return Response(
             {
                 "stories": StoryListSerializer(
-                    base_qs.order_by("-id", "-rating")[:20], many=True
+                    base_qs.order_by("-id", "-rating")[:20],
+                    many=True,
+                    context={"request": request},
                 ).data
             }
         )
@@ -257,10 +300,14 @@ class DiscoverDataAPIView(APIView):
             {
                 "genres": GenreSerializer(genres, many=True).data,
                 "new_releases": StoryListSerializer(
-                    base_qs.order_by("-published_date", "-id")[:20], many=True
+                    base_qs.order_by("-published_date", "-id")[:20],
+                    many=True,
+                    context={"request": request},
                 ).data,
                 "hidden_gems": StoryListSerializer(
-                    base_qs.order_by("-rating", "views", "-id")[:20], many=True
+                    base_qs.order_by("-rating", "views", "-id")[:20],
+                    many=True,
+                    context={"request": request},
                 ).data,
             }
         )
