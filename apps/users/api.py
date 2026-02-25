@@ -12,6 +12,7 @@ from smtplib import SMTPException
 import logging
 import socket
 import time
+import hmac
 import os
 from .models import OTP
 from apps.story.models import Favorite, Review
@@ -99,6 +100,22 @@ def collect_smtp_diagnostics(extra_ports=None):
             elapsed_ms = int((time.monotonic() - started) * 1000)
             result["ports"][str(port)] = f"failed after {elapsed_ms}ms: {exc}"
     return result
+
+
+def can_use_email_test_endpoint(request):
+    if settings.DEBUG:
+        return True
+
+    user = getattr(request, "user", None)
+    if user and user.is_authenticated and user.is_staff:
+        return True
+
+    configured_key = str(getattr(settings, "EMAIL_TEST_API_KEY", "") or "").strip()
+    provided_key = str(request.headers.get("X-Email-Test-Key", "") or "").strip()
+
+    if configured_key and provided_key and hmac.compare_digest(configured_key, provided_key):
+        return True
+    return False
 
 
 class AuthenticationViewSet(viewsets.GenericViewSet):
@@ -556,11 +573,12 @@ class TestEmailAPIView(APIView):
     permission_classes = [AllowAny]
 
     def post(self, request):
-        if not settings.DEBUG and not (
-            request.user and request.user.is_authenticated and request.user.is_staff
-        ):
+        if not can_use_email_test_endpoint(request):
             return Response(
-                {"message": "Not allowed."},
+                {
+                    "message": "Not allowed.",
+                    "hint": "Use staff authentication or provide valid X-Email-Test-Key in production.",
+                },
                 status=status.HTTP_403_FORBIDDEN,
             )
 
@@ -619,11 +637,12 @@ class TestEmailConfigAPIView(APIView):
     permission_classes = [AllowAny]
 
     def get(self, request):
-        if not settings.DEBUG and not (
-            request.user and request.user.is_authenticated and request.user.is_staff
-        ):
+        if not can_use_email_test_endpoint(request):
             return Response(
-                {"message": "Not allowed."},
+                {
+                    "message": "Not allowed.",
+                    "hint": "Use staff authentication or provide valid X-Email-Test-Key in production.",
+                },
                 status=status.HTTP_403_FORBIDDEN,
             )
 
