@@ -175,19 +175,22 @@ OTP_LENGTH = 4
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 
+# Email (Google Workspace / SMTP)
+EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
+EMAIL_HOST = "smtp.gmail.com"
+EMAIL_PORT = "587"
+EMAIL_HOST_USER = os.environ.get("EMAIL_HOST_USER", "worldstoriesnet@gmail.com")
+EMAIL_HOST_PASSWORD = os.environ.get("EMAIL_HOST_PASSWORD", "ljqzkewjziblhahr")
+EMAIL_USE_TLS = True
+EMAIL_TIMEOUT = int(os.environ.get("EMAIL_TIMEOUT", "20"))
+DEFAULT_FROM_EMAIL = EMAIL_HOST_USER
+
+# SERVER_EMAIL = os.environ.get("SERVER_EMAIL", DEFAULT_FROM_EMAIL)
+
 
 # Custom Response
 ALLOW_NULL_VALUES_IN_RESPONSE = True
 
-# # SMTP email configuration
-# EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
-# EMAIL_HOST = site_settings.EMAIL_HOST
-# EMAIL_PORT = site_settings.EMAIL_PORT
-# EMAIL_HOST_USER = site_settings.EMAIL_HOST_USER
-# EMAIL_HOST_PASSWORD = site_settings.EMAIL_HOST_PASSWORD
-# EMAIL_USE_TLS = True
-
-# VALIDATE_OTP = site_settings.USE_OTP_VALIDATION
 
 customColorPalette = [
     {"color": "hsl(4, 90%, 58%)", "label": "Red"},

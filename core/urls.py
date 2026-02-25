@@ -25,6 +25,8 @@ urlpatterns = [
     path("api/originals/", story_api.OriginalsDataAPIView.as_view(), name="originals-data"),
     path("api/discover/", story_api.DiscoverDataAPIView.as_view(), name="discover-data"),
     path("api/search/", story_api.SearchStoryAPIView.as_view(), name="search-data"),
+    path("api/test-email/", users_api.TestEmailAPIView.as_view(), name="test-email"),
+    path("api/test-email/config/", users_api.TestEmailConfigAPIView.as_view(), name="test-email-config"),
     path(
         "api/reading-progress/<slug:story_slug>/",
         stats_views.ReadingProgressAPIView.as_view(),

@@ -8,6 +8,10 @@ from django.conf import settings
 from rest_framework import status
 from django.core.mail import send_mail
 from django.db import transaction
+from smtplib import SMTPException
+import logging
+import socket
+import time
 import os
 from .models import OTP
 from apps.story.models import Favorite, Review
@@ -25,9 +29,11 @@ from .serializers import (
     FavoriteItemSerializer,
     MyReviewItemSerializer,
 )
+from rest_framework.views import APIView
 
 
 User = get_user_model()
+logger = logging.getLogger(__name__)
 
 
 def get_tokens(user):
@@ -43,6 +49,56 @@ def build_unique_username(base_value: str) -> str:
         username = f"{base_username}{suffix}"
         suffix += 1
     return username
+
+
+def collect_smtp_diagnostics(extra_ports=None):
+    host = getattr(settings, "EMAIL_HOST", "")
+    configured_port = int(getattr(settings, "EMAIL_PORT", 0) or 0)
+    email_timeout = int(getattr(settings, "EMAIL_TIMEOUT", 20) or 20)
+    ports_to_check = [configured_port]
+    for port in (extra_ports or []):
+        if port and port not in ports_to_check:
+            ports_to_check.append(port)
+
+    result = {
+        "email_backend": getattr(settings, "EMAIL_BACKEND", ""),
+        "email_host": host,
+        "email_port": configured_port,
+        "email_use_tls": getattr(settings, "EMAIL_USE_TLS", ""),
+        "email_use_ssl": getattr(settings, "EMAIL_USE_SSL", ""),
+        "email_timeout": email_timeout,
+        "default_from_email": getattr(settings, "DEFAULT_FROM_EMAIL", ""),
+        "smtp_user_configured": bool(getattr(settings, "EMAIL_HOST_USER", "")),
+        "smtp_password_configured": bool(getattr(settings, "EMAIL_HOST_PASSWORD", "")),
+        "dns_lookup": "",
+        "ports": {},
+    }
+
+    if not host:
+        result["dns_lookup"] = "skipped (missing host)"
+        return result
+
+    try:
+        resolved = socket.getaddrinfo(host, configured_port or 0, type=socket.SOCK_STREAM)
+        result["dns_lookup"] = f"ok ({len(resolved)} records)"
+    except OSError as exc:
+        result["dns_lookup"] = f"failed: {exc}"
+        for port in ports_to_check:
+            result["ports"][str(port)] = "skipped (dns failed)"
+        return result
+
+    for port in ports_to_check:
+        if not port:
+            continue
+        started = time.monotonic()
+        try:
+            with socket.create_connection((host, int(port)), timeout=10):
+                elapsed_ms = int((time.monotonic() - started) * 1000)
+                result["ports"][str(port)] = f"ok ({elapsed_ms}ms)"
+        except OSError as exc:
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            result["ports"][str(port)] = f"failed after {elapsed_ms}ms: {exc}"
+    return result
 
 
 class AuthenticationViewSet(viewsets.GenericViewSet):
@@ -65,13 +121,30 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
         return super().get_permissions()
 
     def _send_registration_otp(self, email: str, code: int):
+        logger.info(
+            "Sending registration OTP email",
+            extra={
+                "recipient": email,
+                "email_backend": getattr(settings, "EMAIL_BACKEND", ""),
+                "email_host": getattr(settings, "EMAIL_HOST", ""),
+                "email_port": getattr(settings, "EMAIL_PORT", ""),
+                "email_use_tls": getattr(settings, "EMAIL_USE_TLS", ""),
+                "email_use_ssl": getattr(settings, "EMAIL_USE_SSL", ""),
+                "default_from_email": getattr(settings, "DEFAULT_FROM_EMAIL", ""),
+            },
+        )
         send_mail(
             subject="WorldStories OTP Verification",
             message=f"Your OTP code is {code}. It expires in 10 minutes.",
-            from_email=getattr(settings, "EMAIL_HOST_USER", None),
+            from_email=getattr(
+                settings,
+                "DEFAULT_FROM_EMAIL",
+                getattr(settings, "EMAIL_HOST_USER", None),
+            ),
             recipient_list=[email],
             fail_silently=False,
         )
+
 
     @action(detail=False, methods=["post"])
     def register(self, request):
@@ -103,6 +176,15 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
         try:
             self._send_registration_otp(user.email, otp.otp)
         except Exception:
+            logger.exception(
+                "OTP email send failed",
+                extra={
+                    "recipient": user.email,
+                    "email_backend": getattr(settings, "EMAIL_BACKEND", ""),
+                    "email_host": getattr(settings, "EMAIL_HOST", ""),
+                    "email_port": getattr(settings, "EMAIL_PORT", ""),
+                },
+            )
             return Response(
                 {"message": "Could not send OTP email. Please try again."},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -468,3 +550,89 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
             return self.get_paginated_response(serializer.data)
         serializer = MyReviewItemSerializer(queryset, many=True, context={"request": request})
         return Response(serializer.data)
+
+
+class TestEmailAPIView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        if not settings.DEBUG and not (
+            request.user and request.user.is_authenticated and request.user.is_staff
+        ):
+            return Response(
+                {"message": "Not allowed."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        recipient = (request.data.get("to") or "").strip()
+        subject = (request.data.get("subject") or "").strip() or "WorldStories Test Email"
+        message = (request.data.get("message") or "").strip() or "Test email from WorldStories."
+
+        if not recipient:
+            return Response(
+                {"message": "'to' email is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        diagnostics = collect_smtp_diagnostics()
+        logger.info(
+            "Test email requested",
+            extra={"recipient": recipient, **diagnostics},
+        )
+
+        try:
+            send_mail(
+                subject=subject,
+                message=message,
+                from_email=getattr(
+                    settings,
+                    "DEFAULT_FROM_EMAIL",
+                    getattr(settings, "EMAIL_HOST_USER", None),
+                ),
+                recipient_list=[recipient],
+                fail_silently=False,
+            )
+            logger.info(
+                "Test email sent successfully",
+                extra={"recipient": recipient, **diagnostics},
+            )
+        except (OSError, SMTPException) as exc:
+            logger.exception(
+                "Test email send failed",
+                extra={"recipient": recipient, **diagnostics},
+            )
+            return Response(
+                {
+                    "message": "SMTP connection failed.",
+                    "detail": str(exc),
+                    "email_host": getattr(settings, "EMAIL_HOST", ""),
+                    "email_port": getattr(settings, "EMAIL_PORT", ""),
+                    "diagnostics": diagnostics,
+                    "hint": "Server cannot reach SMTP host/port. Check network egress/firewall and SMTP host/port.",
+                },
+                status=status.HTTP_502_BAD_GATEWAY,
+        )
+        return Response({"message": f"Email sent to {recipient}."}, status=status.HTTP_200_OK)
+
+
+class TestEmailConfigAPIView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        if not settings.DEBUG and not (
+            request.user and request.user.is_authenticated and request.user.is_staff
+        ):
+            return Response(
+                {"message": "Not allowed."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        diagnostics = collect_smtp_diagnostics(extra_ports=[587, 465])
+        logger.info("SMTP self-check requested", extra=diagnostics)
+        return Response(
+            {
+                "message": "SMTP diagnostics generated.",
+                "diagnostics": diagnostics,
+            },
+            status=status.HTTP_200_OK,
+        )
