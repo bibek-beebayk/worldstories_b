@@ -1,0 +1,164 @@
+{% extends "admin/change_form.html" %}
+
+{% block extrahead %}
+  {{ block.super }}
+  <style>
+    .chapter-modal-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(15, 23, 42, 0.55);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 9999;
+      padding: 20px;
+    }
+
+    .chapter-modal-overlay.is-open {
+      display: flex;
+    }
+
+    .chapter-modal {
+      width: min(1000px, 96vw);
+      height: min(90vh, 860px);
+      background: #fff;
+      border-radius: 10px;
+      box-shadow: 0 16px 60px rgba(0, 0, 0, 0.35);
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .chapter-modal__header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 14px;
+      border-bottom: 1px solid #e5e7eb;
+    }
+
+    .chapter-modal__title {
+      font-size: 14px;
+      font-weight: 700;
+      color: #111827;
+      margin: 0;
+    }
+
+    .chapter-modal__actions {
+      display: flex;
+      gap: 8px;
+    }
+
+    .chapter-modal__body {
+      flex: 1;
+      min-height: 0;
+    }
+
+    .chapter-modal__iframe {
+      width: 100%;
+      height: 100%;
+      border: 0;
+      background: #f8fafc;
+    }
+
+    .chapter-modal__btn {
+      border: 1px solid #d1d5db;
+      background: #ffffff;
+      color: #111827;
+      border-radius: 6px;
+      padding: 6px 10px;
+      font-size: 12px;
+      line-height: 1;
+      cursor: pointer;
+    }
+
+    .chapter-modal__btn:hover {
+      background: #f9fafb;
+    }
+
+    .chapter-modal__btn--primary {
+      border-color: #2563eb;
+      background: #2563eb;
+      color: #fff;
+    }
+
+    .chapter-modal__btn--primary:hover {
+      background: #1d4ed8;
+    }
+  </style>
+{% endblock %}
+
+{% block admin_change_form_document_ready %}
+  {{ block.super }}
+  <script>
+    (function () {
+      const chapterGroup =
+        document.getElementById("chapters-group") ||
+        document.getElementById("chapter_set-group") ||
+        document.querySelector('.inline-group[id$="chapters-group"]') ||
+        document.querySelector('.inline-group[id$="chapter_set-group"]');
+      if (!chapterGroup) return;
+
+      const addLink =
+        chapterGroup.querySelector(".add-row a") ||
+        chapterGroup.querySelector("a.addlink");
+      if (!addLink) return;
+
+      const path = window.location.pathname;
+      const match = path.match(/\/(\d+)\/change\/?$/);
+      const storyId = match ? match[1] : null;
+
+      if (!storyId) {
+        return;
+      }
+
+      const overlay = document.createElement("div");
+      overlay.className = "chapter-modal-overlay";
+      overlay.innerHTML = `
+        <div class="chapter-modal" role="dialog" aria-modal="true" aria-label="Add chapter">
+          <div class="chapter-modal__header">
+            <p class="chapter-modal__title">Add New Chapter</p>
+            <div class="chapter-modal__actions">
+              <button type="button" class="chapter-modal__btn chapter-modal__btn--primary" data-action="refresh">Refresh Story</button>
+              <button type="button" class="chapter-modal__btn" data-action="close">Close</button>
+            </div>
+          </div>
+          <div class="chapter-modal__body">
+            <iframe class="chapter-modal__iframe" title="Add chapter form"></iframe>
+          </div>
+        </div>
+      `;
+      document.body.appendChild(overlay);
+
+      const iframe = overlay.querySelector("iframe");
+      const closeBtn = overlay.querySelector('[data-action="close"]');
+      const refreshBtn = overlay.querySelector('[data-action="refresh"]');
+
+      const closeModal = () => {
+        overlay.classList.remove("is-open");
+        iframe.setAttribute("src", "about:blank");
+      };
+
+      addLink.addEventListener("click", function (event) {
+        event.preventDefault();
+        const addUrl = `${window.location.origin}/admin/story/chapter/add/?story=${storyId}`;
+        iframe.setAttribute("src", addUrl);
+        overlay.classList.add("is-open");
+      });
+
+      closeBtn.addEventListener("click", closeModal);
+      refreshBtn.addEventListener("click", () => window.location.reload());
+      overlay.addEventListener("click", (event) => {
+        if (event.target === overlay) {
+          closeModal();
+        }
+      });
+
+      document.addEventListener("keydown", (event) => {
+        if (event.key === "Escape" && overlay.classList.contains("is-open")) {
+          closeModal();
+        }
+      });
+    })();
+  </script>
+{% endblock %}

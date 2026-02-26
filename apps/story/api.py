@@ -1,15 +1,23 @@
 from rest_framework.viewsets import ReadOnlyModelViewSet, ModelViewSet
 from rest_framework.views import APIView
 from rest_framework.generics import ListAPIView
-from django.db.models import Sum, Avg
+from django.db.models import Sum, Avg, Count
 from django.db.models import Q
 from django.http import FileResponse
+from django.db import transaction
+from django.utils.text import slugify
 from rest_framework.parsers import FormParser, MultiPartParser, JSONParser
+from rest_framework.permissions import BasePermission
+from rest_framework.filters import SearchFilter
 
 from apps.story.filters import StoryFilter
+from apps.stats.models import ReadingProgress, AudioReadingProgress
+from apps.users.models import User
 from .models import Genre, Story, Chapter, Audio, Author, Review, Favorite, Submission
 from .serializers import (
     GenreSerializer,
+    AdminGenreSerializer,
+    AdminAuthorSerializer,
     StoryListSerializer,
     StoryDetailSerializer,
     ChapterSerializer,
@@ -18,16 +26,26 @@ from .serializers import (
     ReviewWriteSerializer,
     SubmissionSerializer,
     SubmissionListSerializer,
+    StoryAdminSerializer,
+    ChapterAdminSerializer,
+    AudioAdminSerializer,
+    SubmissionAdminSerializer,
 )
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework.permissions import IsAuthenticated
 from rest_framework import status
+from rest_framework.exceptions import ValidationError
+
+
+class IsSuperUser(BasePermission):
+    def has_permission(self, request, view):
+        return bool(request.user and request.user.is_authenticated and request.user.is_superuser)
 
 
 class StoryViewSet(ReadOnlyModelViewSet):
-    queryset = Story.objects.all().order_by("-id")
+    queryset = Story.objects.filter(is_published=True).order_by("-id")
     lookup_field = "slug"
     filter_backends = [DjangoFilterBackend]
     filterset_class = StoryFilter
@@ -179,7 +197,7 @@ class StoryViewSet(ReadOnlyModelViewSet):
 class SubmissionViewSet(ModelViewSet):
     parser_classes = [MultiPartParser, FormParser, JSONParser]
     permission_classes = [IsAuthenticated]
-    http_method_names = ["get", "post", "head", "options"]
+    http_method_names = ["get", "post", "patch", "delete", "head", "options"]
 
     def get_queryset(self):
         queryset = Submission.objects.select_related("user").prefetch_related("genres")
@@ -192,6 +210,159 @@ class SubmissionViewSet(ModelViewSet):
             return SubmissionListSerializer
         return SubmissionSerializer
 
+    def partial_update(self, request, *args, **kwargs):
+        submission = self.get_object()
+        if request.user.is_staff:
+            return super().partial_update(request, *args, **kwargs)
+        if submission.status != "requires_edit":
+            return Response(
+                {"detail": "Only submissions marked Requires Edit can be edited."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        serializer = self.get_serializer(submission, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save(
+            status="pending",
+            reviewer_notes=None,
+            reviewed_by=None,
+            reviewed_at=None,
+        )
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    def destroy(self, request, *args, **kwargs):
+        submission = self.get_object()
+        if submission.status == "approved" and not request.user.is_staff:
+            return Response(
+                {"detail": "Approved submissions cannot be deleted."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        return super().destroy(request, *args, **kwargs)
+
+
+class StoryAdminViewSet(ModelViewSet):
+    queryset = Story.objects.select_related("author", "submitted_by", "submission").all().order_by("-id")
+    serializer_class = StoryAdminSerializer
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
+    permission_classes = [IsSuperUser]
+    filter_backends = [SearchFilter]
+    search_fields = ["title", "slug", "about"]
+
+
+class ChapterAdminViewSet(ModelViewSet):
+    queryset = Chapter.objects.select_related("story").all().order_by("story_id", "order")
+    serializer_class = ChapterAdminSerializer
+    permission_classes = [IsSuperUser]
+    filter_backends = [SearchFilter]
+    search_fields = ["title", "slug", "story__title"]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        story_id = self.request.query_params.get("story")
+        if story_id:
+            queryset = queryset.filter(story_id=story_id).order_by("order", "id")
+        return queryset
+
+
+class AudioAdminViewSet(ModelViewSet):
+    queryset = Audio.objects.select_related("story").all().order_by("story_id", "order")
+    serializer_class = AudioAdminSerializer
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
+    permission_classes = [IsSuperUser]
+    filter_backends = [SearchFilter]
+    search_fields = ["title", "slug", "story__title"]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        story_id = self.request.query_params.get("story")
+        if story_id:
+            queryset = queryset.filter(story_id=story_id).order_by("order", "id")
+        return queryset
+
+
+class SubmissionAdminViewSet(ModelViewSet):
+    queryset = (
+        Submission.objects.select_related("user", "reviewed_by", "published_story")
+        .prefetch_related("genres")
+        .order_by("-created_at")
+    )
+    serializer_class = SubmissionAdminSerializer
+    permission_classes = [IsSuperUser]
+    http_method_names = ["get", "patch", "head", "options"]
+    filter_backends = [SearchFilter]
+    search_fields = ["title", "user__email", "status"]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        status_filter = self.request.query_params.get("status")
+        if status_filter and status_filter in {"pending", "requires_edit", "approved", "rejected"}:
+            queryset = queryset.filter(status=status_filter)
+        return queryset
+
+    def perform_update(self, serializer):
+        save_kwargs = {}
+        next_status = serializer.validated_data.get("status")
+        next_notes = serializer.validated_data.get("reviewer_notes")
+        if next_status == "requires_edit" and not (next_notes and str(next_notes).strip()):
+            raise ValidationError({"reviewer_notes": "Reviewer notes are required when requesting edits."})
+        if "status" in serializer.validated_data:
+            from django.utils import timezone
+
+            save_kwargs["reviewed_by"] = self.request.user
+            save_kwargs["reviewed_at"] = timezone.now()
+        with transaction.atomic():
+            submission = serializer.save(**save_kwargs)
+            if next_status == "approved":
+                story = self._upsert_story_draft_from_submission(submission)
+                submission.published_story = story
+                submission.save(update_fields=["published_story"])
+
+    def _build_unique_story_slug(self, title: str, instance=None) -> str:
+        base_slug = slugify(title) or "story"
+        slug = base_slug
+        suffix = 2
+        queryset = Story.objects.all()
+        if instance is not None:
+            queryset = queryset.exclude(pk=instance.pk)
+        while queryset.filter(slug=slug).exists():
+            slug = f"{base_slug}-{suffix}"
+            suffix += 1
+        return slug
+
+    def _upsert_story_draft_from_submission(self, submission: Submission) -> Story:
+        story = submission.published_story
+        if story is None:
+            story = Story(
+                title=submission.title,
+                slug=self._build_unique_story_slug(submission.title),
+            )
+
+        story.title = submission.title
+        story.about = submission.about
+        story.story_type = submission.story_type
+        story.submitted_by = submission.user
+        story.cover_image = submission.cover_image
+        if submission.cover_image_file:
+            story.cover_image_file = submission.cover_image_file
+        if submission.pdf_file:
+            story.pdf_file = submission.pdf_file
+        if submission.epub_file:
+            story.epub_file = submission.epub_file
+        story.published_date = None
+        story.is_published = False
+        story.save()
+        story.genres.set(submission.genres.all())
+
+        if not story.chapters.exists():
+            Chapter.objects.create(
+                story=story,
+                title="Chapter 1",
+                slug="chapter-1",
+                content=submission.content,
+                order=1,
+            )
+        return story
+
 
 class GenreListAPIView(APIView):
     def get(self, request):
@@ -200,9 +371,39 @@ class GenreListAPIView(APIView):
         return Response(serializer.data)
 
 
+class AdminAuthorListAPIView(APIView):
+    permission_classes = [IsSuperUser]
+
+    def get(self, request):
+        authors = Author.objects.all().order_by("name")
+        serializer = AdminAuthorSerializer(authors, many=True)
+        return Response(serializer.data)
+
+    def post(self, request):
+        serializer = AdminAuthorSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        author = serializer.save()
+        return Response(AdminAuthorSerializer(author).data, status=status.HTTP_201_CREATED)
+
+
+class AdminGenreListCreateAPIView(APIView):
+    permission_classes = [IsSuperUser]
+
+    def get(self, request):
+        genres = Genre.objects.all().order_by("name")
+        serializer = AdminGenreSerializer(genres, many=True)
+        return Response(serializer.data)
+
+    def post(self, request):
+        serializer = AdminGenreSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        genre = serializer.save()
+        return Response(AdminGenreSerializer(genre).data, status=status.HTTP_201_CREATED)
+
+
 class HomeDataAPIView(APIView):
     def get(self, request):
-        base_qs = Story.objects.all().prefetch_related("genres", "audios")
+        base_qs = Story.objects.filter(is_published=True).prefetch_related("genres", "audios")
 
         weekly_spotlight = base_qs.order_by("-rating", "-views", "-id")[:6]
         new_trending = base_qs.order_by("-views", "-published_date", "-id")[:5]
@@ -214,7 +415,7 @@ class HomeDataAPIView(APIView):
         featured_story = base_qs.order_by("-views", "-rating", "-id").first()
 
         readers_count = (
-            Story.objects.aggregate(total_readers=Sum("views")).get("total_readers") or 0
+            Story.objects.filter(is_published=True).aggregate(total_readers=Sum("views")).get("total_readers") or 0
         )
 
         return Response(
@@ -250,7 +451,7 @@ class HomeDataAPIView(APIView):
                     ).data,
                     "stats": {
                         "creators": Author.objects.count(),
-                        "stories": Story.objects.count(),
+                        "stories": Story.objects.filter(is_published=True).count(),
                         "readers": readers_count,
                     },
                 },
@@ -260,7 +461,7 @@ class HomeDataAPIView(APIView):
 
 class TrendingDataAPIView(APIView):
     def get(self, request):
-        base_qs = Story.objects.all().prefetch_related("genres", "audios")
+        base_qs = Story.objects.filter(is_published=True).prefetch_related("genres", "audios")
         return Response(
             {
                 "today": StoryListSerializer(
@@ -289,7 +490,7 @@ class TrendingDataAPIView(APIView):
 
 class OriginalsDataAPIView(APIView):
     def get(self, request):
-        base_qs = Story.objects.all().prefetch_related("genres", "audios")
+        base_qs = Story.objects.filter(is_published=True).prefetch_related("genres", "audios")
         return Response(
             {
                 "stories": StoryListSerializer(
@@ -303,7 +504,7 @@ class OriginalsDataAPIView(APIView):
 
 class DiscoverDataAPIView(APIView):
     def get(self, request):
-        base_qs = Story.objects.all().prefetch_related("genres", "audios")
+        base_qs = Story.objects.filter(is_published=True).prefetch_related("genres", "audios")
         genres = Genre.objects.all()
         return Response(
             {
@@ -322,6 +523,107 @@ class DiscoverDataAPIView(APIView):
         )
 
 
+class AdminOverviewAPIView(APIView):
+    permission_classes = [IsSuperUser]
+
+    def get(self, request):
+        total_views = Story.objects.aggregate(total=Sum("views")).get("total") or 0
+
+        summary = {
+            "stories": Story.objects.count(),
+            "chapters": Chapter.objects.count(),
+            "audios": Audio.objects.count(),
+            "users": User.objects.count(),
+            "submissions_pending": Submission.objects.filter(status="pending").count(),
+            "submissions_approved": Submission.objects.filter(status="approved").count(),
+            "submissions_rejected": Submission.objects.filter(status="rejected").count(),
+            "reviews": Review.objects.count(),
+            "favorites": Favorite.objects.count(),
+            "total_story_views": total_views,
+            "active_readers": ReadingProgress.objects.values("user_id").distinct().count(),
+            "active_listeners": AudioReadingProgress.objects.values("user_id").distinct().count(),
+        }
+
+        most_read_stories_qs = (
+            Story.objects.annotate(readers_count=Count("reading_progress", distinct=True))
+            .order_by("-readers_count", "-views", "-id")[:8]
+        )
+        most_read_stories = [
+            {
+                "id": story.id,
+                "title": story.title,
+                "slug": story.slug,
+                "cover_image": (
+                    request.build_absolute_uri(story.cover_image_file.url)
+                    if story.cover_image_file
+                    else story.cover_image
+                ),
+                "readers_count": story.readers_count,
+                "views": story.views,
+                "rating": story.rating,
+            }
+            for story in most_read_stories_qs
+        ]
+
+        most_listened_audios_qs = (
+            Audio.objects.select_related("story")
+            .annotate(
+                listeners_count=Count("audio_reading_progress", distinct=True),
+                avg_progress=Avg("audio_reading_progress__progress"),
+            )
+            .order_by("-listeners_count", "-id")[:8]
+        )
+        most_listened_audios = [
+            {
+                "id": audio.id,
+                "title": audio.title,
+                "slug": audio.slug,
+                "story_id": audio.story_id,
+                "story_title": audio.story.title,
+                "story_slug": audio.story.slug,
+                "listeners_count": audio.listeners_count,
+                "avg_progress": round(float(audio.avg_progress or 0), 3),
+            }
+            for audio in most_listened_audios_qs
+        ]
+
+        top_favorited_stories_qs = (
+            Story.objects.annotate(favorites_count=Count("favorites", distinct=True))
+            .order_by("-favorites_count", "-id")[:8]
+        )
+        top_favorited_stories = [
+            {
+                "id": story.id,
+                "title": story.title,
+                "slug": story.slug,
+                "favorites_count": story.favorites_count,
+            }
+            for story in top_favorited_stories_qs
+        ]
+
+        top_rated_stories_qs = Story.objects.order_by("-rating", "-views", "-id")[:8]
+        top_rated_stories = [
+            {
+                "id": story.id,
+                "title": story.title,
+                "slug": story.slug,
+                "rating": story.rating,
+                "views": story.views,
+            }
+            for story in top_rated_stories_qs
+        ]
+
+        return Response(
+            {
+                "summary": summary,
+                "most_read_stories": most_read_stories,
+                "most_listened_audios": most_listened_audios,
+                "top_favorited_stories": top_favorited_stories,
+                "top_rated_stories": top_rated_stories,
+            }
+        )
+
+
 class SearchStoryAPIView(ListAPIView):
     serializer_class = StoryListSerializer
 
@@ -333,7 +635,7 @@ class SearchStoryAPIView(ListAPIView):
             return Story.objects.none()
 
         queryset = (
-            Story.objects.all()
+            Story.objects.filter(is_published=True)
             .select_related("author")
             .prefetch_related("genres", "audios", "tags")
             .filter(

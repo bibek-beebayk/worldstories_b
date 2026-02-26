@@ -1,18 +1,35 @@
 from django.contrib import admin, messages
 from django.db import transaction
+from django.utils.html import strip_tags
 from django.utils import timezone
 from django.utils.text import slugify
 from .models import Audio, Story, Genre, Tag, Author, Chapter, Review, Submission
 
 
-class ChapterInline(admin.StackedInline):
+class ChapterInline(admin.TabularInline):
     model = Chapter
-    extra = 0
+    extra = 1
+    verbose_name = "Chapter"
+    verbose_name_plural = "Chapters (Quick Add)"
     prepopulated_fields = {"slug": ("title",)}
+    fields = ("order", "title", "slug", "content_preview")
+    readonly_fields = ("content_preview",)
+    show_change_link = True
+
+    @admin.display(description="Preview")
+    def content_preview(self, obj):
+        if not obj or not obj.content:
+            return "-"
+        text = strip_tags(str(obj.content)).strip()
+        if not text:
+            return "-"
+        return f"{text[:80]}..." if len(text) > 80 else text
 
 class AudioInline(admin.StackedInline):
     model = Audio
     extra = 0
+    classes = ("collapse",)
+    fields = ("title", "slug", "order", "audio_file")
 
 
 def _unique_story_slug(title: str) -> str:
@@ -32,6 +49,7 @@ def _publish_submission(submission: Submission, reviewer) -> Story:
         about=submission.about,
         story_type=submission.story_type,
         author=None,
+        submitted_by=submission.user,
         published_date=timezone.now().date(),
         cover_image=submission.cover_image or None,
         cover_image_file=submission.cover_image_file,
@@ -68,11 +86,53 @@ def _publish_submission(submission: Submission, reviewer) -> Story:
 @admin.register(Story)
 class StoryAdmin(admin.ModelAdmin):
     inlines = [ChapterInline, AudioInline]
+    change_form_template = "admin/story/story/change_form.html"
     prepopulated_fields = {"slug": ("title",)}
+    fieldsets = (
+        (
+            "Core Details",
+            {
+                "fields": ("title", "slug", "about", "story_type", "author"),
+            },
+        ),
+        (
+            "Submission",
+            {
+                "fields": ("submitted_by",),
+            },
+        ),
+        (
+            "Classification",
+            {
+                "fields": ("genres", "tags", "is_completed"),
+            },
+        ),
+        (
+            "Media & Files",
+            {
+                "fields": ("cover_image", "cover_image_file", "pdf_file", "epub_file"),
+            },
+        ),
+        (
+            "Publishing",
+            {
+                "fields": ("published_date",),
+            },
+        ),
+        (
+            "Read-only Metrics",
+            {
+                "fields": ("rating", "views", "chapters_count", "audios_count"),
+                "classes": ("collapse",),
+            },
+        ),
+    )
+    readonly_fields = ("submitted_by", "rating", "views", "chapters_count", "audios_count")
     list_display = (
         "title",
         "story_type",
         "author",
+        "submitted_by",
         "is_completed",
         "rating",
         "views",
@@ -97,7 +157,7 @@ class StoryAdmin(admin.ModelAdmin):
     )
     ordering = ("-published_date", "-id")
     date_hierarchy = "published_date"
-    list_select_related = ("author",)
+    list_select_related = ("author", "submitted_by")
     filter_horizontal = ("genres", "tags")
     autocomplete_fields = ("author",)
 
@@ -127,7 +187,23 @@ class AuthorAdmin(admin.ModelAdmin):
 
 @admin.register(Chapter)
 class ChapterAdmin(admin.ModelAdmin):
-    pass
+    fieldsets = (
+        ("Chapter Info", {"fields": ("story", "order", "title", "slug")}),
+        ("Content", {"fields": ("content",)}),
+    )
+    list_display = ("title", "story", "order", "slug")
+    search_fields = ("title", "slug", "story__title")
+    list_filter = ("story",)
+    list_select_related = ("story",)
+    autocomplete_fields = ("story",)
+    ordering = ("story__title", "order")
+
+    def get_changeform_initial_data(self, request):
+        initial = super().get_changeform_initial_data(request)
+        story_id = request.GET.get("story")
+        if story_id:
+            initial["story"] = story_id
+        return initial
 
 
 @admin.register(Review)

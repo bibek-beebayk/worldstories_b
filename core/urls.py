@@ -14,6 +14,10 @@ router = DefaultRouter()
 
 router.register("stories", story_api.StoryViewSet, basename="story")
 router.register("submissions", story_api.SubmissionViewSet, basename="submission")
+router.register("admin/stories", story_api.StoryAdminViewSet, basename="admin-story")
+router.register("admin/chapters", story_api.ChapterAdminViewSet, basename="admin-chapter")
+router.register("admin/audios", story_api.AudioAdminViewSet, basename="admin-audio")
+router.register("admin/submissions", story_api.SubmissionAdminViewSet, basename="admin-submission")
 router.register("auth", users_api.AuthenticationViewSet, basename="auth")
 
 urlpatterns = [
@@ -26,6 +30,9 @@ urlpatterns = [
     path("api/originals/", story_api.OriginalsDataAPIView.as_view(), name="originals-data"),
     path("api/discover/", story_api.DiscoverDataAPIView.as_view(), name="discover-data"),
     path("api/search/", story_api.SearchStoryAPIView.as_view(), name="search-data"),
+    path("api/admin/overview/", story_api.AdminOverviewAPIView.as_view(), name="admin-overview"),
+    path("api/admin/authors/", story_api.AdminAuthorListAPIView.as_view(), name="admin-authors"),
+    path("api/admin/genres/", story_api.AdminGenreListCreateAPIView.as_view(), name="admin-genres"),
     path(
         "api/reading-progress/<slug:story_slug>/",
         stats_views.ReadingProgressAPIView.as_view(),

@@ -73,6 +73,7 @@ class UserProfileSerializer(serializers.ModelSerializer):
             "id",
             "email",
             "username",
+            "is_superuser",
             "display_name",
             "bio",
             "avatar_url",

@@ -120,6 +120,47 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
             status=status.HTTP_410_GONE,
         )
 
+    @action(detail=False, methods=["post"], url_path="admin-login")
+    def admin_login(self, request):
+        email = (request.data.get("email") or "").strip().lower()
+        password = request.data.get("password") or ""
+
+        if not email or not password:
+            return Response(
+                {"message": "Email and password are required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        from django.contrib.auth import authenticate
+
+        user = authenticate(request=request, username=email, password=password)
+        if not user:
+            return Response(
+                {"message": "Invalid email or password."},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+
+        if not user.is_superuser:
+            return Response(
+                {"message": "Superuser access required."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        tokens = get_tokens(user)
+        return Response(
+            {
+                "access": tokens["access"],
+                "refresh": tokens["refresh"],
+                "user": {
+                    "id": str(user.id),
+                    "email": user.email,
+                    "username": user.username,
+                    "is_superuser": user.is_superuser,
+                },
+            },
+            status=status.HTTP_200_OK,
+        )
+
     @action(detail=False, methods=["post"], url_path="google-login")
     def google_login(self, request):
         token = request.data.get("token")

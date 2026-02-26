@@ -12,6 +12,7 @@ STORY_TYPE_CHOICES = [
 
 SUBMISSION_STATUS_CHOICES = [
     ("pending", "Pending"),
+    ("requires_edit", "Requires Edit"),
     ("approved", "Approved"),
     ("rejected", "Rejected"),
 ]
@@ -59,6 +60,13 @@ class Story(models.Model):
         max_length=50, choices=STORY_TYPE_CHOICES, default="Short Story"
     )
     author = models.ForeignKey(Author, on_delete=models.CASCADE, blank=True, null=True, related_name="stories")
+    submitted_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        blank=True,
+        null=True,
+        related_name="submitted_stories",
+    )
     published_date = models.DateField(blank=True, null=True)
     cover_image = models.URLField(blank=True, null=True)
     cover_image_file = models.ImageField(upload_to="story_covers/", blank=True, null=True)
@@ -68,6 +76,7 @@ class Story(models.Model):
     tags = models.ManyToManyField(Tag, blank=True)
     rating = models.FloatField(default=0.0)
     views = models.PositiveIntegerField(default=0)
+    is_published = models.BooleanField(default=True)
 
     # def rating(self):
     #     # reviews = self.reviews.all()

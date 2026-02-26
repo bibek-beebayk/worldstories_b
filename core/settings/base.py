@@ -9,7 +9,7 @@ from django.utils import timezone
 # Application definition
 
 INSTALLED_APPS = [
-    "jazzmin",
+    # "jazzmin",
     "django.contrib.admin",
     "django.contrib.auth",
     "django.contrib.contenttypes",
@@ -46,12 +46,15 @@ MIDDLEWARE = [
     "core.libs.middleware.APILogMiddleware",
 ]
 
+# Needed for same-origin iframe usage in admin modal workflows.
+X_FRAME_OPTIONS = "SAMEORIGIN"
+
 ROOT_URLCONF = "core.urls"
 
 TEMPLATES = [
     {
         "BACKEND": "django.template.backends.django.DjangoTemplates",
-        "DIRS": [],
+        "DIRS": [BASE_DIR / "templates"],
         "APP_DIRS": True,
         "OPTIONS": {
             "context_processors": [
