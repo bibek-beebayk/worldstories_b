@@ -37,6 +37,11 @@ from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework.permissions import IsAuthenticated
 from rest_framework import status
 from rest_framework.exceptions import ValidationError
+from core.libs.pagination import PageNumberPagination
+
+
+class AdminChapterPagination(PageNumberPagination):
+    page_size = 10000
 
 
 class IsSuperUser(BasePermission):
@@ -252,6 +257,7 @@ class StoryAdminViewSet(ModelViewSet):
 class ChapterAdminViewSet(ModelViewSet):
     queryset = Chapter.objects.select_related("story").all().order_by("story_id", "order")
     serializer_class = ChapterAdminSerializer
+    pagination_class = AdminChapterPagination
     permission_classes = [IsSuperUser]
     filter_backends = [SearchFilter]
     search_fields = ["title", "slug", "story__title"]
