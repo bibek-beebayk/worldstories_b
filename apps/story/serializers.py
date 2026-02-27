@@ -445,6 +445,13 @@ class StoryAdminSerializer(serializers.ModelSerializer):
 
         return super().update(instance, validated_data)
 
+    def create(self, validated_data):
+        # These flags are only meaningful for updates and are not model fields.
+        validated_data.pop("remove_cover_image_file", None)
+        validated_data.pop("remove_pdf_file", None)
+        validated_data.pop("remove_epub_file", None)
+        return super().create(validated_data)
+
 
 class ChapterAdminSerializer(serializers.ModelSerializer):
     def _build_unique_slug(self, story, title: str, instance=None) -> str:
