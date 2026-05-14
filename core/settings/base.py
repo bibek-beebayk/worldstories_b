@@ -77,7 +77,7 @@ DATABASES = {
         "ENGINE": "django.db.backends.postgresql_psycopg2",
         "NAME": os.environ.get("PGDATABASE", "stories_db"),
         "USER": os.environ.get("PGUSER", "postgres"),
-        "PASSWORD": os.environ.get("PGPASSWORD", "postgres"),
+        "PASSWORD": os.environ.get("PGPASSWORD", "password"),
         "HOST": os.environ.get("PGHOST", ""),
         "PORT": os.environ.get("PGPORT", ""),
         "ATOMIC_REQUESTS": True,

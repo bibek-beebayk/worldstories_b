@@ -12,3 +12,4 @@ django-cors-headers
 django-solo
 google-auth
 requests
+python-magic-bin
