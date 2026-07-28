@@ -13,3 +13,6 @@ static/
 *.dot
 tunnel.txt
 *.pem*
+.env
+.env.*
+!.env.example

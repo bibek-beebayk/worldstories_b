@@ -2,8 +2,6 @@
 import os
 from core.settings.base import BASE_DIR, MIDDLEWARE
 
-SECRET_KEY = "django-insecure-mrk3h^2+7cas%6q$(6_gt!tixkx)=-)=m)l)id-c1qbm&r2df_"
-
 DEBUG = False
 
 ALLOWED_HOSTS = ["worldstories-b-production.up.railway.app"]

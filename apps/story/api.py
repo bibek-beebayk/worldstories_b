@@ -372,7 +372,17 @@ class SubmissionAdminViewSet(ModelViewSet):
 
 class GenreListAPIView(APIView):
     def get(self, request):
-        genres = Genre.objects.all()
+        genres = (
+            Genre.objects.filter(stories__is_published=True)
+            .annotate(
+                published_stories_count=Count(
+                    "stories",
+                    filter=Q(stories__is_published=True),
+                    distinct=True,
+                )
+            )
+            .order_by("name")
+        )
         serializer = GenreSerializer(genres, many=True)
         return Response(serializer.data)
 

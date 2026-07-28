@@ -1,9 +1,14 @@
 from pathlib import Path
 import os
+from dotenv import load_dotenv
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = BASE_DIR.parent
+load_dotenv(PROJECT_ROOT / ".env")
 from django.utils import timezone
+
+SECRET_KEY = os.environ["SECRET_KEY"]
 
 
 # Application definition
@@ -77,9 +82,9 @@ DATABASES = {
         "ENGINE": "django.db.backends.postgresql_psycopg2",
         "NAME": os.environ.get("PGDATABASE", "stories_db"),
         "USER": os.environ.get("PGUSER", "postgres"),
-        "PASSWORD": os.environ.get("PGPASSWORD", "password"),
-        "HOST": os.environ.get("PGHOST", ""),
-        "PORT": os.environ.get("PGPORT", ""),
+        "PASSWORD": os.environ.get("PGPASSWORD", ""),
+        "HOST": os.environ.get("PGHOST", "127.0.0.1"),
+        "PORT": os.environ.get("PGPORT", "5432"),
         "ATOMIC_REQUESTS": True,
     }
 }
@@ -182,8 +187,8 @@ GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
 EMAIL_HOST = "smtp.gmail.com"
 EMAIL_PORT = "587"
-EMAIL_HOST_USER = os.environ.get("EMAIL_HOST_USER", "worldstoriesnet@gmail.com")
-EMAIL_HOST_PASSWORD = os.environ.get("EMAIL_HOST_PASSWORD", "ljqzkewjziblhahr")
+EMAIL_HOST_USER = os.environ.get("EMAIL_HOST_USER", "")
+EMAIL_HOST_PASSWORD = os.environ.get("EMAIL_HOST_PASSWORD", "")
 EMAIL_USE_TLS = True
 EMAIL_TIMEOUT = int(os.environ.get("EMAIL_TIMEOUT", "20"))
 DEFAULT_FROM_EMAIL = EMAIL_HOST_USER

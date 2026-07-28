@@ -7,7 +7,10 @@ class GenreSerializer(serializers.ModelSerializer):
     stories_count = serializers.SerializerMethodField()
 
     def get_stories_count(self, obj):
-        return obj.stories.count()
+        annotated_count = getattr(obj, "published_stories_count", None)
+        if annotated_count is not None:
+            return annotated_count
+        return obj.stories.filter(is_published=True).count()
     
     class Meta:
         model = Genre
