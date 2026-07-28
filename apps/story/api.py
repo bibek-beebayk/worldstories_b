@@ -44,6 +44,10 @@ class AdminChapterPagination(PageNumberPagination):
     page_size = 10000
 
 
+class CataloguePagination(PageNumberPagination):
+    page_size = 12
+
+
 class IsSuperUser(BasePermission):
     def has_permission(self, request, view):
         return bool(request.user and request.user.is_authenticated and request.user.is_superuser)
@@ -54,6 +58,7 @@ class StoryViewSet(ReadOnlyModelViewSet):
     lookup_field = "slug"
     filter_backends = [DjangoFilterBackend]
     filterset_class = StoryFilter
+    pagination_class = CataloguePagination
 
     def get_permissions(self):
         if self.action in {"reviews", "my_review"} and self.request.method in {
