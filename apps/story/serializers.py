@@ -91,6 +91,11 @@ class StoryListSerializer(serializers.ModelSerializer):
         ]
 
 
+class FeaturedStorySerializer(StoryListSerializer):
+    class Meta(StoryListSerializer.Meta):
+        fields = StoryListSerializer.Meta.fields + ["about"]
+
+
 class ChapterListSerializer(serializers.ModelSerializer):
     class Meta:
         model = Chapter

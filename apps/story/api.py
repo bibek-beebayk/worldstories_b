@@ -19,6 +19,7 @@ from .serializers import (
     AdminGenreSerializer,
     AdminAuthorSerializer,
     StoryListSerializer,
+    FeaturedStorySerializer,
     StoryDetailSerializer,
     ChapterSerializer,
     AudioSerializer,
@@ -433,7 +434,7 @@ class HomeDataAPIView(APIView):
         originals = base_qs.order_by("-id")[:6]
         new_releases = base_qs.order_by("-published_date", "-id")[:6]
         sidebar_recommended = base_qs.order_by("-rating", "-views", "-id")[:3]
-        featured_story = base_qs.order_by("-views", "-rating", "-id").first()
+        featured_stories = base_qs.order_by("-views", "-rating", "-id")[:5]
 
         readers_count = (
             Story.objects.filter(is_published=True).aggregate(total_readers=Sum("views")).get("total_readers") or 0
@@ -441,11 +442,9 @@ class HomeDataAPIView(APIView):
 
         return Response(
             {
-                "featured_story": (
-                    StoryListSerializer(featured_story, context={"request": request}).data
-                    if featured_story
-                    else None
-                ),
+                "featured_stories": FeaturedStorySerializer(
+                    featured_stories, many=True, context={"request": request}
+                ).data,
                 "weekly_spotlight": StoryListSerializer(
                     weekly_spotlight, many=True, context={"request": request}
                 ).data,
