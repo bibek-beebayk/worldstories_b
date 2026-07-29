@@ -31,7 +31,7 @@ def sitemap(request):
     ).rstrip("/")
     entries = [
         f"<url><loc>{escape(site_url + path)}</loc></url>"
-        for path in ["/", "/catalogue", "/trending", "/discover", "/contest"]
+        for path in ["/", "/library", "/trending", "/discover", "/contest"]
     ]
 
     stories = Story.objects.filter(is_published=True).only("slug", "published_date")
