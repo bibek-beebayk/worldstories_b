@@ -420,6 +420,9 @@ class LibraryShelvesAPIView(APIView):
 
         paginator = LibraryShelfPagination()
         page = paginator.paginate_queryset(genres, request)
+        paginator.aggregate = {
+            "total_stories": Story.objects.filter(is_published=True).count()
+        }
 
         shelves = []
         for genre in page:
