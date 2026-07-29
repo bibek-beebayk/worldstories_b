@@ -79,18 +79,7 @@ class Story(models.Model):
     views = models.PositiveIntegerField(default=0)
     is_published = models.BooleanField(default=True)
 
-    # def rating(self):
-    #     # reviews = self.reviews.all()
-    #     # if reviews.exists():
-    #     #     return sum(review.rating for review in reviews) / reviews.count()
-    #     return 4.7
-    
-    # def views(self):
-    #     return 1234
-
     def has_audio(self):
-        # TODO
-        # return hasattr(self, 'audio')
         return self.audios.exists()
 
     def __str__(self):
