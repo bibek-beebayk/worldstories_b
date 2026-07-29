@@ -481,26 +481,33 @@ class HomeDataAPIView(APIView):
 
 class TrendingDataAPIView(APIView):
     def get(self, request):
-        base_qs = Story.objects.filter(is_published=True).prefetch_related("genres", "audios")
+        base_qs = (
+            Story.objects.filter(is_published=True)
+            .prefetch_related("genres", "audios")
+            .annotate(
+                favorites_total=Count("favorites", distinct=True),
+                reviews_total=Count("reviews", distinct=True),
+            )
+        )
         return Response(
             {
-                "today": StoryListSerializer(
+                "most_viewed": StoryListSerializer(
                     base_qs.order_by("-views", "-id")[:10],
                     many=True,
                     context={"request": request},
                 ).data,
-                "week": StoryListSerializer(
-                    base_qs.order_by("-views", "-rating", "-id")[:10],
-                    many=True,
-                    context={"request": request},
-                ).data,
-                "month": StoryListSerializer(
+                "highest_rated": StoryListSerializer(
                     base_qs.order_by("-rating", "-views", "-id")[:10],
                     many=True,
                     context={"request": request},
                 ).data,
-                "alltime": StoryListSerializer(
-                    base_qs.order_by("-views", "-rating", "-published_date")[:10],
+                "most_favorited": StoryListSerializer(
+                    base_qs.order_by("-favorites_total", "-id")[:10],
+                    many=True,
+                    context={"request": request},
+                ).data,
+                "most_discussed": StoryListSerializer(
+                    base_qs.order_by("-reviews_total", "-id")[:10],
                     many=True,
                     context={"request": request},
                 ).data,
