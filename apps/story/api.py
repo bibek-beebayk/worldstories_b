@@ -426,15 +426,31 @@ class AdminGenreListCreateAPIView(APIView):
 class HomeDataAPIView(APIView):
     def get(self, request):
         base_qs = Story.objects.filter(is_published=True).prefetch_related("genres", "audios")
+        used_ids = set()
 
-        weekly_spotlight = base_qs.order_by("-rating", "-views", "-id")[:6]
-        new_trending = base_qs.order_by("-views", "-published_date", "-id")[:5]
-        recommended = base_qs.order_by("-rating", "-published_date", "-id")[:6]
-        popular = base_qs.order_by("-views", "-rating", "-id")[:6]
-        originals = base_qs.order_by("-id")[:6]
-        new_releases = base_qs.order_by("-published_date", "-id")[:6]
-        sidebar_recommended = base_qs.order_by("-rating", "-views", "-id")[:3]
-        featured_stories = base_qs.order_by("-views", "-rating", "-id")[:5]
+        def take(queryset, limit):
+            """Pull `limit` stories off the front of an ordered queryset, skipping any
+            story already claimed by an earlier (more prominent) section on this page.
+            Sections are computed in page order, top to bottom, so each one shows
+            stories the reader hasn't already seen higher up the homepage."""
+            results = []
+            for story in queryset:
+                if story.id in used_ids:
+                    continue
+                results.append(story)
+                used_ids.add(story.id)
+                if len(results) >= limit:
+                    break
+            return results
+
+        featured_stories = take(base_qs.order_by("-views", "-rating", "-id"), 5)
+        weekly_spotlight = take(base_qs.order_by("-rating", "-views", "-id"), 6)
+        sidebar_recommended = take(base_qs.order_by("-rating", "-views", "-id"), 3)
+        new_trending = take(base_qs.order_by("-views", "-published_date", "-id"), 5)
+        recommended = take(base_qs.order_by("-rating", "-published_date", "-id"), 6)
+        popular = take(base_qs.order_by("-views", "-rating", "-id"), 6)
+        new_releases = take(base_qs.order_by("-published_date", "-id"), 6)
+        more_to_explore = take(base_qs.order_by("-id"), 12)
 
         readers_count = (
             Story.objects.filter(is_published=True).aggregate(total_readers=Sum("views")).get("total_readers") or 0
@@ -451,15 +467,15 @@ class HomeDataAPIView(APIView):
                 "new_trending": StoryListSerializer(
                     new_trending, many=True, context={"request": request}
                 ).data,
+                "more_to_explore": StoryListSerializer(
+                    more_to_explore, many=True, context={"request": request}
+                ).data,
                 "tabs": {
                     "recommended": StoryListSerializer(
                         recommended, many=True, context={"request": request}
                     ).data,
                     "popular": StoryListSerializer(
                         popular, many=True, context={"request": request}
-                    ).data,
-                    "originals": StoryListSerializer(
-                        originals, many=True, context={"request": request}
                     ).data,
                     "new": StoryListSerializer(
                         new_releases, many=True, context={"request": request}
