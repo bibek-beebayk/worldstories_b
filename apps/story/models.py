@@ -2,6 +2,7 @@ from django.db import models
 from django_ckeditor_5.fields import CKEditor5Field
 from django.core.validators import MinValueValidator, MaxValueValidator
 from django.conf import settings
+from versatileimagefield.fields import VersatileImageField
 
 STORY_TYPE_CHOICES = [
     ("Short Story", "Short Story"),
@@ -69,7 +70,7 @@ class Story(models.Model):
     )
     published_date = models.DateField(blank=True, null=True)
     cover_image = models.URLField(blank=True, null=True)
-    cover_image_file = models.ImageField(upload_to="story_covers/", blank=True, null=True)
+    cover_image_file = VersatileImageField(upload_to="story_covers/", blank=True, null=True)
     pdf_file = models.FileField(upload_to="story_files/pdfs/", blank=True, null=True)
     epub_file = models.FileField(upload_to="story_files/epubs/", blank=True, null=True)
     is_completed = models.BooleanField(default=False)

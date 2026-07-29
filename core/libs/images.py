@@ -105,6 +105,21 @@ class EmptyForNullTextField(serializers.CharField):
         return attibute
 
 
+def get_cover_image_url(cover_image_file, fallback_url, request, size=None):
+    """
+    Resolves a cover image URL, preferring an appropriately-sized
+    VersatileImageField rendition over the full original upload so
+    list/hero views don't ship multi-MB source images.
+    """
+    if cover_image_file:
+        image = cover_image_file
+        if size and hasattr(image, "thumbnail"):
+            image = image.thumbnail[size]
+        url = image.url
+        return request.build_absolute_uri(url) if request else url
+    return fallback_url or ""
+
+
 def warm(instance):
     if hasattr(instance, 'SIZES') and type(instance.SIZES) == dict:
         for field, set in instance.SIZES.items():

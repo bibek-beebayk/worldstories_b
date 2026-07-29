@@ -1,6 +1,10 @@
 from rest_framework import serializers
 from django.utils.text import slugify
+from core.libs.images import get_cover_image_url
 from .models import Audio, Story, Genre, Chapter, Tag, Author, Review, Submission
+
+CARD_COVER_SIZE = "480x640"
+LARGE_COVER_SIZE = "900x1200"
 
 
 class GenreSerializer(serializers.ModelSerializer):
@@ -64,13 +68,11 @@ class StoryListSerializer(serializers.ModelSerializer):
     def get_favorites_count(self, obj):
         return obj.favorites.count()
 
+    cover_image_size = CARD_COVER_SIZE
+
     def get_cover_image(self, obj):
-        if obj.cover_image_file:
-            request = self.context.get("request")
-            if request:
-                return request.build_absolute_uri(obj.cover_image_file.url)
-            return obj.cover_image_file.url
-        return obj.cover_image or ""
+        request = self.context.get("request")
+        return get_cover_image_url(obj.cover_image_file, obj.cover_image, request, size=self.cover_image_size)
 
     class Meta:
         model = Story
@@ -92,6 +94,8 @@ class StoryListSerializer(serializers.ModelSerializer):
 
 
 class FeaturedStorySerializer(StoryListSerializer):
+    cover_image_size = LARGE_COVER_SIZE
+
     class Meta(StoryListSerializer.Meta):
         fields = StoryListSerializer.Meta.fields + ["about"]
 
@@ -150,12 +154,8 @@ class StoryDetailSerializer(serializers.ModelSerializer):
         return obj.favorites.count()
 
     def get_cover_image(self, obj):
-        if obj.cover_image_file:
-            request = self.context.get("request")
-            if request:
-                return request.build_absolute_uri(obj.cover_image_file.url)
-            return obj.cover_image_file.url
-        return obj.cover_image or ""
+        request = self.context.get("request")
+        return get_cover_image_url(obj.cover_image_file, obj.cover_image, request, size=LARGE_COVER_SIZE)
 
     def get_pdf_file(self, obj):
         if not obj.pdf_file:

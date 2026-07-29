@@ -26,7 +26,7 @@ INSTALLED_APPS = [
     "rest_framework",
     "rest_framework_simplejwt",
     # 'rest_framework.authtoken',
-    # "versatileimagefield",
+    "versatileimagefield",
     "django_filters",
     "django_ckeditor_5",
     "corsheaders",
@@ -169,9 +169,9 @@ SIMPLEJWT = {
     "REFRESH_TOKEN_LIFETIME": timezone.timedelta(days=1),
 }
 
-# VERSATILEIMAGEFIELD_SETTINGS = {
-#     "create_images_on_demand": False,
-# }
+VERSATILEIMAGEFIELD_SETTINGS = {
+    "create_images_on_demand": True,
+}
 
 
 # USERNAME_FIELD = "email"
