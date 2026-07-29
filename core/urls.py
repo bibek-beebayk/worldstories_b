@@ -3,12 +3,16 @@ from django.urls import path
 from django.conf import settings
 from django.urls import include, path
 from django.conf.urls.static import static
+from django.http import HttpResponse
+from django.utils.html import escape
+import os
 
 from rest_framework.routers import DefaultRouter
 from rest_framework_simplejwt.views import TokenRefreshView
 from apps.story import api as story_api
 from apps.stats import views as stats_views
 from apps.users import api as users_api
+from apps.story.models import Story
 
 router = DefaultRouter()
 
@@ -19,6 +23,37 @@ router.register("admin/chapters", story_api.ChapterAdminViewSet, basename="admin
 router.register("admin/audios", story_api.AudioAdminViewSet, basename="admin-audio")
 router.register("admin/submissions", story_api.SubmissionAdminViewSet, basename="admin-submission")
 router.register("auth", users_api.AuthenticationViewSet, basename="auth")
+
+
+def sitemap(request):
+    site_url = os.environ.get(
+        "SITE_URL", "https://worldstories-f.netlify.app"
+    ).rstrip("/")
+    entries = [
+        f"<url><loc>{escape(site_url + path)}</loc></url>"
+        for path in ["/", "/catalogue", "/trending", "/discover", "/contest"]
+    ]
+
+    stories = Story.objects.filter(is_published=True).only("slug", "published_date")
+    for story in stories.iterator():
+        last_modified = (
+            f"<lastmod>{story.published_date.isoformat()}</lastmod>"
+            if story.published_date
+            else ""
+        )
+        entries.append(
+            f"<url><loc>{escape(f'{site_url}/story/{story.slug}')}</loc>"
+            f"{last_modified}</url>"
+        )
+
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+        + "".join(entries)
+        + "</urlset>"
+    )
+    return HttpResponse(xml, content_type="application/xml")
+
 
 urlpatterns = [
     path("admin/", admin.site.urls),
@@ -44,5 +79,6 @@ urlpatterns = [
         name="audio-reading-progress",
     ),
     path("api/genres/", story_api.GenreListAPIView.as_view(), name="genre-list"),
+    path("api/sitemap.xml", sitemap, name="sitemap"),
     path("ckeditor5/", include("django_ckeditor_5.urls")),
 ] + static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
