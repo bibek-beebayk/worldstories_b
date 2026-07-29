@@ -4,6 +4,8 @@ from django.core.validators import MinValueValidator, MaxValueValidator
 from django.conf import settings
 from versatileimagefield.fields import VersatileImageField
 
+from core.libs.models import TimeStampModel
+
 STORY_TYPE_CHOICES = [
     ("Short Story", "Short Story"),
     ("Novel", "Novel"),
@@ -201,3 +203,28 @@ class Submission(models.Model):
 
     def __str__(self):
         return f"{self.title} ({self.status})"
+
+
+class StoryView(TimeStampModel):
+    """One row per counted view. Used only to de-duplicate repeat visits from the same
+    IP within a short window before bumping Story.views — not meant to be queried for
+    anything beyond that (see readers_count/ReadingProgress in apps.stats for real
+    per-user reading activity)."""
+
+    story = models.ForeignKey(Story, on_delete=models.CASCADE, related_name="view_events")
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        blank=True,
+        null=True,
+        related_name="story_view_events",
+    )
+    ip_address = models.GenericIPAddressField(blank=True, null=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["story", "ip_address", "created_at"]),
+        ]
+
+    def __str__(self):
+        return f"View of {self.story} from {self.ip_address} at {self.created_at}"

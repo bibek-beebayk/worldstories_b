@@ -1,11 +1,15 @@
+import re
+
 from rest_framework.viewsets import ReadOnlyModelViewSet, ModelViewSet
 from rest_framework.views import APIView
 from rest_framework.generics import ListAPIView
-from django.db.models import Sum, Avg, Count
+from django.db.models import Sum, Avg, Count, F
 from django.db.models import Q
 from django.http import FileResponse
 from django.db import transaction
+from django.utils import timezone
 from django.utils.text import slugify
+from datetime import timedelta
 from rest_framework.parsers import FormParser, MultiPartParser, JSONParser
 from rest_framework.permissions import BasePermission
 from rest_framework.filters import SearchFilter
@@ -13,7 +17,7 @@ from rest_framework.filters import SearchFilter
 from apps.story.filters import StoryFilter
 from apps.stats.models import ReadingProgress, AudioReadingProgress
 from apps.users.models import User
-from .models import Genre, Story, Chapter, Audio, Author, Review, Favorite, Submission
+from .models import Genre, Story, Chapter, Audio, Author, Review, Favorite, Submission, StoryView
 from .serializers import (
     GenreSerializer,
     AdminGenreSerializer,
@@ -39,6 +43,30 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework import status
 from rest_framework.exceptions import ValidationError
 from core.libs.pagination import PageNumberPagination
+
+
+VIEW_DEDUPE_WINDOW = timedelta(hours=24)
+
+# Same bot list the social-meta Netlify edge function checks — its server-side fetches
+# to this endpoint (for link-preview scraping) shouldn't be counted as real reads.
+BOT_USER_AGENT_PATTERN = re.compile(
+    r"facebookexternalhit|Facebot|Twitterbot|Slackbot|Slack-ImgProxy|Discordbot|WhatsApp|"
+    r"TelegramBot|LinkedInBot|Pinterest|redditbot|SkypeUriPreview|Applebot|Googlebot|"
+    r"bingbot|DuckDuckBot|YandexBot|W3C_Validator|vkShare",
+    re.IGNORECASE,
+)
+
+
+def get_client_ip(request):
+    forwarded_for = request.META.get("HTTP_X_FORWARDED_FOR")
+    if forwarded_for:
+        return forwarded_for.split(",")[0].strip()
+    return request.META.get("REMOTE_ADDR")
+
+
+def is_bot_request(request):
+    user_agent = request.META.get("HTTP_USER_AGENT", "")
+    return bool(BOT_USER_AGENT_PATTERN.search(user_agent))
 
 
 class AdminChapterPagination(PageNumberPagination):
@@ -81,6 +109,40 @@ class StoryViewSet(ReadOnlyModelViewSet):
         average = story.reviews.aggregate(avg=Avg("rating")).get("avg") or 0
         story.rating = round(float(average), 1) if average else 0.0
         story.save(update_fields=["rating"])
+
+    def _register_view(self, request, story):
+        """Counts one view per IP per story per VIEW_DEDUPE_WINDOW, so refreshing the
+        page or re-fetching for chapter navigation doesn't inflate the count. Bot/crawler
+        requests (including the social-meta edge function's own server-side fetches) are
+        excluded entirely."""
+        if is_bot_request(request):
+            return
+
+        ip_address = get_client_ip(request)
+        already_counted = False
+        if ip_address:
+            already_counted = StoryView.objects.filter(
+                story=story,
+                ip_address=ip_address,
+                created_at__gte=timezone.now() - VIEW_DEDUPE_WINDOW,
+            ).exists()
+
+        if already_counted:
+            return
+
+        StoryView.objects.create(
+            story=story,
+            user=request.user if request.user.is_authenticated else None,
+            ip_address=ip_address,
+        )
+        Story.objects.filter(pk=story.pk).update(views=F("views") + 1)
+        story.views += 1
+
+    def retrieve(self, request, *args, **kwargs):
+        instance = self.get_object()
+        self._register_view(request, instance)
+        serializer = self.get_serializer(instance)
+        return Response(serializer.data)
 
     def get_serializer_class(self):
         if self.action == "retrieve":

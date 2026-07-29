@@ -3,7 +3,7 @@ from django.db import transaction
 from django.utils.html import strip_tags
 from django.utils import timezone
 from django.utils.text import slugify
-from .models import Audio, Story, Genre, Tag, Author, Chapter, Review, Submission
+from .models import Audio, Story, Genre, Tag, Author, Chapter, Review, Submission, StoryView
 
 
 class ChapterInline(admin.TabularInline):
@@ -279,3 +279,18 @@ class SubmissionAdmin(admin.ModelAdmin):
                 f"{skipped_count} submission(s) skipped because they are already published.",
                 level=messages.WARNING,
             )
+
+
+@admin.register(StoryView)
+class StoryViewAdmin(admin.ModelAdmin):
+    list_display = ("story", "ip_address", "user", "created_at")
+    list_filter = ("created_at",)
+    search_fields = ("story__title", "ip_address")
+    autocomplete_fields = ("story",)
+    readonly_fields = ("story", "user", "ip_address", "created_at", "updated_at")
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
