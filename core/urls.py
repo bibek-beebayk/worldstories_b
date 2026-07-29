@@ -27,7 +27,7 @@ router.register("auth", users_api.AuthenticationViewSet, basename="auth")
 
 def sitemap(request):
     site_url = os.environ.get(
-        "SITE_URL", "https://worldstories-f.netlify.app"
+        "SITE_URL", "https://worldstories.net"
     ).rstrip("/")
     entries = [
         f"<url><loc>{escape(site_url + path)}</loc></url>"
