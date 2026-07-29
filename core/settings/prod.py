@@ -1,5 +1,6 @@
 # Email backend
 import os
+
 from core.settings.base import BASE_DIR, MIDDLEWARE
 
 DEBUG = False
@@ -7,15 +8,15 @@ DEBUG = False
 ALLOWED_HOSTS = ["worldstories-b-production.up.railway.app"]
 
 CSRF_TRUSTED_ORIGINS = [
-    "https://worldstories-b-production.up.railway.app", "https://worldstories-f.netlify.app", "http://localhost:8080", "http://127.0.0.1:8080",
+    "https://worldstories-b-production.up.railway.app", "https://worldstories-f.netlify.app", "http://localhost:8080", "http://127.0.0.1:8080", "https://worldstories.net", "https://www.worldstories.net"
 ]
 
 CORS_ALLOWED_ORIGINS = [
-    "https://worldstories-b-production.up.railway.app", "https://worldstories-f.netlify.app", "http://localhost:8080", "http://127.0.0.1:8080"
+    "https://worldstories-b-production.up.railway.app", "https://worldstories-f.netlify.app", "http://localhost:8080", "http://127.0.0.1:8080", "https://worldstories.net", "https://www.worldstories.net"
 ]
 
 CORS_ORIGIN_WHITELIST = [
-    "https://worldstories-b-production.up.railway.app", "https://worldstories-f.netlify.app", "http://localhost:8080", "http://127.0.0.1:8080"
+    "https://worldstories-b-production.up.railway.app", "https://worldstories-f.netlify.app", "http://localhost:8080", "http://127.0.0.1:8080", "https://worldstories.net", "https://www.worldstories.net"
 ]
 
 MIDDLEWARE += [
