@@ -79,6 +79,7 @@ urlpatterns = [
         name="audio-reading-progress",
     ),
     path("api/genres/", story_api.GenreListAPIView.as_view(), name="genre-list"),
+    path("api/library-shelves/", story_api.LibraryShelvesAPIView.as_view(), name="library-shelves"),
     path("api/sitemap.xml", sitemap, name="sitemap"),
     path("ckeditor5/", include("django_ckeditor_5.urls")),
 ] + static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)

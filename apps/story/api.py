@@ -49,6 +49,10 @@ class CataloguePagination(PageNumberPagination):
     page_size = 12
 
 
+class LibraryShelfPagination(PageNumberPagination):
+    page_size = 4
+
+
 class IsSuperUser(BasePermission):
     def has_permission(self, request, view):
         return bool(request.user and request.user.is_authenticated and request.user.is_superuser)
@@ -391,6 +395,51 @@ class GenreListAPIView(APIView):
         )
         serializer = GenreSerializer(genres, many=True)
         return Response(serializer.data)
+
+
+class LibraryShelvesAPIView(APIView):
+    """Paginates genres (the 'shelves'), not stories — each shelf carries only a small
+    preview of its stories. This keeps a genre-organized library view cheap regardless
+    of how large the catalog gets: only the shelves currently on screen (plus a page
+    of lookahead) ever hit the database."""
+
+    PREVIEW_SIZE = 8
+
+    def get(self, request):
+        genres = (
+            Genre.objects.filter(stories__is_published=True)
+            .annotate(
+                published_stories_count=Count(
+                    "stories",
+                    filter=Q(stories__is_published=True),
+                    distinct=True,
+                )
+            )
+            .order_by("name")
+        )
+
+        paginator = LibraryShelfPagination()
+        page = paginator.paginate_queryset(genres, request)
+
+        shelves = []
+        for genre in page:
+            preview_stories = (
+                Story.objects.filter(is_published=True, genres=genre)
+                .prefetch_related("genres", "audios")
+                .order_by("-views", "-rating", "-id")[: self.PREVIEW_SIZE]
+            )
+            shelves.append(
+                {
+                    "id": genre.id,
+                    "name": genre.name,
+                    "stories_count": genre.published_stories_count,
+                    "preview_stories": StoryListSerializer(
+                        preview_stories, many=True, context={"request": request}
+                    ).data,
+                }
+            )
+
+        return paginator.get_paginated_response(shelves)
 
 
 class AdminAuthorListAPIView(APIView):
