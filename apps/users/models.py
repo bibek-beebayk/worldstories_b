@@ -34,7 +34,7 @@ class User(AbstractBaseUser, PermissionsMixin):
     bio = models.TextField(blank=True, null=True)
     avatar_url = models.URLField(blank=True, null=True)
 
-    date_joined = models.DateTimeField(default=timezone.now)
+    date_joined = models.DateTimeField(default=timezone.now, db_index=True)
     last_login = models.DateTimeField(null=True, blank=True)
     login_count = models.BigIntegerField(default=0)
 

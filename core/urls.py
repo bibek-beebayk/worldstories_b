@@ -10,6 +10,7 @@ import os
 from rest_framework.routers import DefaultRouter
 from rest_framework_simplejwt.views import TokenRefreshView
 from apps.story import api as story_api
+from apps.story import analytics_api as story_analytics_api
 from apps.stats import views as stats_views
 from apps.users import api as users_api
 from apps.story.models import Story
@@ -66,6 +67,26 @@ urlpatterns = [
     path("api/discover/", story_api.DiscoverDataAPIView.as_view(), name="discover-data"),
     path("api/search/", story_api.SearchStoryAPIView.as_view(), name="search-data"),
     path("api/admin/overview/", story_api.AdminOverviewAPIView.as_view(), name="admin-overview"),
+    path(
+        "api/admin/analytics/content/",
+        story_analytics_api.AdminAnalyticsContentAPIView.as_view(),
+        name="admin-analytics-content",
+    ),
+    path(
+        "api/admin/analytics/engagement/",
+        story_analytics_api.AdminAnalyticsEngagementAPIView.as_view(),
+        name="admin-analytics-engagement",
+    ),
+    path(
+        "api/admin/analytics/users/",
+        story_analytics_api.AdminAnalyticsUsersAPIView.as_view(),
+        name="admin-analytics-users",
+    ),
+    path(
+        "api/admin/analytics/submissions/",
+        story_analytics_api.AdminAnalyticsSubmissionsAPIView.as_view(),
+        name="admin-analytics-submissions",
+    ),
     path("api/admin/authors/", story_api.AdminAuthorListAPIView.as_view(), name="admin-authors"),
     path("api/admin/genres/", story_api.AdminGenreListCreateAPIView.as_view(), name="admin-genres"),
     path(

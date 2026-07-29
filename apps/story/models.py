@@ -138,6 +138,7 @@ class Review(models.Model):
     class Meta:
         unique_together = ("story", "user")
         ordering = ["-created_at"]
+        indexes = [models.Index(fields=["created_at"])]
 
     def __str__(self):
         return f"{self.story.title} review by {self.user}"
@@ -153,6 +154,7 @@ class Favorite(models.Model):
     class Meta:
         unique_together = ("story", "user")
         ordering = ["-created_at"]
+        indexes = [models.Index(fields=["created_at"])]
 
     def __str__(self):
         return f"{self.user} favorited {self.story}"
@@ -200,6 +202,10 @@ class Submission(models.Model):
 
     class Meta:
         ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["created_at"]),
+            models.Index(fields=["reviewed_at"]),
+        ]
 
     def __str__(self):
         return f"{self.title} ({self.status})"
