@@ -410,6 +410,10 @@ class StoryAdminSerializer(serializers.ModelSerializer):
             "source",
         ]
         read_only_fields = ["rating", "views"]
+        # slug isn't required at the request level — validate() below auto-generates
+        # it from the title when omitted, but that only runs after field-level
+        # validation, so `slug` must not be marked required there.
+        extra_kwargs = {"slug": {"required": False}}
 
     def get_submitted_by(self, obj):
         if not obj.submitted_by:
