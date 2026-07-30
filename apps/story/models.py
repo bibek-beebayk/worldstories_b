@@ -24,6 +24,7 @@ LANGUAGE_CHOICES = [
     ("pt", "Portuguese"),
     ("it", "Italian"),
     ("hi", "Hindi"),
+    ("ne", "Nepali"),
     ("ja", "Japanese"),
     ("ko", "Korean"),
     ("zh", "Chinese"),
