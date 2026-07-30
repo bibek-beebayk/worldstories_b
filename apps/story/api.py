@@ -426,7 +426,8 @@ class SubmissionAdminViewSet(ModelViewSet):
             story.pdf_file = submission.pdf_file
         if submission.epub_file:
             story.epub_file = submission.epub_file
-        story.published_date = None
+        story.original_published_date = None
+        story.site_published_date = None
         story.is_published = False
         story.save()
         story.genres.set(submission.genres.all())
@@ -560,10 +561,10 @@ class HomeDataAPIView(APIView):
         featured_stories = take(base_qs.order_by("-views", "-rating", "-id"), 5)
         weekly_spotlight = take(base_qs.order_by("-rating", "-views", "-id"), 6)
         sidebar_recommended = take(base_qs.order_by("-rating", "-views", "-id"), 3)
-        new_trending = take(base_qs.order_by("-views", "-published_date", "-id"), 5)
-        recommended = take(base_qs.order_by("-rating", "-published_date", "-id"), 6)
+        new_trending = take(base_qs.order_by("-views", "-site_published_date", "-id"), 5)
+        recommended = take(base_qs.order_by("-rating", "-site_published_date", "-id"), 6)
         popular = take(base_qs.order_by("-views", "-rating", "-id"), 6)
-        new_releases = take(base_qs.order_by("-published_date", "-id"), 6)
+        new_releases = take(base_qs.order_by("-site_published_date", "-id"), 6)
         more_to_explore = take(base_qs.order_by("-id"), 12)
 
         readers_count = (
@@ -667,7 +668,7 @@ class DiscoverDataAPIView(APIView):
             {
                 "genres": GenreSerializer(genres, many=True).data,
                 "new_releases": StoryListSerializer(
-                    base_qs.order_by("-published_date", "-id")[:20],
+                    base_qs.order_by("-site_published_date", "-id")[:20],
                     many=True,
                     context={"request": request},
                 ).data,
@@ -806,7 +807,7 @@ class SearchStoryAPIView(ListAPIView):
         )
 
         if sort == "recent":
-            return queryset.order_by("-published_date", "-id")
+            return queryset.order_by("-site_published_date", "-id")
         if sort == "rating":
             return queryset.order_by("-rating", "-views", "-id")
         if sort == "views":

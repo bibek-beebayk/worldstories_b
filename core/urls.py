@@ -45,11 +45,11 @@ def sitemap(request):
         ]
     ]
 
-    stories = Story.objects.filter(is_published=True).only("slug", "published_date")
+    stories = Story.objects.filter(is_published=True).only("slug", "site_published_date")
     for story in stories.iterator():
         last_modified = (
-            f"<lastmod>{story.published_date.isoformat()}</lastmod>"
-            if story.published_date
+            f"<lastmod>{story.site_published_date.isoformat()}</lastmod>"
+            if story.site_published_date
             else ""
         )
         entries.append(

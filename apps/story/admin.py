@@ -50,7 +50,7 @@ def _publish_submission(submission: Submission, reviewer) -> Story:
         story_type=submission.story_type,
         author=None,
         submitted_by=submission.user,
-        published_date=timezone.now().date(),
+        site_published_date=timezone.now().date(),
         cover_image=submission.cover_image or None,
         cover_image_file=submission.cover_image_file,
         pdf_file=submission.pdf_file,
@@ -116,7 +116,7 @@ class StoryAdmin(admin.ModelAdmin):
         (
             "Publishing",
             {
-                "fields": ("published_date",),
+                "fields": ("original_published_date", "site_published_date"),
             },
         ),
         (
@@ -136,7 +136,8 @@ class StoryAdmin(admin.ModelAdmin):
         "is_completed",
         "rating",
         "views",
-        "published_date",
+        "original_published_date",
+        "site_published_date",
         "chapters_count",
         "audios_count",
     )
@@ -151,12 +152,12 @@ class StoryAdmin(admin.ModelAdmin):
     list_filter = (
         "story_type",
         "is_completed",
-        "published_date",
+        "site_published_date",
         "genres",
         "tags",
     )
-    ordering = ("-published_date", "-id")
-    date_hierarchy = "published_date"
+    ordering = ("-site_published_date", "-id")
+    date_hierarchy = "site_published_date"
     list_select_related = ("author", "submitted_by")
     filter_horizontal = ("genres", "tags")
     autocomplete_fields = ("author",)

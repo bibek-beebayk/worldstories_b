@@ -83,11 +83,10 @@ class AdminAnalyticsContentAPIView(APIView):
         )
 
         publishing_over_time = (
-            Story.objects.filter(is_published=True, created_at__gte=cutoff)
-            .annotate(day=TruncDate("created_at"))
-            .values("day")
+            Story.objects.filter(is_published=True, site_published_date__gte=cutoff.date())
+            .values("site_published_date")
             .annotate(count=Count("id"))
-            .order_by("day")
+            .order_by("site_published_date")
         )
 
         return Response(
@@ -114,7 +113,7 @@ class AdminAnalyticsContentAPIView(APIView):
                     for row in completion_split
                 ],
                 "publishing_over_time": [
-                    {"day": row["day"], "count": row["count"]} for row in publishing_over_time
+                    {"day": row["site_published_date"], "count": row["count"]} for row in publishing_over_time
                 ],
             }
         )

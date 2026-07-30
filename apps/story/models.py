@@ -70,7 +70,16 @@ class Story(models.Model):
         null=True,
         related_name="submitted_stories",
     )
-    published_date = models.DateField(blank=True, null=True)
+    original_published_date = models.DateField(
+        blank=True,
+        null=True,
+        help_text="When this work was originally published (e.g. for reprints/adaptations of existing works).",
+    )
+    site_published_date = models.DateField(
+        blank=True,
+        null=True,
+        help_text="When this story went live on WorldStories. Drives recency sorting and the publishing velocity stat.",
+    )
     cover_image = models.URLField(blank=True, null=True)
     cover_image_file = VersatileImageField(upload_to="story_covers/", blank=True, null=True)
     pdf_file = models.FileField(upload_to="story_files/pdfs/", blank=True, null=True)

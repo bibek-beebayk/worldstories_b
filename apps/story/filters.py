@@ -21,10 +21,10 @@ class StoryFilter(filters.FilterSet):
     
     def filter_sort(self, queryset, name, value):
         if value.lower() == "recent":
-            return queryset.order_by("-published_date")
+            return queryset.order_by("-site_published_date")
         # TODO: Fix sorting logic
         elif value.lower() == "popular":
-            return queryset.order_by("published_date")
+            return queryset.order_by("site_published_date")
         elif value.lower() == "rating":
             return queryset.order_by("-rating")
         elif value.lower() == "views":
