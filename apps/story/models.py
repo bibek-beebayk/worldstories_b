@@ -1,3 +1,5 @@
+import uuid
+
 from django.db import models
 from django_ckeditor_5.fields import CKEditor5Field
 from django.core.validators import MinValueValidator, MaxValueValidator
@@ -12,6 +14,21 @@ STORY_TYPE_CHOICES = [
     ("Novella", "Novella"),
     ("Poetry", "Poetry"),
     ("Non Fiction", "Non Fiction"),
+]
+
+LANGUAGE_CHOICES = [
+    ("en", "English"),
+    ("es", "Spanish"),
+    ("fr", "French"),
+    ("de", "German"),
+    ("pt", "Portuguese"),
+    ("it", "Italian"),
+    ("hi", "Hindi"),
+    ("ja", "Japanese"),
+    ("ko", "Korean"),
+    ("zh", "Chinese"),
+    ("ar", "Arabic"),
+    ("ru", "Russian"),
 ]
 
 SUBMISSION_STATUS_CHOICES = [
@@ -62,6 +79,13 @@ class Story(models.Model):
     genres = models.ManyToManyField(Genre, related_name="stories")
     story_type = models.CharField(
         max_length=50, choices=STORY_TYPE_CHOICES, default="Short Story"
+    )
+    language = models.CharField(max_length=10, choices=LANGUAGE_CHOICES, default="en", db_index=True)
+    translation_group = models.UUIDField(
+        default=uuid.uuid4,
+        editable=False,
+        db_index=True,
+        help_text="Stories sharing this value are treated as translations of the same work.",
     )
     author = models.ForeignKey(Author, on_delete=models.CASCADE, blank=True, null=True, related_name="stories")
     submitted_by = models.ForeignKey(
@@ -181,6 +205,7 @@ class Submission(models.Model):
     story_type = models.CharField(
         max_length=50, choices=STORY_TYPE_CHOICES, default="Short Story"
     )
+    language = models.CharField(max_length=10, choices=LANGUAGE_CHOICES, default="en")
     genres = models.ManyToManyField(Genre, related_name="submissions")
     cover_image = models.URLField(blank=True, null=True)
     cover_image_file = models.ImageField(

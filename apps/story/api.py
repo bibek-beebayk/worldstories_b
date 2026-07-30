@@ -1,4 +1,5 @@
 import re
+import uuid
 
 from rest_framework.viewsets import ReadOnlyModelViewSet, ModelViewSet
 from rest_framework.views import APIView
@@ -325,6 +326,31 @@ class StoryAdminViewSet(ModelViewSet):
     filter_backends = [SearchFilter]
     search_fields = ["title", "slug", "about"]
 
+    @action(detail=True, methods=["post"], url_path="link-translation")
+    def link_translation(self, request, pk=None):
+        story = self.get_object()
+        target_id = request.data.get("target_story_id")
+        if not target_id:
+            return Response({"detail": "target_story_id is required."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            target = Story.objects.get(pk=target_id)
+        except Story.DoesNotExist:
+            return Response({"detail": "Target story not found."}, status=status.HTTP_404_NOT_FOUND)
+        if target.pk == story.pk:
+            return Response(
+                {"detail": "A story cannot be linked to itself."}, status=status.HTTP_400_BAD_REQUEST
+            )
+        story.translation_group = target.translation_group
+        story.save(update_fields=["translation_group"])
+        return Response(self.get_serializer(story).data)
+
+    @action(detail=True, methods=["post"], url_path="unlink-translation")
+    def unlink_translation(self, request, pk=None):
+        story = self.get_object()
+        story.translation_group = uuid.uuid4()
+        story.save(update_fields=["translation_group"])
+        return Response(self.get_serializer(story).data)
+
 
 class ChapterAdminViewSet(ModelViewSet):
     queryset = Chapter.objects.select_related("story").all().order_by("story_id", "order")
@@ -418,6 +444,7 @@ class SubmissionAdminViewSet(ModelViewSet):
         story.title = submission.title
         story.about = submission.about
         story.story_type = submission.story_type
+        story.language = submission.language
         story.submitted_by = submission.user
         story.cover_image = submission.cover_image
         if submission.cover_image_file:
@@ -788,6 +815,7 @@ class SearchStoryAPIView(ListAPIView):
     def get_queryset(self):
         q = self.request.query_params.get("q", "").strip()
         sort = self.request.query_params.get("sort", "popular").lower()
+        language = self.request.query_params.get("language", "").strip()
 
         if not q:
             return Story.objects.none()
@@ -805,6 +833,9 @@ class SearchStoryAPIView(ListAPIView):
             )
             .distinct()
         )
+
+        if language and language.lower() != "all":
+            queryset = queryset.filter(language=language)
 
         if sort == "recent":
             return queryset.order_by("-site_published_date", "-id")

@@ -5,6 +5,7 @@ from .models import Story
 class StoryFilter(filters.FilterSet):
     status = filters.CharFilter(method="filter_status", label="Status")
     genres = filters.CharFilter(method="filter_genres", label="Genres")
+    language = filters.CharFilter(method="filter_language", label="Language")
     sort = filters.CharFilter(method="filter_sort", label="Sort")
     q = filters.CharFilter(method="filter_q", label="Query")
 
@@ -14,10 +15,15 @@ class StoryFilter(filters.FilterSet):
         elif value.lower() == "ongoing":
             return queryset.filter(is_completed=False)
         return queryset
-    
+
     def filter_genres(self, queryset, name, value):
         genre_ids = [genre.strip() for genre in value.split(",")]
         return queryset.filter(genres__id__in=genre_ids).distinct()
+
+    def filter_language(self, queryset, name, value):
+        if not value or value.lower() == "all":
+            return queryset
+        return queryset.filter(language=value)
     
     def filter_sort(self, queryset, name, value):
         if value.lower() == "recent":
@@ -45,4 +51,4 @@ class StoryFilter(filters.FilterSet):
 
     class Meta:
         model = Story
-        fields = ["status", "genres", "sort", "q"]
+        fields = ["status", "genres", "language", "sort", "q"]

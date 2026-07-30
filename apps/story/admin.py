@@ -48,6 +48,7 @@ def _publish_submission(submission: Submission, reviewer) -> Story:
         slug=_unique_story_slug(submission.title),
         about=submission.about,
         story_type=submission.story_type,
+        language=submission.language,
         author=None,
         submitted_by=submission.user,
         site_published_date=timezone.now().date(),
@@ -92,7 +93,7 @@ class StoryAdmin(admin.ModelAdmin):
         (
             "Core Details",
             {
-                "fields": ("title", "slug", "about", "story_type", "author"),
+                "fields": ("title", "slug", "about", "story_type", "language", "author"),
             },
         ),
         (
@@ -131,6 +132,7 @@ class StoryAdmin(admin.ModelAdmin):
     list_display = (
         "title",
         "story_type",
+        "language",
         "author",
         "submitted_by",
         "is_completed",
@@ -151,6 +153,7 @@ class StoryAdmin(admin.ModelAdmin):
     )
     list_filter = (
         "story_type",
+        "language",
         "is_completed",
         "site_published_date",
         "genres",
@@ -215,9 +218,9 @@ class ReviewAdmin(admin.ModelAdmin):
 
 @admin.register(Submission)
 class SubmissionAdmin(admin.ModelAdmin):
-    list_display = ("title", "user", "status", "published_story", "created_at", "updated_at")
+    list_display = ("title", "user", "language", "status", "published_story", "created_at", "updated_at")
     search_fields = ("title", "user__email", "about")
-    list_filter = ("status", "story_type", "created_at")
+    list_filter = ("status", "story_type", "language", "created_at")
     filter_horizontal = ("genres",)
     readonly_fields = ("reviewed_by", "reviewed_at", "published_story", "created_at", "updated_at")
     actions = ["approve_and_publish", "mark_rejected"]

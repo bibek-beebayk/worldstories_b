@@ -81,6 +81,7 @@ class StoryListSerializer(serializers.ModelSerializer):
             "title",
             "slug",
             "story_type",
+            "language",
             "site_published_date",
             "cover_image",
             "rating",
@@ -137,9 +138,22 @@ class StoryDetailSerializer(serializers.ModelSerializer):
     favorites_count = serializers.SerializerMethodField()
     chapters = ChapterListSerializer(many=True, read_only=True)
     audios = AudioSerializer(many=True, read_only=True)
+    translations = serializers.SerializerMethodField()
 
     def get_chapter_count(self, obj):
         return obj.chapters.count()
+
+    def get_translations(self, obj):
+        siblings = (
+            Story.objects.filter(translation_group=obj.translation_group, is_published=True)
+            .exclude(pk=obj.pk)
+            .only("id", "slug", "language", "title")
+            .order_by("language")
+        )
+        return [
+            {"id": sibling.id, "slug": sibling.slug, "language": sibling.language, "title": sibling.title}
+            for sibling in siblings
+        ]
     
     def get_reviews_count(self, obj):
         return obj.reviews.count()
@@ -187,6 +201,8 @@ class StoryDetailSerializer(serializers.ModelSerializer):
             "about",
             "genres",
             "story_type",
+            "language",
+            "translations",
             "author",
             "submitted_by",
             "original_published_date",
@@ -246,6 +262,7 @@ class SubmissionSerializer(serializers.ModelSerializer):
             "about",
             "content",
             "story_type",
+            "language",
             "genres",
             "cover_image",
             "cover_image_file",
@@ -307,6 +324,7 @@ class SubmissionListSerializer(serializers.ModelSerializer):
             "id",
             "title",
             "story_type",
+            "language",
             "genres",
             "cover_image",
             "status",
@@ -345,6 +363,19 @@ class StoryAdminSerializer(serializers.ModelSerializer):
     epub_file_url = serializers.SerializerMethodField(read_only=True)
     submitted_by = serializers.SerializerMethodField(read_only=True)
     source = serializers.SerializerMethodField(read_only=True)
+    translations = serializers.SerializerMethodField(read_only=True)
+
+    def get_translations(self, obj):
+        siblings = (
+            Story.objects.filter(translation_group=obj.translation_group)
+            .exclude(pk=obj.pk)
+            .only("id", "slug", "language", "title")
+            .order_by("language")
+        )
+        return [
+            {"id": sibling.id, "slug": sibling.slug, "language": sibling.language, "title": sibling.title}
+            for sibling in siblings
+        ]
 
     class Meta:
         model = Story
@@ -354,6 +385,8 @@ class StoryAdminSerializer(serializers.ModelSerializer):
             "slug",
             "about",
             "story_type",
+            "language",
+            "translations",
             "author",
             "submitted_by",
             "original_published_date",
@@ -534,6 +567,7 @@ class SubmissionAdminSerializer(serializers.ModelSerializer):
             "about",
             "content",
             "story_type",
+            "language",
             "genres",
             "cover_image",
             "cover_image_url",
@@ -557,6 +591,7 @@ class SubmissionAdminSerializer(serializers.ModelSerializer):
             "about",
             "content",
             "story_type",
+            "language",
             "genres",
             "cover_image",
             "cover_image_url",
