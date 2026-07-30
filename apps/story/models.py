@@ -9,6 +9,7 @@ from core.libs.models import TimeStampModel
 STORY_TYPE_CHOICES = [
     ("Short Story", "Short Story"),
     ("Novel", "Novel"),
+    ("Novella", "Novella"),
     ("Poetry", "Poetry"),
     ("Non Fiction", "Non Fiction"),
 ]
