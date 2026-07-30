@@ -80,6 +80,7 @@ class Story(models.Model):
     rating = models.FloatField(default=0.0)
     views = models.PositiveIntegerField(default=0)
     is_published = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
 
     def has_audio(self):
         return self.audios.exists()

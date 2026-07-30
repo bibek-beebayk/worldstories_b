@@ -38,7 +38,6 @@ class AdminAnalyticsContentAPIView(APIView):
     def get(self, request):
         days = get_range_days(request)
         cutoff = get_cutoff(days)
-        cutoff_date = cutoff.date()
 
         views_over_time = (
             StoryView.objects.filter(created_at__gte=cutoff)
@@ -84,10 +83,11 @@ class AdminAnalyticsContentAPIView(APIView):
         )
 
         publishing_over_time = (
-            Story.objects.filter(is_published=True, published_date__gte=cutoff_date)
-            .values("published_date")
+            Story.objects.filter(is_published=True, created_at__gte=cutoff)
+            .annotate(day=TruncDate("created_at"))
+            .values("day")
             .annotate(count=Count("id"))
-            .order_by("published_date")
+            .order_by("day")
         )
 
         return Response(
@@ -114,7 +114,7 @@ class AdminAnalyticsContentAPIView(APIView):
                     for row in completion_split
                 ],
                 "publishing_over_time": [
-                    {"day": row["published_date"], "count": row["count"]} for row in publishing_over_time
+                    {"day": row["day"], "count": row["count"]} for row in publishing_over_time
                 ],
             }
         )
