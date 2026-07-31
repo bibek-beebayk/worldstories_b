@@ -1,7 +1,7 @@
 from rest_framework import serializers
 
 from apps.story.models import Chapter, Audio
-from apps.stats.models import ReadingProgress, AudioReadingProgress
+from apps.stats.models import ReadingProgress, AudioReadingProgress, FileReadingProgress
 
 
 class ChapterProgressSerializer(serializers.Serializer):
@@ -59,6 +59,17 @@ class ReadingProgressWriteSerializer(serializers.Serializer):
                 )
         attrs["chapter"] = chapter
         return attrs
+
+
+class FileReadingProgressSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = FileReadingProgress
+        fields = ["format", "progress", "position", "updated_at"]
+
+
+class FileReadingProgressWriteSerializer(serializers.Serializer):
+    progress = serializers.FloatField(min_value=0.0, max_value=1.0)
+    position = serializers.CharField(required=False, allow_blank=True, allow_null=True)
 
 
 class AudioProgressSerializer(serializers.Serializer):

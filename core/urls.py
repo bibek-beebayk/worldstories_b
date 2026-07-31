@@ -109,6 +109,11 @@ urlpatterns = [
         stats_views.AudioReadingProgressAPIView.as_view(),
         name="audio-reading-progress",
     ),
+    path(
+        "api/file-reading-progress/<slug:story_slug>/<str:file_format>/",
+        stats_views.FileReadingProgressAPIView.as_view(),
+        name="file-reading-progress",
+    ),
     path("api/genres/", story_api.GenreListAPIView.as_view(), name="genre-list"),
     path("api/library-shelves/", story_api.LibraryShelvesAPIView.as_view(), name="library-shelves"),
     path("api/sitemap.xml", sitemap, name="sitemap"),

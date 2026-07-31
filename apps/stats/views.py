@@ -5,12 +5,19 @@ from rest_framework.response import Response
 from rest_framework import status
 
 from apps.story.models import Story
-from apps.stats.models import ReadingProgress, ChapterReadingProgress, AudioReadingProgress
+from apps.stats.models import (
+    ReadingProgress,
+    ChapterReadingProgress,
+    AudioReadingProgress,
+    FileReadingProgress,
+)
 from apps.stats.serializers import (
     ReadingProgressSerializer,
     ReadingProgressWriteSerializer,
     AudioReadingProgressSerializer,
     AudioReadingProgressWriteSerializer,
+    FileReadingProgressSerializer,
+    FileReadingProgressWriteSerializer,
 )
 
 
@@ -148,3 +155,40 @@ class AudioReadingProgressAPIView(APIView):
         progress_obj.save()
 
         return Response(self._build_progress_payload(request, story, progress_obj))
+
+
+class FileReadingProgressAPIView(APIView):
+    """Tracks progress through a story's EPUB/PDF file — one row per
+    (user, story, format), unlike chapters/audios there's only ever one file
+    of a given format per story so no per-item breakdown is needed."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, story_slug, file_format):
+        if file_format not in dict(FileReadingProgress.FORMAT_CHOICES):
+            return Response({"detail": "Invalid format."}, status=status.HTTP_400_BAD_REQUEST)
+        story = get_object_or_404(Story, slug=story_slug)
+        progress = FileReadingProgress.objects.filter(
+            user=request.user, story=story, format=file_format
+        ).first()
+        if not progress:
+            return Response({"detail": "Progress not found."}, status=status.HTTP_404_NOT_FOUND)
+        return Response(FileReadingProgressSerializer(progress).data)
+
+    def put(self, request, story_slug, file_format):
+        if file_format not in dict(FileReadingProgress.FORMAT_CHOICES):
+            return Response({"detail": "Invalid format."}, status=status.HTTP_400_BAD_REQUEST)
+        story = get_object_or_404(Story, slug=story_slug)
+        serializer = FileReadingProgressWriteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        progress_obj, _ = FileReadingProgress.objects.get_or_create(
+            user=request.user,
+            story=story,
+            format=file_format,
+        )
+        progress_obj.progress = max(progress_obj.progress, serializer.validated_data["progress"])
+        progress_obj.position = serializer.validated_data.get("position", progress_obj.position)
+        progress_obj.save()
+
+        return Response(FileReadingProgressSerializer(progress_obj).data)

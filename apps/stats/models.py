@@ -74,6 +74,50 @@ class ChapterReadingProgress(models.Model):
         return f"{self.user} - {self.chapter} ({self.progress:.2%})"
 
 
+class FileReadingProgress(models.Model):
+    """Progress through a story's EPUB or PDF file — unlike chapters/audios
+    there's only ever one file per format per story, so one row per
+    (user, story, format) is enough (no per-item breakdown needed)."""
+
+    FORMAT_EPUB = "epub"
+    FORMAT_PDF = "pdf"
+    FORMAT_CHOICES = [
+        (FORMAT_EPUB, "EPUB"),
+        (FORMAT_PDF, "PDF"),
+    ]
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="file_reading_progress",
+    )
+    story = models.ForeignKey(
+        Story,
+        on_delete=models.CASCADE,
+        related_name="file_reading_progress",
+    )
+    format = models.CharField(max_length=10, choices=FORMAT_CHOICES)
+
+    # Overall progress through the file (0.0 - 1.0)
+    progress = models.FloatField(default=0.0)
+
+    # Format-specific position marker: an EPUB CFI string for "epub", or a
+    # page number (stored as text) for "pdf" — opaque to the backend, just
+    # round-tripped so the frontend reader can resume exactly where it left off.
+    position = models.CharField(max_length=512, blank=True, null=True)
+
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = ("user", "story", "format")
+        indexes = [
+            models.Index(fields=["user", "story", "format"]),
+        ]
+
+    def __str__(self):
+        return f"{self.user} - {self.story} [{self.format}] ({self.progress:.2%})"
+
+
 class AudioReadingProgress(models.Model):
     user = models.ForeignKey(
         settings.AUTH_USER_MODEL,
