@@ -271,6 +271,14 @@ class StoryViewSet(ReadOnlyModelViewSet):
         file_obj = story.pdf_file.open("rb")
         return FileResponse(file_obj, content_type="application/pdf")
 
+    @action(detail=True, methods=["get"], url_path="epub-stream")
+    def epub_stream(self, request, slug=None):
+        story = self.get_object()
+        if not story.epub_file:
+            return Response({"detail": "EPUB file not available."}, status=status.HTTP_404_NOT_FOUND)
+        file_obj = story.epub_file.open("rb")
+        return FileResponse(file_obj, content_type="application/epub+zip")
+
 
 class SubmissionViewSet(ModelViewSet):
     parser_classes = [MultiPartParser, FormParser, JSONParser]
