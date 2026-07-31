@@ -14,6 +14,7 @@ STORY_TYPE_CHOICES = [
     ("Novella", "Novella"),
     ("Poetry", "Poetry"),
     ("Non Fiction", "Non Fiction"),
+    ("Summary", "Summary"),
 ]
 
 LANGUAGE_CHOICES = [
