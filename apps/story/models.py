@@ -129,6 +129,37 @@ class Story(models.Model):
         verbose_name_plural = "Stories"
 
 
+def with_preferred_translation_only(queryset):
+    """Given a queryset of Story rows, keep only one row per translation_group
+    — the English edition if the group has one, otherwise its oldest (lowest
+    id) edition — so public listings (library, home, etc.) show a single
+    entry per underlying work instead of one per language. Stories that
+    aren't linked to any other translation form a "group" of one and always
+    pass through untouched.
+
+    Only considers published stories when picking each group's
+    representative, so callers should already be filtering on
+    is_published=True (as every current caller does) — otherwise a group
+    could "win" on an unpublished edition and vanish from the results
+    entirely once the outer is_published filter excludes it.
+    """
+    preferred_id = (
+        Story.objects.filter(
+            translation_group=models.OuterRef("translation_group"), is_published=True
+        )
+        .annotate(
+            _language_priority=models.Case(
+                models.When(language="en", then=models.Value(0)),
+                default=models.Value(1),
+                output_field=models.IntegerField(),
+            )
+        )
+        .order_by("_language_priority", "id")
+        .values("id")[:1]
+    )
+    return queryset.filter(id=models.Subquery(preferred_id))
+
+
 class Chapter(models.Model):
     story = models.ForeignKey(Story, on_delete=models.CASCADE, related_name="chapters")
     title = models.CharField(max_length=256)

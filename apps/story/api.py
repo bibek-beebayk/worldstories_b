@@ -18,7 +18,18 @@ from rest_framework.filters import SearchFilter
 from apps.story.filters import StoryFilter
 from apps.stats.models import ReadingProgress, AudioReadingProgress
 from apps.users.models import User
-from .models import Genre, Story, Chapter, Audio, Author, Review, Favorite, Submission, StoryView
+from .models import (
+    Genre,
+    Story,
+    Chapter,
+    Audio,
+    Author,
+    Review,
+    Favorite,
+    Submission,
+    StoryView,
+    with_preferred_translation_only,
+)
 from .serializers import (
     GenreSerializer,
     AdminGenreSerializer,
@@ -93,6 +104,17 @@ class StoryViewSet(ReadOnlyModelViewSet):
     filter_backends = [DjangoFilterBackend]
     filterset_class = StoryFilter
     pagination_class = CataloguePagination
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        # Only the "list" action (the public browse/search listing) collapses
+        # each translation_group down to one edition — retrieve and the other
+        # detail actions (chapter, favorite, reviews, etc.) must still resolve
+        # any specific translation directly by its own slug, e.g. for the
+        # Translations panel's "switch language" links to keep working.
+        if self.action == "list":
+            queryset = with_preferred_translation_only(queryset)
+        return queryset
 
     def get_permissions(self):
         if self.action in {"reviews", "my_review"} and self.request.method in {
@@ -504,12 +526,17 @@ class LibraryShelvesAPIView(APIView):
     PREVIEW_SIZE = 8
 
     def get(self, request):
+        # Collapses each translation_group to a single (English-preferred)
+        # edition first, so both the per-genre counts and the preview lists
+        # below only ever reflect one entry per underlying work.
+        preferred_stories = with_preferred_translation_only(Story.objects.filter(is_published=True))
+
         genres = (
-            Genre.objects.filter(stories__is_published=True)
+            Genre.objects.filter(stories__in=preferred_stories)
             .annotate(
                 published_stories_count=Count(
                     "stories",
-                    filter=Q(stories__is_published=True),
+                    filter=Q(stories__in=preferred_stories),
                     distinct=True,
                 )
             )
@@ -519,13 +546,13 @@ class LibraryShelvesAPIView(APIView):
         paginator = LibraryShelfPagination()
         page = paginator.paginate_queryset(genres, request)
         paginator.aggregate = {
-            "total_stories": Story.objects.filter(is_published=True).count()
+            "total_stories": preferred_stories.count()
         }
 
         shelves = []
         for genre in page:
             preview_stories = (
-                Story.objects.filter(is_published=True, genres=genre)
+                preferred_stories.filter(genres=genre)
                 .prefetch_related("genres", "audios")
                 .order_by("-views", "-rating", "-id")[: self.PREVIEW_SIZE]
             )
