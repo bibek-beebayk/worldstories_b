@@ -2,6 +2,7 @@ from rest_framework import serializers
 from django.utils.text import slugify
 from core.libs.images import get_cover_image_url
 from .models import Audio, Story, Genre, Chapter, Tag, Author, Review, Submission
+from . import reading_time
 
 CARD_COVER_SIZE = "480x640"
 LARGE_COVER_SIZE = "900x1200"
@@ -139,9 +140,17 @@ class StoryDetailSerializer(serializers.ModelSerializer):
     chapters = ChapterListSerializer(many=True, read_only=True)
     audios = AudioSerializer(many=True, read_only=True)
     translations = serializers.SerializerMethodField()
+    reading_time_minutes = serializers.SerializerMethodField()
+    listening_time_minutes = serializers.SerializerMethodField()
 
     def get_chapter_count(self, obj):
         return obj.chapters.count()
+
+    def get_reading_time_minutes(self, obj):
+        return reading_time.story_reading_minutes(obj)
+
+    def get_listening_time_minutes(self, obj):
+        return reading_time.story_listening_minutes(obj.audios.all())
 
     def get_translations(self, obj):
         siblings = (
@@ -219,6 +228,8 @@ class StoryDetailSerializer(serializers.ModelSerializer):
             "chapter_count",
             "chapters",
             "audios",
+            "reading_time_minutes",
+            "listening_time_minutes",
         ]
 
 
@@ -548,9 +559,26 @@ class AudioAdminSerializer(serializers.ModelSerializer):
             attrs["slug"] = self._build_unique_slug(story, title, self.instance)
         return attrs
 
+    def _probe_and_save_duration(self, instance):
+        duration = reading_time.probe_audio_duration_seconds(instance.audio_file)
+        instance.duration_seconds = duration
+        instance.save(update_fields=["duration_seconds"])
+
+    def create(self, validated_data):
+        instance = super().create(validated_data)
+        self._probe_and_save_duration(instance)
+        return instance
+
+    def update(self, instance, validated_data):
+        instance = super().update(instance, validated_data)
+        if "audio_file" in validated_data:
+            self._probe_and_save_duration(instance)
+        return instance
+
     class Meta:
         model = Audio
-        fields = ["id", "story", "title", "slug", "audio_file", "order"]
+        fields = ["id", "story", "title", "slug", "audio_file", "order", "duration_seconds"]
+        read_only_fields = ["duration_seconds"]
 
 
 class SubmissionAdminSerializer(serializers.ModelSerializer):

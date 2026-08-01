@@ -13,3 +13,5 @@ django-solo
 google-auth
 requests
 python-dotenv
+mutagen
+pypdf

@@ -183,6 +183,11 @@ class Audio(models.Model):
     uploaded_at = models.DateTimeField(auto_now_add=True)
     order = models.PositiveIntegerField(default=1)
 
+    # Probed from the audio file itself (via mutagen) once at upload time and
+    # cached here — computing it on demand would mean downloading the full
+    # file from remote storage on every story-detail page view.
+    duration_seconds = models.FloatField(null=True, blank=True, default=None)
+
     def __str__(self):
         return f"Audio for {self.story.title} uploaded at {self.uploaded_at}"
     
