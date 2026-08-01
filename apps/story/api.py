@@ -301,6 +301,20 @@ class StoryViewSet(ReadOnlyModelViewSet):
         file_obj = story.epub_file.open("rb")
         return FileResponse(file_obj, content_type="application/epub+zip")
 
+    @action(detail=True, methods=["get"], url_path=r"audios/(?P<audio_slug>[^/.]+)/stream")
+    def audio_stream(self, request, slug=None, audio_slug=None):
+        """Same-origin proxy for an audio chapter's bytes — used only by the
+        offline-download flow so it can fetch bytes to encrypt without
+        depending on the R2 bucket's CORS config (unlike normal playback,
+        which reads audio_file's direct R2 URL and doesn't need CORS since
+        it's a plain <audio> resource load, not a script-readable fetch)."""
+        story = self.get_object()
+        audio = story.audios.filter(slug=audio_slug).first()
+        if not audio or not audio.audio_file:
+            return Response({"detail": "Audio file not available."}, status=status.HTTP_404_NOT_FOUND)
+        file_obj = audio.audio_file.open("rb")
+        return FileResponse(file_obj, content_type="audio/mpeg")
+
 
 class SubmissionViewSet(ModelViewSet):
     parser_classes = [MultiPartParser, FormParser, JSONParser]
