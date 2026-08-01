@@ -54,6 +54,14 @@ MIDDLEWARE = [
 # Needed for same-origin iframe usage in admin modal workflows.
 X_FRAME_OPTIONS = "SAMEORIGIN"
 
+# Content-Length isn't in the CORS response-header safelist browsers expose to
+# script by default — without this, the frontend's cross-origin download
+# progress tracking (reading Content-Length to compute a percentage while
+# streaming epub/pdf/audio bytes) would silently see no total and show no
+# percentage in production, where the frontend and backend are different
+# origins.
+CORS_EXPOSE_HEADERS = ["Content-Length"]
+
 ROOT_URLCONF = "core.urls"
 
 TEMPLATES = [
