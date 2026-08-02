@@ -1,3 +1,4 @@
+import calendar
 import uuid
 
 from django.db import models
@@ -117,10 +118,22 @@ class Story(models.Model):
         null=True,
         related_name="submitted_stories",
     )
-    original_published_date = models.DateField(
+    original_published_year = models.PositiveSmallIntegerField(
         blank=True,
         null=True,
-        help_text="When this work was originally published (e.g. for reprints/adaptations of existing works).",
+        help_text="Year the work was originally published, if known (e.g. for reprints/adaptations of existing works).",
+    )
+    original_published_month = models.PositiveSmallIntegerField(
+        blank=True,
+        null=True,
+        validators=[MinValueValidator(1), MaxValueValidator(12)],
+        help_text="Month (1-12) it was originally published, if known. Only meaningful when the year is also set.",
+    )
+    original_published_day = models.PositiveSmallIntegerField(
+        blank=True,
+        null=True,
+        validators=[MinValueValidator(1), MaxValueValidator(31)],
+        help_text="Day of month it was originally published, if known. Only meaningful when the month is also set.",
     )
     site_published_date = models.DateField(
         blank=True,
@@ -151,6 +164,20 @@ class Story(models.Model):
 
     def has_audio(self):
         return self.audios.exists()
+
+    def original_published_date_display(self):
+        """Formats whichever of year/month/day are actually known — "1920",
+        "March 1920", or "March 15, 1920". Returns None if even the year is
+        missing; falling back to site_published_date in that case is handled
+        at the serializer level, since that's a different field entirely."""
+        if not self.original_published_year:
+            return None
+        if self.original_published_month:
+            month_name = calendar.month_name[self.original_published_month]
+            if self.original_published_day:
+                return f"{month_name} {self.original_published_day}, {self.original_published_year}"
+            return f"{month_name} {self.original_published_year}"
+        return str(self.original_published_year)
 
     def __str__(self):
         return self.title

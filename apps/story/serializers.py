@@ -142,9 +142,18 @@ class StoryDetailSerializer(serializers.ModelSerializer):
     translations = serializers.SerializerMethodField()
     reading_time_minutes = serializers.SerializerMethodField()
     listening_time_minutes = serializers.SerializerMethodField()
+    published_date_label = serializers.SerializerMethodField()
 
     def get_chapter_count(self, obj):
         return obj.chapters.count()
+
+    def get_published_date_label(self, obj):
+        original = obj.original_published_date_display()
+        if original:
+            return original
+        if obj.site_published_date:
+            return obj.site_published_date.strftime("%B %-d, %Y")
+        return None
 
     def get_reading_time_minutes(self, obj):
         return reading_time.story_reading_minutes(obj)
@@ -214,7 +223,11 @@ class StoryDetailSerializer(serializers.ModelSerializer):
             "translations",
             "author",
             "submitted_by",
-            "original_published_date",
+            "original_published_year",
+            "original_published_month",
+            "original_published_day",
+            "site_published_date",
+            "published_date_label",
             "cover_image",
             "pdf_file",
             "epub_file",
@@ -375,6 +388,15 @@ class StoryAdminSerializer(serializers.ModelSerializer):
     submitted_by = serializers.SerializerMethodField(read_only=True)
     source = serializers.SerializerMethodField(read_only=True)
     translations = serializers.SerializerMethodField(read_only=True)
+    published_date_label = serializers.SerializerMethodField(read_only=True)
+
+    def get_published_date_label(self, obj):
+        original = obj.original_published_date_display()
+        if original:
+            return original
+        if obj.site_published_date:
+            return obj.site_published_date.strftime("%B %-d, %Y")
+        return None
 
     def get_translations(self, obj):
         siblings = (
@@ -389,12 +411,18 @@ class StoryAdminSerializer(serializers.ModelSerializer):
         ]
 
     # The admin form submits these as multipart FormData, where "clear this
-    # optional date" naturally comes through as an empty string rather than
-    # omitting the key — but DRF's Date/DateTimeField only treats an actual
-    # None as "no value" and rejects "" as an invalid format. Normalizing
-    # empty strings to None here (before field validation) lets clearing any
-    # of these three fields actually work instead of erroring.
-    CLEARABLE_DATE_FIELDS = ("original_published_date", "site_published_date", "publish_at")
+    # optional value" naturally comes through as an empty string rather than
+    # omitting the key — but DRF's Date/DateTime/IntegerField only treats an
+    # actual None as "no value" and rejects "" as an invalid format.
+    # Normalizing empty strings to None here (before field validation) lets
+    # clearing any of these fields actually work instead of erroring.
+    CLEARABLE_DATE_FIELDS = (
+        "original_published_year",
+        "original_published_month",
+        "original_published_day",
+        "site_published_date",
+        "publish_at",
+    )
 
     def to_internal_value(self, data):
         if hasattr(data, "copy"):
@@ -416,7 +444,10 @@ class StoryAdminSerializer(serializers.ModelSerializer):
             "translations",
             "author",
             "submitted_by",
-            "original_published_date",
+            "original_published_year",
+            "original_published_month",
+            "original_published_day",
+            "published_date_label",
             "site_published_date",
             "is_published",
             "publish_at",
@@ -482,6 +513,17 @@ class StoryAdminSerializer(serializers.ModelSerializer):
         slug = attrs.get("slug")
         if not slug and title:
             attrs["slug"] = self._build_unique_slug(title, self.instance)
+
+        # Only meaningful in combination — a day without a month, or a month
+        # without a year, can't be formatted into anything sensible.
+        year = attrs.get("original_published_year", getattr(self.instance, "original_published_year", None))
+        month = attrs.get("original_published_month", getattr(self.instance, "original_published_month", None))
+        day = attrs.get("original_published_day", getattr(self.instance, "original_published_day", None))
+        if month and not year:
+            raise serializers.ValidationError({"original_published_month": "Requires the year to also be set."})
+        if day and not month:
+            raise serializers.ValidationError({"original_published_day": "Requires the month to also be set."})
+
         return attrs
 
     def get_cover_image_url(self, obj):

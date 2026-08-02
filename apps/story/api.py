@@ -498,7 +498,9 @@ class SubmissionAdminViewSet(ModelViewSet):
             story.pdf_file = submission.pdf_file
         if submission.epub_file:
             story.epub_file = submission.epub_file
-        story.original_published_date = None
+        story.original_published_year = None
+        story.original_published_month = None
+        story.original_published_day = None
         story.site_published_date = None
         story.is_published = False
         story.save()

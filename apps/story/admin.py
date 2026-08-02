@@ -117,7 +117,10 @@ class StoryAdmin(admin.ModelAdmin):
         (
             "Publishing",
             {
-                "fields": ("original_published_date", "site_published_date"),
+                "fields": (
+                    ("original_published_year", "original_published_month", "original_published_day"),
+                    "site_published_date",
+                ),
             },
         ),
         (
@@ -138,7 +141,7 @@ class StoryAdmin(admin.ModelAdmin):
         "is_completed",
         "rating",
         "views",
-        "original_published_date",
+        "original_published_date_display",
         "site_published_date",
         "chapters_count",
         "audios_count",
