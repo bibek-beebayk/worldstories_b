@@ -49,14 +49,14 @@ class ReadingProgressAPIView(APIView):
         return serializer.data
 
     def get(self, request, story_slug):
-        story = get_object_or_404(Story, slug=story_slug)
+        story = get_object_or_404(Story.objects.published(), slug=story_slug)
         progress = ReadingProgress.objects.filter(user=request.user, story=story).first()
         if not progress:
             return Response({"detail": "Progress not found."}, status=status.HTTP_404_NOT_FOUND)
         return Response(self._build_progress_payload(request, story, progress))
 
     def put(self, request, story_slug):
-        story = get_object_or_404(Story, slug=story_slug)
+        story = get_object_or_404(Story.objects.published(), slug=story_slug)
         serializer = ReadingProgressWriteSerializer(
             data=request.data,
             context={"story": story},
@@ -120,7 +120,7 @@ class AudioReadingProgressAPIView(APIView):
         return serializer.data
 
     def get(self, request, story_slug):
-        story = get_object_or_404(Story, slug=story_slug)
+        story = get_object_or_404(Story.objects.published(), slug=story_slug)
         progress = AudioReadingProgress.objects.filter(
             user=request.user, story=story
         ).order_by("-updated_at").first()
@@ -129,7 +129,7 @@ class AudioReadingProgressAPIView(APIView):
         return Response(self._build_progress_payload(request, story, progress))
 
     def put(self, request, story_slug):
-        story = get_object_or_404(Story, slug=story_slug)
+        story = get_object_or_404(Story.objects.published(), slug=story_slug)
         serializer = AudioReadingProgressWriteSerializer(
             data=request.data,
             context={"story": story},
@@ -167,7 +167,7 @@ class FileReadingProgressAPIView(APIView):
     def get(self, request, story_slug, file_format):
         if file_format not in dict(FileReadingProgress.FORMAT_CHOICES):
             return Response({"detail": "Invalid format."}, status=status.HTTP_400_BAD_REQUEST)
-        story = get_object_or_404(Story, slug=story_slug)
+        story = get_object_or_404(Story.objects.published(), slug=story_slug)
         progress = FileReadingProgress.objects.filter(
             user=request.user, story=story, format=file_format
         ).first()
@@ -178,7 +178,7 @@ class FileReadingProgressAPIView(APIView):
     def put(self, request, story_slug, file_format):
         if file_format not in dict(FileReadingProgress.FORMAT_CHOICES):
             return Response({"detail": "Invalid format."}, status=status.HTTP_400_BAD_REQUEST)
-        story = get_object_or_404(Story, slug=story_slug)
+        story = get_object_or_404(Story.objects.published(), slug=story_slug)
         serializer = FileReadingProgressWriteSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 

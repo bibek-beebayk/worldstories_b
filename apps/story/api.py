@@ -104,14 +104,17 @@ class IsSuperUser(BasePermission):
 
 
 class StoryViewSet(ReadOnlyModelViewSet):
-    queryset = Story.objects.published().order_by("-id")
+    # Keep an ungated base queryset for DRF's model introspection. The public
+    # visibility predicate contains the current time and must be constructed
+    # per request so scheduled stories become visible without a process restart.
+    queryset = Story.objects.all()
     lookup_field = "slug"
     filter_backends = [DjangoFilterBackend]
     filterset_class = StoryFilter
     pagination_class = CataloguePagination
 
     def get_queryset(self):
-        queryset = super().get_queryset()
+        queryset = Story.objects.published().order_by("-id")
         # Only the "list" action (the public browse/search listing) collapses
         # each translation_group down to one edition — retrieve and the other
         # detail actions (chapter, favorite, reviews, etc.) must still resolve

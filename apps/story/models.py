@@ -165,6 +165,18 @@ class Story(models.Model):
     def has_audio(self):
         return self.audios.exists()
 
+    def save(self, *args, **kwargs):
+        if self.is_published and not self.site_published_date:
+            self.site_published_date = (
+                timezone.localdate(self.publish_at)
+                if self.publish_at
+                else timezone.localdate()
+            )
+            update_fields = kwargs.get("update_fields")
+            if update_fields is not None:
+                kwargs["update_fields"] = set(update_fields) | {"site_published_date"}
+        return super().save(*args, **kwargs)
+
     def original_published_date_display(self):
         """Formats whichever of year/month/day are actually known — "1920",
         "March 1920", or "March 15, 1920". Returns None if even the year is

@@ -1,5 +1,6 @@
 from rest_framework import serializers
 from django.utils.text import slugify
+from datetime import date
 from core.libs.images import get_cover_image_url
 from .models import Audio, Story, Genre, Chapter, Tag, Author, Review, Submission, published_story_q
 from . import reading_time
@@ -523,6 +524,13 @@ class StoryAdminSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({"original_published_month": "Requires the year to also be set."})
         if day and not month:
             raise serializers.ValidationError({"original_published_day": "Requires the month to also be set."})
+        if year and month and day:
+            try:
+                date(year, month, day)
+            except ValueError:
+                raise serializers.ValidationError(
+                    {"original_published_day": "This is not a valid calendar date."}
+                )
 
         return attrs
 
