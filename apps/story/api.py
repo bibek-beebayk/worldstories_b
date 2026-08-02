@@ -82,7 +82,11 @@ def is_bot_request(request):
     return bool(BOT_USER_AGENT_PATTERN.search(user_agent))
 
 
-class AdminChapterPagination(PageNumberPagination):
+# Chapters/audios are managed as a full per-story list in the admin panel
+# (not paginated UI), so this uses a high page_size rather than the global
+# default of 20 — otherwise a story with more items than that would silently
+# have the rest hidden.
+class AdminStoryItemPagination(PageNumberPagination):
     page_size = 10000
 
 
@@ -400,7 +404,7 @@ class StoryAdminViewSet(ModelViewSet):
 class ChapterAdminViewSet(ModelViewSet):
     queryset = Chapter.objects.select_related("story").all().order_by("story_id", "order")
     serializer_class = ChapterAdminSerializer
-    pagination_class = AdminChapterPagination
+    pagination_class = AdminStoryItemPagination
     permission_classes = [IsSuperUser]
     filter_backends = [SearchFilter]
     search_fields = ["title", "slug", "story__title"]
@@ -416,6 +420,7 @@ class ChapterAdminViewSet(ModelViewSet):
 class AudioAdminViewSet(ModelViewSet):
     queryset = Audio.objects.select_related("story").all().order_by("story_id", "order")
     serializer_class = AudioAdminSerializer
+    pagination_class = AdminStoryItemPagination
     parser_classes = [MultiPartParser, FormParser, JSONParser]
     permission_classes = [IsSuperUser]
     filter_backends = [SearchFilter]
