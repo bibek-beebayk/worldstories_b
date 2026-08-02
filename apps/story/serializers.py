@@ -1,7 +1,7 @@
 from rest_framework import serializers
 from django.utils.text import slugify
 from core.libs.images import get_cover_image_url
-from .models import Audio, Story, Genre, Chapter, Tag, Author, Review, Submission
+from .models import Audio, Story, Genre, Chapter, Tag, Author, Review, Submission, published_story_q
 from . import reading_time
 
 CARD_COVER_SIZE = "480x640"
@@ -15,7 +15,7 @@ class GenreSerializer(serializers.ModelSerializer):
         annotated_count = getattr(obj, "published_stories_count", None)
         if annotated_count is not None:
             return annotated_count
-        return obj.stories.filter(is_published=True).count()
+        return obj.stories.filter(published_story_q()).count()
     
     class Meta:
         model = Genre
@@ -154,7 +154,7 @@ class StoryDetailSerializer(serializers.ModelSerializer):
 
     def get_translations(self, obj):
         siblings = (
-            Story.objects.filter(translation_group=obj.translation_group, is_published=True)
+            Story.objects.filter(published_story_q(), translation_group=obj.translation_group)
             .exclude(pk=obj.pk)
             .only("id", "slug", "language", "title")
             .order_by("language")
@@ -388,6 +388,22 @@ class StoryAdminSerializer(serializers.ModelSerializer):
             for sibling in siblings
         ]
 
+    # The admin form submits these as multipart FormData, where "clear this
+    # optional date" naturally comes through as an empty string rather than
+    # omitting the key — but DRF's Date/DateTimeField only treats an actual
+    # None as "no value" and rejects "" as an invalid format. Normalizing
+    # empty strings to None here (before field validation) lets clearing any
+    # of these three fields actually work instead of erroring.
+    CLEARABLE_DATE_FIELDS = ("original_published_date", "site_published_date", "publish_at")
+
+    def to_internal_value(self, data):
+        if hasattr(data, "copy"):
+            data = data.copy()
+            for field_name in self.CLEARABLE_DATE_FIELDS:
+                if data.get(field_name) == "":
+                    data[field_name] = None
+        return super().to_internal_value(data)
+
     class Meta:
         model = Story
         fields = [
@@ -403,6 +419,7 @@ class StoryAdminSerializer(serializers.ModelSerializer):
             "original_published_date",
             "site_published_date",
             "is_published",
+            "publish_at",
             "cover_image",
             "cover_image_file",
             "remove_cover_image_file",

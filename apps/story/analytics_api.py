@@ -12,7 +12,7 @@ from apps.stats.models import AudioReadingProgress, ChapterReadingProgress, Read
 from apps.users.models import User
 
 from .api import IsSuperUser
-from .models import Favorite, Genre, Review, Story, StoryView, Submission
+from .models import Favorite, Genre, Review, Story, StoryView, Submission, published_story_q
 
 ALLOWED_RANGE_DAYS = (7, 30, 90, 365)
 DEFAULT_RANGE_DAYS = 30
@@ -49,10 +49,10 @@ class AdminAnalyticsContentAPIView(APIView):
 
         genre_qs = (
             Genre.objects.annotate(
-                stories_count=Count("stories", filter=Q(stories__is_published=True), distinct=True),
-                avg_rating=Avg("stories__rating", filter=Q(stories__is_published=True)),
-                total_views=Sum("stories__views", filter=Q(stories__is_published=True)),
-                total_favorites=Count("stories__favorites", filter=Q(stories__is_published=True), distinct=True),
+                stories_count=Count("stories", filter=published_story_q("stories"), distinct=True),
+                avg_rating=Avg("stories__rating", filter=published_story_q("stories")),
+                total_views=Sum("stories__views", filter=published_story_q("stories")),
+                total_favorites=Count("stories__favorites", filter=published_story_q("stories"), distinct=True),
             )
             .filter(stories_count__gt=0)
             .order_by("-total_views")
@@ -70,20 +70,20 @@ class AdminAnalyticsContentAPIView(APIView):
         ]
 
         story_type_breakdown = (
-            Story.objects.filter(is_published=True)
+            Story.objects.published()
             .values("story_type")
             .annotate(count=Count("id"), avg_rating=Avg("rating"), avg_views=Avg("views"))
             .order_by("-count")
         )
 
         completion_split = (
-            Story.objects.filter(is_published=True)
+            Story.objects.published()
             .values("is_completed")
             .annotate(count=Count("id"), avg_rating=Avg("rating"), avg_views=Avg("views"))
         )
 
         publishing_over_time = (
-            Story.objects.filter(is_published=True, site_published_date__gte=cutoff.date())
+            Story.objects.filter(published_story_q(), site_published_date__gte=cutoff.date())
             .values("site_published_date")
             .annotate(count=Count("id"))
             .order_by("site_published_date")

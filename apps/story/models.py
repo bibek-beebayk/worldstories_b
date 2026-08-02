@@ -4,9 +4,29 @@ from django.db import models
 from django_ckeditor_5.fields import CKEditor5Field
 from django.core.validators import MinValueValidator, MaxValueValidator
 from django.conf import settings
+from django.utils import timezone
 from versatileimagefield.fields import VersatileImageField
 
 from core.libs.models import TimeStampModel
+
+
+def published_story_q(prefix=""):
+    """Q object for "is this story currently publicly visible" — is_published
+    is True AND either publish_at isn't set (publish immediately) or it's
+    already passed. Takes an optional relation prefix so it works both as
+    Story.objects.filter(published_story_q()) and for cross-relation lookups
+    like Genre.objects.filter(published_story_q("stories")).
+    """
+    field = f"{prefix}__" if prefix else ""
+    return models.Q(**{f"{field}is_published": True}) & (
+        models.Q(**{f"{field}publish_at__isnull": True})
+        | models.Q(**{f"{field}publish_at__lte": timezone.now()})
+    )
+
+
+class StoryQuerySet(models.QuerySet):
+    def published(self):
+        return self.filter(published_story_q())
 
 STORY_TYPE_CHOICES = [
     ("Short Story", "Short Story"),
@@ -116,7 +136,18 @@ class Story(models.Model):
     rating = models.FloatField(default=0.0)
     views = models.PositiveIntegerField(default=0)
     is_published = models.BooleanField(default=True)
+    publish_at = models.DateTimeField(
+        blank=True,
+        null=True,
+        help_text=(
+            "Optional: hide this story from public listings/search until this "
+            "moment, even while is_published is True. Leave blank to publish "
+            "immediately (as soon as is_published is True)."
+        ),
+    )
     created_at = models.DateTimeField(auto_now_add=True)
+
+    objects = StoryQuerySet.as_manager()
 
     def has_audio(self):
         return self.audios.exists()
@@ -137,16 +168,14 @@ def with_preferred_translation_only(queryset):
     aren't linked to any other translation form a "group" of one and always
     pass through untouched.
 
-    Only considers published stories when picking each group's
-    representative, so callers should already be filtering on
-    is_published=True (as every current caller does) — otherwise a group
-    could "win" on an unpublished edition and vanish from the results
-    entirely once the outer is_published filter excludes it.
+    Only considers currently-published (and not still schedule-gated)
+    stories when picking each group's representative, so callers should
+    already be filtering on the same condition (as every current caller
+    does) — otherwise a group could "win" on an edition the outer filter
+    would exclude anyway, and vanish from the results entirely.
     """
     preferred_id = (
-        Story.objects.filter(
-            translation_group=models.OuterRef("translation_group"), is_published=True
-        )
+        Story.objects.filter(published_story_q(), translation_group=models.OuterRef("translation_group"))
         .annotate(
             _language_priority=models.Case(
                 models.When(language="en", then=models.Value(0)),

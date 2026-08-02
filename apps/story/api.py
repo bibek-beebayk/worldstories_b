@@ -29,6 +29,7 @@ from .models import (
     Submission,
     StoryView,
     with_preferred_translation_only,
+    published_story_q,
 )
 from .serializers import (
     GenreSerializer,
@@ -99,7 +100,7 @@ class IsSuperUser(BasePermission):
 
 
 class StoryViewSet(ReadOnlyModelViewSet):
-    queryset = Story.objects.filter(is_published=True).order_by("-id")
+    queryset = Story.objects.published().order_by("-id")
     lookup_field = "slug"
     filter_backends = [DjangoFilterBackend]
     filterset_class = StoryFilter
@@ -517,11 +518,11 @@ class SubmissionAdminViewSet(ModelViewSet):
 class GenreListAPIView(APIView):
     def get(self, request):
         genres = (
-            Genre.objects.filter(stories__is_published=True)
+            Genre.objects.filter(published_story_q("stories"))
             .annotate(
                 published_stories_count=Count(
                     "stories",
-                    filter=Q(stories__is_published=True),
+                    filter=published_story_q("stories"),
                     distinct=True,
                 )
             )
@@ -543,7 +544,7 @@ class LibraryShelvesAPIView(APIView):
         # Collapses each translation_group to a single (English-preferred)
         # edition first, so both the per-genre counts and the preview lists
         # below only ever reflect one entry per underlying work.
-        preferred_stories = with_preferred_translation_only(Story.objects.filter(is_published=True))
+        preferred_stories = with_preferred_translation_only(Story.objects.published())
 
         genres = (
             Genre.objects.filter(stories__in=preferred_stories)
@@ -616,7 +617,7 @@ class AdminGenreListCreateAPIView(APIView):
 
 class HomeDataAPIView(APIView):
     def get(self, request):
-        base_qs = Story.objects.filter(is_published=True).prefetch_related("genres", "audios")
+        base_qs = Story.objects.published().prefetch_related("genres", "audios")
         used_ids = set()
 
         def take(queryset, limit):
@@ -644,7 +645,7 @@ class HomeDataAPIView(APIView):
         more_to_explore = take(base_qs.order_by("-id"), 12)
 
         readers_count = (
-            Story.objects.filter(is_published=True).aggregate(total_readers=Sum("views")).get("total_readers") or 0
+            Story.objects.published().aggregate(total_readers=Sum("views")).get("total_readers") or 0
         )
 
         return Response(
@@ -678,7 +679,7 @@ class HomeDataAPIView(APIView):
                     ).data,
                     "stats": {
                         "creators": Author.objects.count(),
-                        "stories": Story.objects.filter(is_published=True).count(),
+                        "stories": Story.objects.published().count(),
                         "readers": readers_count,
                     },
                 },
@@ -689,7 +690,7 @@ class HomeDataAPIView(APIView):
 class TrendingDataAPIView(APIView):
     def get(self, request):
         base_qs = (
-            Story.objects.filter(is_published=True)
+            Story.objects.published()
             .prefetch_related("genres", "audios")
             .annotate(
                 favorites_total=Count("favorites", distinct=True),
@@ -724,7 +725,7 @@ class TrendingDataAPIView(APIView):
 
 class OriginalsDataAPIView(APIView):
     def get(self, request):
-        base_qs = Story.objects.filter(is_published=True).prefetch_related("genres", "audios")
+        base_qs = Story.objects.published().prefetch_related("genres", "audios")
         return Response(
             {
                 "stories": StoryListSerializer(
@@ -738,7 +739,7 @@ class OriginalsDataAPIView(APIView):
 
 class DiscoverDataAPIView(APIView):
     def get(self, request):
-        base_qs = Story.objects.filter(is_published=True).prefetch_related("genres", "audios")
+        base_qs = Story.objects.published().prefetch_related("genres", "audios")
         genres = Genre.objects.all()
         return Response(
             {
@@ -870,7 +871,7 @@ class SearchStoryAPIView(ListAPIView):
             return Story.objects.none()
 
         queryset = (
-            Story.objects.filter(is_published=True)
+            Story.objects.published()
             .select_related("author")
             .prefetch_related("genres", "audios", "tags")
             .filter(
