@@ -4,6 +4,7 @@ from datetime import date
 from core.libs.images import get_cover_image_url
 from .models import Audio, Story, Genre, Chapter, Tag, Author, Review, Submission, published_story_q
 from . import reading_time
+from .audio_processing import normalize_uploaded_audio
 
 CARD_COVER_SIZE = "480x640"
 LARGE_COVER_SIZE = "900x1200"
@@ -625,6 +626,11 @@ class AudioAdminSerializer(serializers.ModelSerializer):
         if story and title and (slug is None or str(slug).strip() == ""):
             attrs["slug"] = self._build_unique_slug(story, title, self.instance)
         return attrs
+
+    def validate_audio_file(self, value):
+        # Re-encodes on the way in if the source uses a legacy sample rate
+        # some browsers can't decode — see audio_processing.py.
+        return normalize_uploaded_audio(value) if value else value
 
     def _probe_and_save_duration(self, instance):
         duration = reading_time.probe_audio_duration_seconds(instance.audio_file)
