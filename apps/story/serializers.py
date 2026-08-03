@@ -1,3 +1,5 @@
+import json
+
 from rest_framework import serializers
 from django.utils.text import slugify
 from datetime import date
@@ -105,9 +107,15 @@ class FeaturedStorySerializer(StoryListSerializer):
 
 
 class ChapterListSerializer(serializers.ModelSerializer):
+    download_size_bytes = serializers.SerializerMethodField()
+
+    def get_download_size_bytes(self, obj):
+        payload = {"id": str(obj.id), "title": obj.title, "order": obj.order, "content": obj.content, "slug": obj.slug}
+        return len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
     class Meta:
         model = Chapter
-        fields = ["id", "title", "order", "slug"]
+        fields = ["id", "title", "order", "slug", "download_size_bytes"]
 
 
 class ChapterSerializer(serializers.ModelSerializer):
@@ -117,9 +125,19 @@ class ChapterSerializer(serializers.ModelSerializer):
 
 
 class AudioSerializer(serializers.ModelSerializer):
+    download_size_bytes = serializers.SerializerMethodField()
+
+    def get_download_size_bytes(self, obj):
+        try:
+            return obj.audio_file.size if obj.audio_file else 0
+        # Remote storage metadata can be temporarily unavailable. A missing
+        # size must not make the entire story-detail response fail.
+        except Exception:
+            return 0
+
     class Meta:
         model = Audio
-        fields = ["id", "title", "slug", "audio_file", "order"]
+        fields = ["id", "title", "slug", "audio_file", "order", "download_size_bytes"]
 
 
 class AudioListSerializer(serializers.ModelSerializer):
@@ -145,6 +163,21 @@ class StoryDetailSerializer(serializers.ModelSerializer):
     reading_time_minutes = serializers.SerializerMethodField()
     listening_time_minutes = serializers.SerializerMethodField()
     published_date_label = serializers.SerializerMethodField()
+    pdf_size_bytes = serializers.SerializerMethodField()
+    epub_size_bytes = serializers.SerializerMethodField()
+
+    @staticmethod
+    def _file_size(file_field):
+        try:
+            return file_field.size if file_field else 0
+        except Exception:
+            return 0
+
+    def get_pdf_size_bytes(self, obj):
+        return self._file_size(obj.pdf_file)
+
+    def get_epub_size_bytes(self, obj):
+        return self._file_size(obj.epub_file)
 
     def get_chapter_count(self, obj):
         return obj.chapters.count()
@@ -233,6 +266,8 @@ class StoryDetailSerializer(serializers.ModelSerializer):
             "cover_image",
             "pdf_file",
             "epub_file",
+            "pdf_size_bytes",
+            "epub_size_bytes",
             "is_completed",
             "tags",
             "rating",
