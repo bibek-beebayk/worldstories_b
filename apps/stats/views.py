@@ -1,17 +1,20 @@
 from django.shortcuts import get_object_or_404
 from rest_framework.views import APIView
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework import status
+from rest_framework.throttling import SimpleRateThrottle
 
 from apps.story.models import Story
 from apps.stats.models import (
+    AnalyticsEvent,
     ReadingProgress,
     ChapterReadingProgress,
     AudioReadingProgress,
     FileReadingProgress,
 )
 from apps.stats.serializers import (
+    AnalyticsEventWriteSerializer,
     ReadingProgressSerializer,
     ReadingProgressWriteSerializer,
     AudioReadingProgressSerializer,
@@ -19,6 +22,35 @@ from apps.stats.serializers import (
     FileReadingProgressSerializer,
     FileReadingProgressWriteSerializer,
 )
+
+
+class AnalyticsEventThrottle(SimpleRateThrottle):
+    scope = "analytics-events"
+
+    def get_rate(self):
+        return "120/min"
+
+    def get_cache_key(self, request, view):
+        if request.user.is_authenticated:
+            ident = str(request.user.pk)
+        else:
+            ident = self.get_ident(request)
+        return self.cache_format % {"scope": self.scope, "ident": ident}
+
+
+class AnalyticsEventCreateAPIView(APIView):
+    permission_classes = [AllowAny]
+    throttle_classes = [AnalyticsEventThrottle]
+
+    def post(self, request):
+        serializer = AnalyticsEventWriteSerializer(
+            data=request.data, context={"request": request}
+        )
+        serializer.is_valid(raise_exception=True)
+        event = serializer.save()
+        return Response(
+            {"event_id": str(event.event_id)}, status=status.HTTP_201_CREATED
+        )
 
 
 class ReadingProgressAPIView(APIView):

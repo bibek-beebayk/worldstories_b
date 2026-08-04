@@ -1,5 +1,6 @@
 from django.conf import settings
 from django.db import models
+import uuid
 
 from apps.story.models import Story, Chapter, Audio
 
@@ -148,3 +149,55 @@ class AudioReadingProgress(models.Model):
 
     def __str__(self):
         return f"{self.user} - {self.audio} ({self.progress:.2%})"
+
+
+class AnalyticsEvent(models.Model):
+    EVENT_VISIT = "visit"
+    EVENT_AD_IMPRESSION = "ad_impression"
+    EVENT_READING_SESSION = "reading_session"
+    EVENT_LISTENING_SESSION = "listening_session"
+    EVENT_COMPLETION = "completion"
+    EVENT_DOWNLOAD = "download"
+    EVENT_CHOICES = [
+        (EVENT_VISIT, "Visit"),
+        (EVENT_AD_IMPRESSION, "Ad impression"),
+        (EVENT_READING_SESSION, "Reading session"),
+        (EVENT_LISTENING_SESSION, "Listening session"),
+        (EVENT_COMPLETION, "Completion"),
+        (EVENT_DOWNLOAD, "Download"),
+    ]
+
+    event_id = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    event_type = models.CharField(max_length=32, choices=EVENT_CHOICES, db_index=True)
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="analytics_events",
+    )
+    visitor_id = models.CharField(max_length=64, db_index=True)
+    session_id = models.CharField(max_length=64, blank=True, default="", db_index=True)
+    story = models.ForeignKey(
+        Story,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="analytics_events",
+    )
+    duration_seconds = models.FloatField(default=0)
+    value = models.FloatField(default=0)
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["event_type", "created_at"], name="stats_event_type_created_idx"),
+            models.Index(fields=["visitor_id", "created_at"], name="stats_visitor_created_idx"),
+            models.Index(fields=["user", "created_at"], name="stats_user_created_idx"),
+            models.Index(fields=["story", "event_type"], name="stats_story_event_idx"),
+        ]
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"{self.event_type} - {self.visitor_id}"

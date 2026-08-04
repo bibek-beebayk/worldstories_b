@@ -1,7 +1,9 @@
+import json
+
 from rest_framework import serializers
 
-from apps.story.models import Chapter, Audio
-from apps.stats.models import ReadingProgress, AudioReadingProgress, FileReadingProgress
+from apps.story.models import Chapter, Audio, Story
+from apps.stats.models import AnalyticsEvent, ReadingProgress, AudioReadingProgress, FileReadingProgress
 
 
 class ChapterProgressSerializer(serializers.Serializer):
@@ -136,3 +138,37 @@ class AudioReadingProgressWriteSerializer(serializers.Serializer):
                 )
         attrs["audio"] = audio
         return attrs
+
+
+class AnalyticsEventWriteSerializer(serializers.Serializer):
+    event_id = serializers.UUIDField()
+    event_type = serializers.ChoiceField(choices=AnalyticsEvent.EVENT_CHOICES)
+    visitor_id = serializers.CharField(max_length=64)
+    session_id = serializers.CharField(max_length=64, required=False, allow_blank=True)
+    story_slug = serializers.SlugField(required=False, allow_blank=True)
+    duration_seconds = serializers.FloatField(required=False, min_value=0, max_value=86400)
+    value = serializers.FloatField(required=False)
+    metadata = serializers.JSONField(required=False)
+
+    def validate_metadata(self, value):
+        if not isinstance(value, dict):
+            raise serializers.ValidationError("Metadata must be an object.")
+        if len(json.dumps(value, ensure_ascii=False)) > 2048:
+            raise serializers.ValidationError("Metadata is too large.")
+        return value
+
+    def create(self, validated_data):
+        request = self.context["request"]
+        story_slug = validated_data.pop("story_slug", "")
+        story = None
+        if story_slug:
+            story = Story.objects.published().filter(slug=story_slug).first()
+        event, _ = AnalyticsEvent.objects.get_or_create(
+            event_id=validated_data.pop("event_id"),
+            defaults={
+                **validated_data,
+                "story": story,
+                "user": request.user if request.user.is_authenticated else None,
+            },
+        )
+        return event

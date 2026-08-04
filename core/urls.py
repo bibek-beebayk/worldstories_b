@@ -83,6 +83,11 @@ urlpatterns = [
     path("api/trending/", story_api.TrendingDataAPIView.as_view(), name="trending-data"),
     path("api/originals/", story_api.OriginalsDataAPIView.as_view(), name="originals-data"),
     path("api/discover/", story_api.DiscoverDataAPIView.as_view(), name="discover-data"),
+    path(
+        "api/analytics/events/",
+        stats_views.AnalyticsEventCreateAPIView.as_view(),
+        name="analytics-events",
+    ),
     path("api/search/", story_api.SearchStoryAPIView.as_view(), name="search-data"),
     path("api/admin/overview/", story_api.AdminOverviewAPIView.as_view(), name="admin-overview"),
     path(
@@ -104,6 +109,11 @@ urlpatterns = [
         "api/admin/analytics/submissions/",
         story_analytics_api.AdminAnalyticsSubmissionsAPIView.as_view(),
         name="admin-analytics-submissions",
+    ),
+    path(
+        "api/admin/analytics/audience/",
+        story_analytics_api.AdminAnalyticsAudienceAPIView.as_view(),
+        name="admin-analytics-audience",
     ),
     path("api/admin/authors/", story_api.AdminAuthorListAPIView.as_view(), name="admin-authors"),
     path("api/admin/genres/", story_api.AdminGenreListCreateAPIView.as_view(), name="admin-genres"),
