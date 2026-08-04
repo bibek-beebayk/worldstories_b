@@ -1,6 +1,6 @@
 from datetime import timedelta
 
-from django.db.models import Avg, Count, Q, Sum
+from django.db.models import Avg, Count, Min, Q, Sum
 from django.db.models.functions import TruncDate
 from django.utils import timezone
 from django.utils.decorators import method_decorator
@@ -8,7 +8,7 @@ from django.views.decorators.cache import cache_page
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from apps.stats.models import AudioReadingProgress, ChapterReadingProgress, ReadingProgress
+from apps.stats.models import AnalyticsEvent, AudioReadingProgress, ChapterReadingProgress, ReadingProgress
 from apps.users.models import User
 
 from .api import IsSuperUser
@@ -306,5 +306,236 @@ class AdminAnalyticsSubmissionsAPIView(APIView):
                 "avg_time_to_review_hours": avg_time_to_review_hours,
                 "by_story_type": by_story_type,
                 "by_genre": by_genre,
+            }
+        )
+
+
+class AdminAnalyticsAudienceAPIView(APIView):
+    permission_classes = [IsSuperUser]
+
+    @method_decorator(cache_page(CACHE_SECONDS))
+    def get(self, request):
+        days = get_range_days(request)
+        cutoff = get_cutoff(days)
+        events = AnalyticsEvent.objects.filter(created_at__gte=cutoff)
+
+        daily_events = (
+            events.annotate(day=TruncDate("created_at"))
+            .values("day", "event_type")
+            .annotate(count=Count("id"), duration_seconds=Sum("duration_seconds"))
+            .order_by("day")
+        )
+        daily = {}
+        for row in daily_events:
+            entry = daily.setdefault(
+                row["day"],
+                {
+                    "day": row["day"],
+                    "ad_impressions": 0,
+                    "downloads": 0,
+                    "completions": 0,
+                    "reading_minutes": 0,
+                    "listening_minutes": 0,
+                },
+            )
+            event_type = row["event_type"]
+            if event_type == AnalyticsEvent.EVENT_AD_IMPRESSION:
+                entry["ad_impressions"] = row["count"]
+            elif event_type == AnalyticsEvent.EVENT_DOWNLOAD:
+                entry["downloads"] = row["count"]
+            elif event_type == AnalyticsEvent.EVENT_COMPLETION:
+                entry["completions"] = row["count"]
+            elif event_type == AnalyticsEvent.EVENT_READING_SESSION:
+                entry["reading_minutes"] = round((row["duration_seconds"] or 0) / 60, 1)
+            elif event_type == AnalyticsEvent.EVENT_LISTENING_SESSION:
+                entry["listening_minutes"] = round((row["duration_seconds"] or 0) / 60, 1)
+
+        visit_events = AnalyticsEvent.objects.filter(event_type=AnalyticsEvent.EVENT_VISIT)
+        authenticated_first = {
+            f"u:{row['user_id']}": row["first_seen"]
+            for row in visit_events.filter(user_id__isnull=False)
+            .values("user_id")
+            .annotate(first_seen=Min("created_at"))
+        }
+        anonymous_first = {
+            f"v:{row['visitor_id']}": row["first_seen"]
+            for row in visit_events.filter(user_id__isnull=True)
+            .values("visitor_id")
+            .annotate(first_seen=Min("created_at"))
+        }
+        first_seen = {**anonymous_first, **authenticated_first}
+        visitor_days = {}
+        for user_id, visitor_id, created_at in events.filter(
+            event_type=AnalyticsEvent.EVENT_VISIT
+        ).values_list("user_id", "visitor_id", "created_at"):
+            identity = f"u:{user_id}" if user_id else f"v:{visitor_id}"
+            day = timezone.localtime(created_at).date()
+            visitor_days.setdefault(day, set()).add(identity)
+
+        new_returning = []
+        all_visitors = set()
+        returning_visitors = set()
+        for day in sorted(visitor_days):
+            new_ids = set()
+            returning_ids = set()
+            for identity in visitor_days[day]:
+                all_visitors.add(identity)
+                first = first_seen.get(identity)
+                if first and timezone.localtime(first).date() < day:
+                    returning_ids.add(identity)
+                    returning_visitors.add(identity)
+                else:
+                    new_ids.add(identity)
+            new_returning.append(
+                {"day": day, "new_visitors": len(new_ids), "returning_visitors": len(returning_ids)}
+            )
+
+        sessions = events.filter(
+            event_type__in=[
+                AnalyticsEvent.EVENT_READING_SESSION,
+                AnalyticsEvent.EVENT_LISTENING_SESSION,
+            ]
+        )
+        reading_seconds = sessions.filter(
+            event_type=AnalyticsEvent.EVENT_READING_SESSION
+        ).aggregate(total=Sum("duration_seconds"))["total"] or 0
+        listening_seconds = sessions.filter(
+            event_type=AnalyticsEvent.EVENT_LISTENING_SESSION
+        ).aggregate(total=Sum("duration_seconds"))["total"] or 0
+        total_session_count = sessions.count()
+
+        reader_days = {}
+        engaged_titles = set()
+        for user_id, visitor_id, story_id, created_at in sessions.values_list(
+            "user_id", "visitor_id", "story_id", "created_at"
+        ):
+            identity = f"u:{user_id}" if user_id else f"v:{visitor_id}"
+            reader_days.setdefault(identity, set()).add(timezone.localtime(created_at).date())
+            if story_id:
+                engaged_titles.add((identity, story_id))
+        returning_readers = sum(1 for active_days in reader_days.values() if len(active_days) > 1)
+
+        completed_titles = {
+            (f"u:{user_id}" if user_id else f"v:{visitor_id}", story_id)
+            for user_id, visitor_id, story_id in events.filter(
+                event_type=AnalyticsEvent.EVENT_COMPLETION,
+                story_id__isnull=False,
+            ).values_list("user_id", "visitor_id", "story_id")
+        }
+        completed_engagements = len(completed_titles & engaged_titles)
+
+        ad_placements = list(
+            events.filter(event_type=AnalyticsEvent.EVENT_AD_IMPRESSION)
+            .values("metadata__path", "metadata__size")
+            .annotate(count=Count("id"))
+            .order_by("-count")[:12]
+        )
+        download_types = list(
+            events.filter(event_type=AnalyticsEvent.EVENT_DOWNLOAD)
+            .values("metadata__content_type")
+            .annotate(count=Count("id"), bytes=Sum("value"))
+            .order_by("-count")
+        )
+        completion_types = list(
+            events.filter(event_type=AnalyticsEvent.EVENT_COMPLETION)
+            .values("metadata__content_type")
+            .annotate(count=Count("id"))
+            .order_by("-count")
+        )
+        top_downloads = list(
+            events.filter(event_type=AnalyticsEvent.EVENT_DOWNLOAD, story_id__isnull=False)
+            .values("story_id", "story__title", "story__slug")
+            .annotate(count=Count("id"), bytes=Sum("value"))
+            .order_by("-count", "story__title")[:10]
+        )
+        top_listened = list(
+            events.filter(event_type=AnalyticsEvent.EVENT_LISTENING_SESSION, story_id__isnull=False)
+            .values("story_id", "story__title", "story__slug")
+            .annotate(duration_seconds=Sum("duration_seconds"), sessions=Count("id"))
+            .order_by("-duration_seconds")[:10]
+        )
+
+        impressions = events.filter(event_type=AnalyticsEvent.EVENT_AD_IMPRESSION).count()
+        downloads = events.filter(event_type=AnalyticsEvent.EVENT_DOWNLOAD)
+        completions = events.filter(event_type=AnalyticsEvent.EVENT_COMPLETION)
+        unique_downloaders = {
+            f"u:{user_id}" if user_id else f"v:{visitor_id}"
+            for user_id, visitor_id in downloads.values_list("user_id", "visitor_id")
+        }
+
+        return Response(
+            {
+                "range_days": days,
+                "summary": {
+                    "visitors": len(all_visitors),
+                    "returning_visitors": len(returning_visitors),
+                    "returning_rate": round(len(returning_visitors) / len(all_visitors), 3)
+                    if all_visitors
+                    else 0,
+                    "readers": len(reader_days),
+                    "returning_readers": returning_readers,
+                    "reader_retention_rate": round(returning_readers / len(reader_days), 3)
+                    if reader_days
+                    else 0,
+                    "ad_impressions": impressions,
+                    "downloads": downloads.count(),
+                    "unique_downloaders": len(unique_downloaders),
+                    "completions": completions.count(),
+                    "completion_rate": round(completed_engagements / len(engaged_titles), 3)
+                    if engaged_titles
+                    else 0,
+                    "reading_minutes": round(reading_seconds / 60, 1),
+                    "listening_minutes": round(listening_seconds / 60, 1),
+                    "avg_session_minutes": round(
+                        (reading_seconds + listening_seconds) / total_session_count / 60, 1
+                    )
+                    if total_session_count
+                    else 0,
+                },
+                "daily_activity": list(daily.values()),
+                "visitor_retention": new_returning,
+                "ad_placements": [
+                    {
+                        "path": row["metadata__path"] or "unknown",
+                        "size": row["metadata__size"] or "unknown",
+                        "count": row["count"],
+                    }
+                    for row in ad_placements
+                ],
+                "download_types": [
+                    {
+                        "content_type": row["metadata__content_type"] or "unknown",
+                        "count": row["count"],
+                        "bytes": round(row["bytes"] or 0),
+                    }
+                    for row in download_types
+                ],
+                "completion_types": [
+                    {
+                        "content_type": row["metadata__content_type"] or "unknown",
+                        "count": row["count"],
+                    }
+                    for row in completion_types
+                ],
+                "top_downloads": [
+                    {
+                        "story_id": row["story_id"],
+                        "title": row["story__title"],
+                        "slug": row["story__slug"],
+                        "count": row["count"],
+                        "bytes": round(row["bytes"] or 0),
+                    }
+                    for row in top_downloads
+                ],
+                "top_listened": [
+                    {
+                        "story_id": row["story_id"],
+                        "title": row["story__title"],
+                        "slug": row["story__slug"],
+                        "sessions": row["sessions"],
+                        "minutes": round((row["duration_seconds"] or 0) / 60, 1),
+                    }
+                    for row in top_listened
+                ],
             }
         )
