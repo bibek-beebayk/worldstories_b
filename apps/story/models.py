@@ -35,6 +35,7 @@ STORY_TYPE_CHOICES = [
     ("Novella", "Novella"),
     ("Poetry", "Poetry"),
     ("Non Fiction", "Non Fiction"),
+    ("Religious Text", "Religious Text"),
     ("Summary", "Summary"),
 ]
 
