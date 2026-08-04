@@ -784,7 +784,17 @@ class OriginalsDataAPIView(APIView):
 class DiscoverDataAPIView(APIView):
     def get(self, request):
         base_qs = Story.objects.published().prefetch_related("genres", "audios")
-        genres = Genre.objects.all()
+        genres = (
+            Genre.objects.filter(published_story_q("stories"))
+            .annotate(
+                published_stories_count=Count(
+                    "stories",
+                    filter=published_story_q("stories"),
+                    distinct=True,
+                )
+            )
+            .order_by("name")
+        )
         return Response(
             {
                 "genres": GenreSerializer(genres, many=True).data,

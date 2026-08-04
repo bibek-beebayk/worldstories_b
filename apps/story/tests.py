@@ -167,6 +167,18 @@ class PublicAuthorApiTests(APITestCase):
         self.assertIn("published-book", slugs)
         self.assertNotIn("draft-book", slugs)
 
+    def test_discover_only_returns_genres_with_public_titles(self):
+        public_genre = Genre.objects.create(name="Public Genre")
+        empty_genre = Genre.objects.create(name="Draft Only Genre")
+        Story.objects.get(slug="published-book").genres.add(public_genre)
+        Story.objects.get(slug="draft-book").genres.add(empty_genre)
+
+        response = self.client.get(reverse("discover-data"))
+
+        self.assertEqual(response.status_code, 200)
+        genres = {genre["name"]: genre["stories_count"] for genre in response.data["genres"]}
+        self.assertEqual(genres, {"Public Genre": 1})
+
 
 class OriginalPublicationDateValidationTests(SimpleTestCase):
     def test_rejects_impossible_calendar_date(self):

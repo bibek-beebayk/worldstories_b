@@ -10,10 +10,19 @@ from django.core.mail import send_mail
 from django.db import transaction
 import logging
 import os
+from collections import defaultdict
+from datetime import timedelta
+from django.db.models import Count
+from django.utils import timezone
 from .models import OTP
-from apps.story.models import Favorite, Review
+from apps.story.models import Favorite, Review, Story
 from apps.story.serializers import StoryListSerializer
-from apps.stats.models import ReadingProgress, ChapterReadingProgress, AudioReadingProgress
+from apps.stats.models import (
+    ReadingProgress,
+    ChapterReadingProgress,
+    AudioReadingProgress,
+    FileReadingProgress,
+)
 from .serializers import (
     RegisterSerializer,
     LoginSerializer,
@@ -60,6 +69,7 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
             "library_continue_listening",
             "library_favorites",
             "library_reviews",
+            "profile_insights",
         }:
             from rest_framework.permissions import IsAuthenticated
 
@@ -228,6 +238,155 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
         serializer.is_valid(raise_exception=True)
         serializer.save()
         return Response(UserProfileSerializer(request.user).data)
+
+    @action(detail=False, methods=["get"], url_path="profile-insights")
+    def profile_insights(self, request):
+        """Aggregated, private reading-habit metrics for the profile overview."""
+
+        reading_rows = list(
+            ReadingProgress.objects.filter(user=request.user).values_list(
+                "story_id", "progress", "updated_at"
+            )
+        )
+        chapter_rows = list(
+            ChapterReadingProgress.objects.filter(user=request.user).values_list(
+                "story_id", "progress", "updated_at"
+            )
+        )
+        file_rows = list(
+            FileReadingProgress.objects.filter(user=request.user).values_list(
+                "story_id", "format", "progress", "updated_at"
+            )
+        )
+        audio_rows = list(
+            AudioReadingProgress.objects.filter(user=request.user).values_list(
+                "story_id", "progress", "updated_at"
+            )
+        )
+
+        chapter_story_ids = {story_id for story_id, _, _ in chapter_rows}
+        chapter_mode_ids = chapter_story_ids | {
+            story_id for story_id, _, _ in reading_rows
+        }
+        epub_ids = {
+            story_id for story_id, file_format, _, _ in file_rows if file_format == "epub"
+        }
+        pdf_ids = {
+            story_id for story_id, file_format, _, _ in file_rows if file_format == "pdf"
+        }
+        audio_ids = {story_id for story_id, _, _ in audio_rows}
+        started_ids = chapter_mode_ids | epub_ids | pdf_ids | audio_ids
+
+        completed_ids = {
+            story_id for story_id, _, progress, _ in file_rows if progress >= 0.995
+        }
+
+        chapter_totals = dict(
+            Story.objects.filter(id__in=chapter_story_ids)
+            .annotate(item_count=Count("chapters"))
+            .values_list("id", "item_count")
+        )
+        completed_chapters = defaultdict(int)
+        for story_id, progress, _ in chapter_rows:
+            if progress >= 0.995:
+                completed_chapters[story_id] += 1
+        completed_ids.update(
+            story_id
+            for story_id, completed_count in completed_chapters.items()
+            if chapter_totals.get(story_id, 0) > 0
+            and completed_count >= chapter_totals[story_id]
+        )
+
+        audio_totals = dict(
+            Story.objects.filter(id__in=audio_ids)
+            .annotate(item_count=Count("audios"))
+            .values_list("id", "item_count")
+        )
+        completed_audio = defaultdict(int)
+        for story_id, progress, _ in audio_rows:
+            if progress >= 0.995:
+                completed_audio[story_id] += 1
+        completed_ids.update(
+            story_id
+            for story_id, completed_count in completed_audio.items()
+            if audio_totals.get(story_id, 0) > 0
+            and completed_count >= audio_totals[story_id]
+        )
+
+        def activity_date(value):
+            if timezone.is_aware(value):
+                return timezone.localtime(value).date()
+            return value.date()
+
+        today = timezone.localdate()
+        activity = {
+            today - timedelta(days=offset): {"reading": 0, "listening": 0}
+            for offset in range(13, -1, -1)
+        }
+        all_activity_dates = []
+
+        # Chapter rows are the granular record for normal reading. Retain the
+        # story-level timestamp only for legacy progress without chapter rows,
+        # avoiding double-counting a single reader save.
+        reading_timestamps = [updated_at for _, _, updated_at in chapter_rows]
+        reading_timestamps.extend(
+            updated_at
+            for story_id, _, updated_at in reading_rows
+            if story_id not in chapter_story_ids
+        )
+        reading_timestamps.extend(updated_at for _, _, _, updated_at in file_rows)
+        listening_timestamps = [updated_at for _, _, updated_at in audio_rows]
+
+        for updated_at in reading_timestamps:
+            day = activity_date(updated_at)
+            all_activity_dates.append(day)
+            if day in activity:
+                activity[day]["reading"] += 1
+        for updated_at in listening_timestamps:
+            day = activity_date(updated_at)
+            all_activity_dates.append(day)
+            if day in activity:
+                activity[day]["listening"] += 1
+
+        genre_rows = list(
+            Story.objects.filter(id__in=started_ids, genres__isnull=False)
+            .values("genres__name")
+            .annotate(value=Count("id", distinct=True))
+            .order_by("-value", "genres__name")[:6]
+        )
+        genres = [
+            {"name": row["genres__name"], "value": row["value"]}
+            for row in genre_rows
+        ]
+
+        active_since = today - timedelta(days=29)
+        active_days = len({day for day in all_activity_dates if day >= active_since})
+
+        return Response(
+            {
+                "summary": {
+                    "titles_started": len(started_ids),
+                    "titles_completed": len(completed_ids & started_ids),
+                    "active_days_30": active_days,
+                    "favorite_genre": genres[0]["name"] if genres else None,
+                },
+                "activity": [
+                    {
+                        "date": day.isoformat(),
+                        "reading": counts["reading"],
+                        "listening": counts["listening"],
+                    }
+                    for day, counts in activity.items()
+                ],
+                "formats": [
+                    {"name": "Chapters", "value": len(chapter_mode_ids)},
+                    {"name": "EPUB", "value": len(epub_ids)},
+                    {"name": "PDF", "value": len(pdf_ids)},
+                    {"name": "Audio", "value": len(audio_ids)},
+                ],
+                "genres": genres,
+            }
+        )
 
     @action(detail=False, methods=["get"], url_path="library/continue-reading")
     def library_continue_reading(self, request):
