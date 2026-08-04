@@ -145,6 +145,28 @@ class PublicAuthorApiTests(APITestCase):
         self.assertNotIn(draft.slug, slugs)
         self.assertNotIn(translation.slug, slugs)
 
+    def test_search_returns_authors_and_titles_in_separate_sections(self):
+        response = self.client.get(reverse("search-data"), {"q": "Visible Writer"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            [author["id"] for author in response.data["authors"]["results"]],
+            [self.visible_author.id],
+        )
+        self.assertEqual(
+            [story["slug"] for story in response.data["titles"]["results"]],
+            ["published-book"],
+        )
+        self.assertEqual(response.data["authors"]["results"][0]["stories_count"], 1)
+
+    def test_title_search_does_not_return_drafts(self):
+        response = self.client.get(reverse("search-data"), {"q": "Book"})
+
+        self.assertEqual(response.status_code, 200)
+        slugs = [story["slug"] for story in response.data["titles"]["results"]]
+        self.assertIn("published-book", slugs)
+        self.assertNotIn("draft-book", slugs)
+
 
 class OriginalPublicationDateValidationTests(SimpleTestCase):
     def test_rejects_impossible_calendar_date(self):

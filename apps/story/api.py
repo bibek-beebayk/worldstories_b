@@ -3,7 +3,6 @@ import uuid
 
 from rest_framework.viewsets import ReadOnlyModelViewSet, ModelViewSet
 from rest_framework.views import APIView
-from rest_framework.generics import ListAPIView
 from django.db.models import Sum, Avg, Count, F
 from django.db.models import Q
 from django.http import FileResponse
@@ -102,6 +101,11 @@ class LibraryShelfPagination(PageNumberPagination):
 
 class AuthorPagination(PageNumberPagination):
     page_size = 24
+
+
+class SearchAuthorPagination(PageNumberPagination):
+    page_size = 12
+    page_query_param = "author_page"
 
 
 class IsSuperUser(BasePermission):
@@ -899,38 +903,66 @@ class AdminOverviewAPIView(APIView):
         )
 
 
-class SearchStoryAPIView(ListAPIView):
-    serializer_class = StoryListSerializer
+class SearchStoryAPIView(APIView):
+    def get(self, request):
+        q = request.query_params.get("q", "").strip()
+        sort = request.query_params.get("sort", "popular").lower()
+        language = request.query_params.get("language", "").strip()
 
-    def get_queryset(self):
-        q = self.request.query_params.get("q", "").strip()
-        sort = self.request.query_params.get("sort", "popular").lower()
-        language = self.request.query_params.get("language", "").strip()
+        stories = Story.objects.none()
+        authors = Author.objects.none()
 
-        if not q:
-            return Story.objects.none()
-
-        queryset = (
-            Story.objects.published()
-            .select_related("author")
-            .prefetch_related("genres", "audios", "tags")
-            .filter(
-                Q(title__icontains=q)
-                | Q(about__icontains=q)
-                | Q(author__name__icontains=q)
-                | Q(genres__name__icontains=q)
-                | Q(tags__name__icontains=q)
+        if q:
+            stories = (
+                Story.objects.published()
+                .select_related("author")
+                .prefetch_related("genres", "audios", "tags")
+                .filter(
+                    Q(title__icontains=q)
+                    | Q(about__icontains=q)
+                    | Q(author__name__icontains=q)
+                    | Q(genres__name__icontains=q)
+                    | Q(tags__name__icontains=q)
+                )
+                .distinct()
             )
-            .distinct()
-        )
+            authors = (
+                Author.objects.filter(name__icontains=q)
+                .annotate(
+                    published_stories_count=Count(
+                        "stories",
+                        filter=published_story_q("stories"),
+                        distinct=True,
+                    )
+                )
+                .order_by("name", "id")
+            )
 
         if language and language.lower() != "all":
-            queryset = queryset.filter(language=language)
+            stories = stories.filter(language=language)
 
         if sort == "recent":
-            return queryset.order_by("-site_published_date", "-id")
-        if sort == "rating":
-            return queryset.order_by("-rating", "-views", "-id")
-        if sort == "views":
-            return queryset.order_by("-views", "-rating", "-id")
-        return queryset.order_by("-views", "-rating", "-id")
+            stories = stories.order_by("-site_published_date", "-id")
+        elif sort == "rating":
+            stories = stories.order_by("-rating", "-views", "-id")
+        else:
+            stories = stories.order_by("-views", "-rating", "-id")
+
+        story_paginator = CataloguePagination()
+        story_page = story_paginator.paginate_queryset(stories, request, view=self)
+        story_data = StoryListSerializer(
+            story_page, many=True, context={"request": request}
+        ).data
+
+        author_paginator = SearchAuthorPagination()
+        author_page = author_paginator.paginate_queryset(authors, request, view=self)
+        author_data = AuthorSerializer(
+            author_page, many=True, context={"request": request}
+        ).data
+
+        return Response(
+            {
+                "titles": story_paginator.get_response_data(story_data),
+                "authors": author_paginator.get_response_data(author_data),
+            }
+        )
