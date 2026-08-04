@@ -33,6 +33,8 @@ from .models import (
 )
 from .serializers import (
     GenreSerializer,
+    AuthorSerializer,
+    AuthorDetailSerializer,
     AdminGenreSerializer,
     AdminAuthorSerializer,
     StoryListSerializer,
@@ -98,9 +100,37 @@ class LibraryShelfPagination(PageNumberPagination):
     page_size = 4
 
 
+class AuthorPagination(PageNumberPagination):
+    page_size = 24
+
+
 class IsSuperUser(BasePermission):
     def has_permission(self, request, view):
         return bool(request.user and request.user.is_authenticated and request.user.is_superuser)
+
+
+class AuthorViewSet(ReadOnlyModelViewSet):
+    """Public author directory; detail responses only include visible stories."""
+
+    serializer_class = AuthorSerializer
+    pagination_class = AuthorPagination
+
+    def get_queryset(self):
+        return (
+            Author.objects.annotate(
+                published_stories_count=Count(
+                    "stories",
+                    filter=published_story_q("stories"),
+                    distinct=True,
+                )
+            )
+            .order_by("name", "id")
+        )
+
+    def get_serializer_class(self):
+        if self.action == "retrieve":
+            return AuthorDetailSerializer
+        return AuthorSerializer
 
 
 class StoryViewSet(ReadOnlyModelViewSet):

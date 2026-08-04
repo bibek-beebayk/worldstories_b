@@ -4,7 +4,18 @@ from rest_framework import serializers
 from django.utils.text import slugify
 from datetime import date
 from core.libs.images import get_cover_image_url
-from .models import Audio, Story, Genre, Chapter, Tag, Author, Review, Submission, published_story_q
+from .models import (
+    Audio,
+    Story,
+    Genre,
+    Chapter,
+    Tag,
+    Author,
+    Review,
+    Submission,
+    published_story_q,
+    with_preferred_translation_only,
+)
 from . import reading_time
 from .audio_processing import normalize_uploaded_audio
 
@@ -27,6 +38,14 @@ class GenreSerializer(serializers.ModelSerializer):
 
 
 class AuthorSerializer(serializers.ModelSerializer):
+    stories_count = serializers.SerializerMethodField()
+
+    def get_stories_count(self, obj):
+        annotated_count = getattr(obj, "published_stories_count", None)
+        if annotated_count is not None:
+            return annotated_count
+        return obj.stories.filter(published_story_q()).count()
+
     class Meta:
         model = Author
         fields = ["id", "name", "bio", "image", "stories_count"]
@@ -104,6 +123,18 @@ class FeaturedStorySerializer(StoryListSerializer):
 
     class Meta(StoryListSerializer.Meta):
         fields = StoryListSerializer.Meta.fields + ["about"]
+
+
+class AuthorDetailSerializer(AuthorSerializer):
+    stories = serializers.SerializerMethodField()
+
+    def get_stories(self, obj):
+        stories = obj.stories.published().order_by("-site_published_date", "-id")
+        stories = with_preferred_translation_only(stories)
+        return StoryListSerializer(stories, many=True, context=self.context).data
+
+    class Meta(AuthorSerializer.Meta):
+        fields = AuthorSerializer.Meta.fields + ["stories"]
 
 
 class ChapterListSerializer(serializers.ModelSerializer):

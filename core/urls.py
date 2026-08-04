@@ -13,11 +13,12 @@ from apps.story import api as story_api
 from apps.story import analytics_api as story_analytics_api
 from apps.stats import views as stats_views
 from apps.users import api as users_api
-from apps.story.models import Story
+from apps.story.models import Author, Story
 
 router = DefaultRouter()
 
 router.register("stories", story_api.StoryViewSet, basename="story")
+router.register("authors", story_api.AuthorViewSet, basename="author")
 router.register("submissions", story_api.SubmissionViewSet, basename="submission")
 router.register("admin/stories", story_api.StoryAdminViewSet, basename="admin-story")
 router.register("admin/chapters", story_api.ChapterAdminViewSet, basename="admin-chapter")
@@ -37,6 +38,7 @@ def sitemap(request):
             "/library",
             "/trending",
             "/discover",
+            "/authors",
             "/contest",
             "/about",
             "/contact",
@@ -55,6 +57,12 @@ def sitemap(request):
         entries.append(
             f"<url><loc>{escape(f'{site_url}/story/{story.slug}')}</loc>"
             f"{last_modified}</url>"
+        )
+
+    authors = Author.objects.all().only("id")
+    for author in authors.iterator():
+        entries.append(
+            f"<url><loc>{escape(f'{site_url}/authors/{author.id}')}</loc></url>"
         )
 
     xml = (
