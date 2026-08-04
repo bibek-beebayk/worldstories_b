@@ -1,6 +1,7 @@
 import json
 
 from rest_framework import serializers
+from django.db.models import Case, Count, IntegerField, Q, Value, When
 from django.utils.text import slugify
 from datetime import date
 from core.libs.images import get_cover_image_url
@@ -196,6 +197,7 @@ class StoryDetailSerializer(serializers.ModelSerializer):
     published_date_label = serializers.SerializerMethodField()
     pdf_size_bytes = serializers.SerializerMethodField()
     epub_size_bytes = serializers.SerializerMethodField()
+    similar_stories = serializers.SerializerMethodField()
 
     @staticmethod
     def _file_size(file_field):
@@ -238,6 +240,54 @@ class StoryDetailSerializer(serializers.ModelSerializer):
             {"id": sibling.id, "slug": sibling.slug, "language": sibling.language, "title": sibling.title}
             for sibling in siblings
         ]
+
+    def get_similar_stories(self, obj):
+        genre_ids = list(obj.genres.values_list("id", flat=True))
+        matching = Q(story_type=obj.story_type) | Q(language=obj.language)
+        if genre_ids:
+            matching |= Q(genres__id__in=genre_ids)
+        if obj.author_id:
+            matching |= Q(author_id=obj.author_id)
+
+        candidates = Story.objects.published().filter(matching).exclude(
+            translation_group=obj.translation_group
+        )
+        candidates = with_preferred_translation_only(candidates).annotate(
+            shared_genres=Count(
+                "genres",
+                filter=Q(genres__id__in=genre_ids),
+                distinct=True,
+            ),
+            same_author=Case(
+                *(
+                    [When(author_id=obj.author_id, then=Value(1))]
+                    if obj.author_id
+                    else []
+                ),
+                default=Value(0),
+                output_field=IntegerField(),
+            ),
+            same_story_type=Case(
+                When(story_type=obj.story_type, then=Value(1)),
+                default=Value(0),
+                output_field=IntegerField(),
+            ),
+            same_language=Case(
+                When(language=obj.language, then=Value(1)),
+                default=Value(0),
+                output_field=IntegerField(),
+            ),
+        ).order_by(
+            "-shared_genres",
+            "-same_author",
+            "-same_story_type",
+            "-same_language",
+            "-rating",
+            "-views",
+            "-id",
+        )[:6]
+
+        return StoryListSerializer(candidates, many=True, context=self.context).data
     
     def get_reviews_count(self, obj):
         return obj.reviews.count()
@@ -311,6 +361,7 @@ class StoryDetailSerializer(serializers.ModelSerializer):
             "audios",
             "reading_time_minutes",
             "listening_time_minutes",
+            "similar_stories",
         ]
 
 

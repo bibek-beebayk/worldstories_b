@@ -8,7 +8,7 @@ from rest_framework.exceptions import ValidationError
 from rest_framework.test import APITestCase
 
 from apps.story.api import StoryViewSet
-from apps.story.models import Author, Story
+from apps.story.models import Author, Genre, Story
 from apps.story.serializers import StoryAdminSerializer
 from core.urls import sitemap
 
@@ -105,6 +105,45 @@ class PublicAuthorApiTests(APITestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data["stories_count"], 0)
         self.assertEqual(response.data["stories"], [])
+
+    def test_story_detail_recommends_public_similar_titles_only(self):
+        genre = Genre.objects.create(name="Folklore")
+        current = Story.objects.get(slug="published-book")
+        current.genres.add(genre)
+        similar = Story.objects.create(
+            title="Similar Published Book",
+            slug="similar-published-book",
+            author=self.hidden_author,
+            story_type=current.story_type,
+            language=current.language,
+            is_published=True,
+        )
+        similar.genres.add(genre)
+        draft = Story.objects.create(
+            title="Similar Draft",
+            slug="similar-draft",
+            story_type=current.story_type,
+            language=current.language,
+            is_published=False,
+        )
+        draft.genres.add(genre)
+        translation = Story.objects.create(
+            title="Published Translation",
+            slug="published-translation",
+            translation_group=current.translation_group,
+            language="es",
+            is_published=True,
+        )
+        translation.genres.add(genre)
+
+        response = self.client.get(reverse("story-detail", args=[current.slug]))
+
+        self.assertEqual(response.status_code, 200)
+        slugs = [story["slug"] for story in response.data["similar_stories"]]
+        self.assertIn(similar.slug, slugs)
+        self.assertNotIn(current.slug, slugs)
+        self.assertNotIn(draft.slug, slugs)
+        self.assertNotIn(translation.slug, slugs)
 
 
 class OriginalPublicationDateValidationTests(SimpleTestCase):
