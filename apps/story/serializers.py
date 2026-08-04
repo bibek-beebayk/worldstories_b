@@ -2,6 +2,7 @@ import json
 
 from rest_framework import serializers
 from django.db.models import Case, Count, IntegerField, Q, Value, When
+from django.http import QueryDict
 from django.utils.text import slugify
 from datetime import date
 from core.libs.images import get_cover_image_url
@@ -544,8 +545,18 @@ class StoryAdminSerializer(serializers.ModelSerializer):
     )
 
     def to_internal_value(self, data):
-        if hasattr(data, "copy"):
+        if isinstance(data, QueryDict):
+            # QueryDict.copy() performs a deep copy. On multipart requests that
+            # attempts to pickle open UploadedFile streams, which raises on
+            # Python 3.14. Preserve repeated form fields with a shallow copy.
+            normalized = QueryDict("", mutable=True, encoding=data.encoding)
+            for key in data:
+                normalized.setlist(key, list(data.getlist(key)))
+            data = normalized
+        elif hasattr(data, "copy"):
             data = data.copy()
+
+        if hasattr(data, "get"):
             for field_name in self.CLEARABLE_DATE_FIELDS:
                 if data.get(field_name) == "":
                     data[field_name] = None

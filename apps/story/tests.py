@@ -2,7 +2,9 @@ from datetime import date, datetime, timezone as datetime_timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from django.test import RequestFactory, SimpleTestCase
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.http import QueryDict
+from django.test import RequestFactory, SimpleTestCase, TestCase
 from django.urls import reverse
 from rest_framework.exceptions import ValidationError
 from rest_framework.test import APITestCase
@@ -204,3 +206,22 @@ class OriginalPublicationDateValidationTests(SimpleTestCase):
             "original_published_day": None,
         }
         self.assertEqual(serializer.validate(attrs), attrs)
+
+
+class StoryAdminMultipartValidationTests(TestCase):
+    def test_uploaded_file_is_not_deep_copied_when_normalizing_empty_dates(self):
+        upload = SimpleUploadedFile(
+            "story.pdf",
+            b"%PDF-1.4 test document",
+            content_type="application/pdf",
+        )
+        data = QueryDict("", mutable=True)
+        data["title"] = "Multipart Story"
+        data["site_published_date"] = ""
+        data.setlist("pdf_file", [upload])
+
+        serializer = StoryAdminSerializer(data=data)
+
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        self.assertIsNone(serializer.validated_data["site_published_date"])
+        self.assertIs(serializer.validated_data["pdf_file"], upload)
