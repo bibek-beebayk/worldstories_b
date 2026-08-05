@@ -181,6 +181,68 @@ class PublicAuthorApiTests(APITestCase):
         genres = {genre["name"]: genre["stories_count"] for genre in response.data["genres"]}
         self.assertEqual(genres, {"Public Genre": 1})
 
+    def test_discover_returns_only_story_types_and_languages_with_public_titles(self):
+        Story.objects.create(
+            title="Published Spanish Novel",
+            slug="published-spanish-novel",
+            story_type="Novel",
+            language="es",
+            is_published=True,
+        )
+        Story.objects.create(
+            title="Draft French Poetry",
+            slug="draft-french-poetry",
+            story_type="Poetry",
+            language="fr",
+            is_published=False,
+        )
+
+        response = self.client.get(reverse("discover-data"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            {item["value"]: item["stories_count"] for item in response.data["story_types"]},
+            {"Novel": 1, "Short Story": 1},
+        )
+        self.assertEqual(
+            {item["value"]: item["stories_count"] for item in response.data["languages"]},
+            {"en": 1, "es": 1},
+        )
+        self.assertEqual(
+            {"most_viewed", "highest_rated", "most_favorited", "most_discussed"},
+            set(response.data).intersection(
+                {"most_viewed", "highest_rated", "most_favorited", "most_discussed"}
+            ),
+        )
+
+    def test_story_list_can_filter_by_story_type(self):
+        Story.objects.create(
+            title="Published Novel",
+            slug="published-novel",
+            story_type="Novel",
+            is_published=True,
+        )
+
+        response = self.client.get(reverse("story-list"), {"story_type": "Novel"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([story["slug"] for story in response.data["results"]], ["published-novel"])
+
+    def test_story_list_language_filter_returns_matching_translation(self):
+        english = Story.objects.get(slug="published-book")
+        spanish = Story.objects.create(
+            title="Libro Publicado",
+            slug="libro-publicado",
+            translation_group=english.translation_group,
+            language="es",
+            is_published=True,
+        )
+
+        response = self.client.get(reverse("story-list"), {"language": "es"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([story["slug"] for story in response.data["results"]], [spanish.slug])
+
 
 class OriginalPublicationDateValidationTests(SimpleTestCase):
     def test_rejects_impossible_calendar_date(self):

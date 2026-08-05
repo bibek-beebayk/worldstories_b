@@ -36,7 +36,6 @@ def sitemap(request):
         for path in [
             "/",
             "/library",
-            "/trending",
             "/discover",
             "/authors",
             "/contest",

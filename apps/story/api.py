@@ -29,6 +29,8 @@ from .models import (
     StoryView,
     with_preferred_translation_only,
     published_story_q,
+    STORY_TYPE_CHOICES,
+    LANGUAGE_CHOICES,
 )
 from .serializers import (
     GenreSerializer,
@@ -155,7 +157,10 @@ class StoryViewSet(ReadOnlyModelViewSet):
         # any specific translation directly by its own slug, e.g. for the
         # Translations panel's "switch language" links to keep working.
         if self.action == "list":
-            queryset = with_preferred_translation_only(queryset)
+            queryset = with_preferred_translation_only(
+                queryset,
+                preferred_language=self.request.query_params.get("language"),
+            )
         return queryset
 
     def get_permissions(self):
@@ -784,6 +789,40 @@ class OriginalsDataAPIView(APIView):
 class DiscoverDataAPIView(APIView):
     def get(self, request):
         base_qs = Story.objects.published().prefetch_related("genres", "audios")
+        trending_qs = base_qs.annotate(
+            favorites_total=Count("favorites", distinct=True),
+            reviews_total=Count("reviews", distinct=True),
+        )
+        story_type_counts = {
+            item["story_type"]: item["stories_count"]
+            for item in Story.objects.published()
+            .values("story_type")
+            .annotate(stories_count=Count("id"))
+        }
+        story_types = [
+            {
+                "value": value,
+                "label": label,
+                "stories_count": story_type_counts[value],
+            }
+            for value, label in STORY_TYPE_CHOICES
+            if value in story_type_counts
+        ]
+        language_counts = {
+            item["language"]: item["stories_count"]
+            for item in Story.objects.published()
+            .values("language")
+            .annotate(stories_count=Count("id"))
+        }
+        languages = [
+            {
+                "value": value,
+                "label": label,
+                "stories_count": language_counts[value],
+            }
+            for value, label in LANGUAGE_CHOICES
+            if value in language_counts
+        ]
         genres = (
             Genre.objects.filter(published_story_q("stories"))
             .annotate(
@@ -798,6 +837,28 @@ class DiscoverDataAPIView(APIView):
         return Response(
             {
                 "genres": GenreSerializer(genres, many=True).data,
+                "story_types": story_types,
+                "languages": languages,
+                "most_viewed": StoryListSerializer(
+                    trending_qs.order_by("-views", "-id")[:10],
+                    many=True,
+                    context={"request": request},
+                ).data,
+                "highest_rated": StoryListSerializer(
+                    trending_qs.order_by("-rating", "-views", "-id")[:10],
+                    many=True,
+                    context={"request": request},
+                ).data,
+                "most_favorited": StoryListSerializer(
+                    trending_qs.order_by("-favorites_total", "-id")[:10],
+                    many=True,
+                    context={"request": request},
+                ).data,
+                "most_discussed": StoryListSerializer(
+                    trending_qs.order_by("-reviews_total", "-id")[:10],
+                    many=True,
+                    context={"request": request},
+                ).data,
                 "new_releases": StoryListSerializer(
                     base_qs.order_by("-site_published_date", "-id")[:20],
                     many=True,

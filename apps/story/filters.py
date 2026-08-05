@@ -6,6 +6,7 @@ class StoryFilter(filters.FilterSet):
     status = filters.CharFilter(method="filter_status", label="Status")
     genres = filters.CharFilter(method="filter_genres", label="Genres")
     language = filters.CharFilter(method="filter_language", label="Language")
+    story_type = filters.CharFilter(method="filter_story_type", label="Story type")
     sort = filters.CharFilter(method="filter_sort", label="Sort")
     q = filters.CharFilter(method="filter_q", label="Query")
 
@@ -24,6 +25,11 @@ class StoryFilter(filters.FilterSet):
         if not value or value.lower() == "all":
             return queryset
         return queryset.filter(language=value)
+
+    def filter_story_type(self, queryset, name, value):
+        if not value or value.lower() == "all":
+            return queryset
+        return queryset.filter(story_type=value)
     
     def filter_sort(self, queryset, name, value):
         if value.lower() == "recent":
@@ -51,4 +57,4 @@ class StoryFilter(filters.FilterSet):
 
     class Meta:
         model = Story
-        fields = ["status", "genres", "language", "sort", "q"]
+        fields = ["status", "genres", "language", "story_type", "sort", "q"]

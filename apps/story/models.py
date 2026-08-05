@@ -200,10 +200,11 @@ class Story(models.Model):
         verbose_name_plural = "Stories"
 
 
-def with_preferred_translation_only(queryset):
-    """Given a queryset of Story rows, keep only one row per translation_group
-    — the English edition if the group has one, otherwise its oldest (lowest
-    id) edition — so public listings (library, home, etc.) show a single
+def with_preferred_translation_only(queryset, preferred_language=None):
+    """Given a queryset of Story rows, keep only one row per translation_group.
+    When a language is requested, choose within that language; otherwise use
+    the English edition if the group has one, then its oldest (lowest id)
+    edition — so public listings (library, home, etc.) show a single
     entry per underlying work instead of one per language. Stories that
     aren't linked to any other translation form a "group" of one and always
     pass through untouched.
@@ -214,8 +215,15 @@ def with_preferred_translation_only(queryset):
     does) — otherwise a group could "win" on an edition the outer filter
     would exclude anyway, and vanish from the results entirely.
     """
+    candidates = Story.objects.filter(
+        published_story_q(),
+        translation_group=models.OuterRef("translation_group"),
+    )
+    if preferred_language and preferred_language != "all":
+        candidates = candidates.filter(language=preferred_language)
+
     preferred_id = (
-        Story.objects.filter(published_story_q(), translation_group=models.OuterRef("translation_group"))
+        candidates
         .annotate(
             _language_priority=models.Case(
                 models.When(language="en", then=models.Value(0)),
