@@ -158,15 +158,7 @@ class ChapterSerializer(serializers.ModelSerializer):
 
 
 class AudioSerializer(serializers.ModelSerializer):
-    download_size_bytes = serializers.SerializerMethodField()
-
-    def get_download_size_bytes(self, obj):
-        try:
-            return obj.audio_file.size if obj.audio_file else 0
-        # Remote storage metadata can be temporarily unavailable. A missing
-        # size must not make the entire story-detail response fail.
-        except Exception:
-            return 0
+    download_size_bytes = serializers.IntegerField(source="file_size_bytes", read_only=True)
 
     class Meta:
         model = Audio
@@ -766,11 +758,16 @@ class AudioAdminSerializer(serializers.ModelSerializer):
         instance.save(update_fields=["duration_seconds"])
 
     def create(self, validated_data):
+        audio_file = validated_data.get("audio_file")
+        validated_data["file_size_bytes"] = getattr(audio_file, "size", 0) or 0
         instance = super().create(validated_data)
         self._probe_and_save_duration(instance)
         return instance
 
     def update(self, instance, validated_data):
+        audio_file = validated_data.get("audio_file")
+        if audio_file is not None:
+            validated_data["file_size_bytes"] = getattr(audio_file, "size", 0) or 0
         instance = super().update(instance, validated_data)
         if "audio_file" in validated_data:
             self._probe_and_save_duration(instance)
@@ -778,8 +775,8 @@ class AudioAdminSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Audio
-        fields = ["id", "story", "title", "slug", "audio_file", "order", "duration_seconds"]
-        read_only_fields = ["duration_seconds"]
+        fields = ["id", "story", "title", "slug", "audio_file", "order", "duration_seconds", "file_size_bytes"]
+        read_only_fields = ["duration_seconds", "file_size_bytes"]
 
 
 class SubmissionAdminSerializer(serializers.ModelSerializer):

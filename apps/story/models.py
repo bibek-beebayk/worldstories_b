@@ -264,6 +264,9 @@ class Audio(models.Model):
     # cached here — computing it on demand would mean downloading the full
     # file from remote storage on every story-detail page view.
     duration_seconds = models.FloatField(null=True, blank=True, default=None)
+    # Cached at upload time so serializing a story with many audio chapters
+    # does not issue one remote object-storage HEAD request per chapter.
+    file_size_bytes = models.PositiveBigIntegerField(default=0, editable=False)
 
     def __str__(self):
         return f"Audio for {self.story.title} uploaded at {self.uploaded_at}"
