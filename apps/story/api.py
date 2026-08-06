@@ -1,3 +1,5 @@
+import mimetypes
+import os
 import re
 import uuid
 
@@ -5,7 +7,7 @@ from rest_framework.viewsets import ReadOnlyModelViewSet, ModelViewSet
 from rest_framework.views import APIView
 from django.db.models import Sum, Avg, Count, F
 from django.db.models import Q
-from django.http import FileResponse
+from django.http import FileResponse, HttpResponse, StreamingHttpResponse
 from django.db import transaction
 from django.utils import timezone
 from django.utils.text import slugify
@@ -71,6 +73,22 @@ BOT_USER_AGENT_PATTERN = re.compile(
     r"bingbot|DuckDuckBot|YandexBot|W3C_Validator|vkShare",
     re.IGNORECASE,
 )
+
+AUDIO_RANGE_PATTERN = re.compile(r"^bytes=(\d*)-(\d*)$")
+
+
+def iter_file_range(file_obj, length, chunk_size=64 * 1024):
+    """Yield exactly ``length`` bytes and always close the storage handle."""
+    remaining = length
+    try:
+        while remaining > 0:
+            chunk = file_obj.read(min(chunk_size, remaining))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+            yield chunk
+    finally:
+        file_obj.close()
 
 
 def get_client_ip(request):
@@ -350,17 +368,62 @@ class StoryViewSet(ReadOnlyModelViewSet):
 
     @action(detail=True, methods=["get"], url_path=r"audios/(?P<audio_slug>[^/.]+)/stream")
     def audio_stream(self, request, slug=None, audio_slug=None):
-        """Same-origin proxy for an audio chapter's bytes — used only by the
-        offline-download flow so it can fetch bytes to encrypt without
-        depending on the R2 bucket's CORS config (unlike normal playback,
-        which reads audio_file's direct R2 URL and doesn't need CORS since
-        it's a plain <audio> resource load, not a script-readable fetch)."""
+        """Serve audio with the byte-range semantics required by Safari."""
         story = self.get_object()
         audio = story.audios.filter(slug=audio_slug).first()
         if not audio or not audio.audio_file:
             return Response({"detail": "Audio file not available."}, status=status.HTTP_404_NOT_FOUND)
-        file_obj = audio.audio_file.open("rb")
-        return FileResponse(file_obj, content_type="audio/mpeg")
+
+        file_size = audio.audio_file.size
+        file_name = os.path.basename(audio.audio_file.name)
+        safe_file_name = file_name.replace('"', "")
+        content_type = mimetypes.guess_type(file_name)[0] or "audio/mpeg"
+        range_header = request.headers.get("Range")
+
+        if range_header:
+            match = AUDIO_RANGE_PATTERN.fullmatch(range_header.strip())
+            if not match:
+                response = HttpResponse(status=416)
+                response["Content-Range"] = f"bytes */{file_size}"
+                return response
+
+            start_text, end_text = match.groups()
+            if not start_text:
+                suffix_length = int(end_text or 0)
+                if suffix_length <= 0:
+                    response = HttpResponse(status=416)
+                    response["Content-Range"] = f"bytes */{file_size}"
+                    return response
+                start = max(0, file_size - suffix_length)
+                end = file_size - 1
+            else:
+                start = int(start_text)
+                end = min(int(end_text), file_size - 1) if end_text else file_size - 1
+
+            if start >= file_size or start > end:
+                response = HttpResponse(status=416)
+                response["Content-Range"] = f"bytes */{file_size}"
+                return response
+
+            length = end - start + 1
+            file_obj = audio.audio_file.open("rb")
+            file_obj.seek(start)
+            response = StreamingHttpResponse(
+                iter_file_range(file_obj, length),
+                status=206,
+                content_type=content_type,
+            )
+            response["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+            response["Content-Length"] = str(length)
+        else:
+            file_obj = audio.audio_file.open("rb")
+            response = FileResponse(file_obj, content_type=content_type)
+            response["Content-Length"] = str(file_size)
+
+        response["Accept-Ranges"] = "bytes"
+        response["Content-Disposition"] = f'inline; filename="{safe_file_name}"'
+        response["Cache-Control"] = "public, max-age=3600"
+        return response
 
 
 class SubmissionViewSet(ModelViewSet):

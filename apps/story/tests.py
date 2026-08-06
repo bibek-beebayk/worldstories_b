@@ -1,4 +1,5 @@
 from datetime import date, datetime, timezone as datetime_timezone
+from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -13,6 +14,41 @@ from apps.story.api import StoryViewSet
 from apps.story.models import Author, Genre, Story
 from apps.story.serializers import StoryAdminSerializer
 from core.urls import sitemap
+
+
+class AudioStreamRangeTests(SimpleTestCase):
+    def make_view(self, payload=b"0123456789"):
+        audio_file = MagicMock()
+        audio_file.size = len(payload)
+        audio_file.name = "story_audios/chapter.mp3"
+        audio_file.open.return_value = BytesIO(payload)
+        audio = SimpleNamespace(audio_file=audio_file)
+        story = MagicMock()
+        story.audios.filter.return_value.first.return_value = audio
+        view = StoryViewSet()
+        view.get_object = MagicMock(return_value=story)
+        return view
+
+    def test_audio_stream_serves_requested_byte_range(self):
+        view = self.make_view()
+        request = RequestFactory().get("/audio", HTTP_RANGE="bytes=2-5")
+
+        response = view.audio_stream(request, slug="story", audio_slug="chapter")
+
+        self.assertEqual(response.status_code, 206)
+        self.assertEqual(response["Accept-Ranges"], "bytes")
+        self.assertEqual(response["Content-Range"], "bytes 2-5/10")
+        self.assertEqual(response["Content-Length"], "4")
+        self.assertEqual(b"".join(response.streaming_content), b"2345")
+
+    def test_audio_stream_rejects_unsatisfiable_range(self):
+        view = self.make_view()
+        request = RequestFactory().get("/audio", HTTP_RANGE="bytes=20-30")
+
+        response = view.audio_stream(request, slug="story", audio_slug="chapter")
+
+        self.assertEqual(response.status_code, 416)
+        self.assertEqual(response["Content-Range"], "bytes */10")
 
 
 class ScheduledPublishingTests(SimpleTestCase):
