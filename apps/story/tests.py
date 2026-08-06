@@ -9,8 +9,9 @@ from django.test import RequestFactory, SimpleTestCase, TestCase
 from django.urls import reverse
 from rest_framework.exceptions import ValidationError
 from rest_framework.test import APITestCase
+from storages.backends.s3 import S3Storage
 
-from apps.story.api import StoryViewSet
+from apps.story.api import StoryViewSet, open_s3_audio_stream
 from apps.story.models import Author, Genre, Story
 from apps.story.serializers import StoryAdminSerializer
 from core.urls import sitemap
@@ -49,6 +50,25 @@ class AudioStreamRangeTests(SimpleTestCase):
 
         self.assertEqual(response.status_code, 416)
         self.assertEqual(response["Content-Range"], "bytes */10")
+
+    def test_s3_audio_stream_forwards_range_without_opening_file(self):
+        storage = MagicMock(spec=S3Storage)
+        storage.bucket_name = "audiobooks"
+        response_payload = {"Body": BytesIO(b"2345"), "ContentLength": 4}
+        storage.connection.meta.client.get_object.return_value = response_payload
+        audio_file = MagicMock()
+        audio_file.storage = storage
+        audio_file.name = "story_audios/chapter.mp3"
+
+        result = open_s3_audio_stream(audio_file, 2, 5)
+
+        self.assertIs(result, response_payload)
+        storage.connection.meta.client.get_object.assert_called_once_with(
+            Bucket="audiobooks",
+            Key="story_audios/chapter.mp3",
+            Range="bytes=2-5",
+        )
+        audio_file.open.assert_not_called()
 
 
 class ScheduledPublishingTests(SimpleTestCase):

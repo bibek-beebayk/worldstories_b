@@ -12,6 +12,7 @@ from django.db import transaction
 from django.utils import timezone
 from django.utils.text import slugify
 from datetime import timedelta
+from storages.backends.s3 import S3Storage
 from rest_framework.parsers import FormParser, MultiPartParser, JSONParser
 from rest_framework.permissions import BasePermission
 from rest_framework.filters import SearchFilter
@@ -89,6 +90,38 @@ def iter_file_range(file_obj, length, chunk_size=64 * 1024):
             yield chunk
     finally:
         file_obj.close()
+
+
+def iter_streaming_body(streaming_body, chunk_size=64 * 1024):
+    """Stream an S3/R2 response body without buffering the complete object."""
+    try:
+        while True:
+            chunk = streaming_body.read(chunk_size)
+            if not chunk:
+                break
+            yield chunk
+    finally:
+        streaming_body.close()
+
+
+def open_s3_audio_stream(audio_file, start=None, end=None):
+    """Open an R2/S3 object directly, forwarding an optional byte range.
+
+    Opening an ``S3File`` through django-storages downloads the complete object
+    into a spooled temporary file first. Using the configured client's
+    ``get_object`` API keeps the response body streaming from object storage.
+    """
+    storage = audio_file.storage
+    if not isinstance(storage, S3Storage):
+        return None
+
+    parameters = {
+        "Bucket": storage.bucket_name,
+        "Key": audio_file.name,
+    }
+    if start is not None and end is not None:
+        parameters["Range"] = f"bytes={start}-{end}"
+    return storage.connection.meta.client.get_object(**parameters)
 
 
 def get_client_ip(request):
@@ -406,18 +439,33 @@ class StoryViewSet(ReadOnlyModelViewSet):
                 return response
 
             length = end - start + 1
-            file_obj = audio.audio_file.open("rb")
-            file_obj.seek(start)
-            response = StreamingHttpResponse(
-                iter_file_range(file_obj, length),
-                status=206,
-                content_type=content_type,
-            )
+            remote_object = open_s3_audio_stream(audio.audio_file, start, end)
+            if remote_object is not None:
+                response = StreamingHttpResponse(
+                    iter_streaming_body(remote_object["Body"]),
+                    status=206,
+                    content_type=remote_object.get("ContentType") or content_type,
+                )
+            else:
+                file_obj = audio.audio_file.open("rb")
+                file_obj.seek(start)
+                response = StreamingHttpResponse(
+                    iter_file_range(file_obj, length),
+                    status=206,
+                    content_type=content_type,
+                )
             response["Content-Range"] = f"bytes {start}-{end}/{file_size}"
             response["Content-Length"] = str(length)
         else:
-            file_obj = audio.audio_file.open("rb")
-            response = FileResponse(file_obj, content_type=content_type)
+            remote_object = open_s3_audio_stream(audio.audio_file)
+            if remote_object is not None:
+                response = StreamingHttpResponse(
+                    iter_streaming_body(remote_object["Body"]),
+                    content_type=remote_object.get("ContentType") or content_type,
+                )
+            else:
+                file_obj = audio.audio_file.open("rb")
+                response = FileResponse(file_obj, content_type=content_type)
             response["Content-Length"] = str(file_size)
 
         response["Accept-Ranges"] = "bytes"
