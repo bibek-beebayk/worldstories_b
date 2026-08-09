@@ -100,10 +100,16 @@ class ScheduledPublishingTests(SimpleTestCase):
     @patch("core.urls.Author.objects.all")
     @patch("core.urls.Story.objects.published")
     def test_sitemap_uses_scheduled_publication_gate(self, published, authors_all):
-        queryset = MagicMock()
-        queryset.only.return_value.iterator.return_value = iter(
-            [SimpleNamespace(slug="visible-story", site_published_date=date(2026, 8, 2))]
+        chapter = SimpleNamespace(slug="chapter-one")
+        story = SimpleNamespace(
+            slug="visible-story",
+            site_published_date=date(2026, 8, 2),
+            chapters=SimpleNamespace(all=lambda: [chapter]),
         )
+        queryset = MagicMock()
+        (
+            queryset.exclude.return_value.prefetch_related.return_value.only.return_value.iterator.return_value
+        ) = iter([story])
         published.return_value = queryset
         authors_all.return_value.only.return_value.iterator.return_value = iter([])
 
@@ -111,8 +117,10 @@ class ScheduledPublishingTests(SimpleTestCase):
         xml = response.content.decode()
 
         self.assertContains(response, "/story/visible-story")
+        self.assertContains(response, "/read/visible-story/chapter-one")
         self.assertIn("<lastmod>2026-08-02</lastmod>", xml)
         published.assert_called_once_with()
+        queryset.exclude.assert_called_once_with(story_type="Summary")
 
 
 class PublicAuthorApiTests(APITestCase):

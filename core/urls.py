@@ -46,7 +46,15 @@ def sitemap(request):
         ]
     ]
 
-    stories = Story.objects.published().only("slug", "site_published_date")
+    # AI-generated "Summary" entries (e.g. for in-copyright books we don't host
+    # the full text of) are thin by design — kept off the sitemap so they're not
+    # offered to search engines as representative site content.
+    stories = (
+        Story.objects.published()
+        .exclude(story_type="Summary")
+        .prefetch_related("chapters")
+        .only("slug", "site_published_date")
+    )
     for story in stories.iterator():
         last_modified = (
             f"<lastmod>{story.site_published_date.isoformat()}</lastmod>"
@@ -57,6 +65,13 @@ def sitemap(request):
             f"<url><loc>{escape(f'{site_url}/story/{story.slug}')}</loc>"
             f"{last_modified}</url>"
         )
+        for chapter in story.chapters.all():
+            if not chapter.slug:
+                continue
+            entries.append(
+                f"<url><loc>{escape(f'{site_url}/read/{story.slug}/{chapter.slug}')}</loc>"
+                f"{last_modified}</url>"
+            )
 
     authors = Author.objects.all().only("id")
     for author in authors.iterator():
