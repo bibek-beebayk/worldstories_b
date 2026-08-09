@@ -97,6 +97,13 @@ class StoryAdmin(admin.ModelAdmin):
             },
         ),
         (
+            "Summary",
+            {
+                "fields": ("summary",),
+                "description": "Longer-form rich-text summary shown in its own tab on the story page.",
+            },
+        ),
+        (
             "Submission",
             {
                 "fields": ("submitted_by",),
@@ -150,6 +157,7 @@ class StoryAdmin(admin.ModelAdmin):
         "title",
         "slug",
         "about",
+        "summary",
         "author__name",
         "genres__name",
         "tags__name",

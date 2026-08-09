@@ -100,6 +100,7 @@ class Story(models.Model):
     # content = models.TextField()
     slug = models.SlugField(max_length=256, unique=True)
     about = models.TextField(blank=True, null=True)
+    summary = CKEditor5Field('Text', config_name='extends', blank=True, null=True)
     genres = models.ManyToManyField(Genre, related_name="stories")
     story_type = models.CharField(
         max_length=50, choices=STORY_TYPE_CHOICES, default="Short Story"
