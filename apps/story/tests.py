@@ -13,8 +13,207 @@ from storages.backends.s3 import S3Storage
 
 from apps.story.api import StoryViewSet, open_s3_audio_stream
 from apps.story.models import Author, Genre, Story
-from apps.story.serializers import StoryAdminSerializer
+from apps.story.serializers import AudioAdminSerializer, StoryAdminSerializer
+from apps.story import reading_time
 from core.urls import sitemap
+
+
+class AudioAdminSerializerDurationProbeTests(SimpleTestCase):
+    """Regression coverage for a production incident: probing duration from
+    instance.audio_file *after* it was already saved to S3/R2 meant a live
+    network round-trip back to remote storage on every admin audio upload. A
+    stalled connection there hung the request — and with gunicorn's default
+    single sync worker, the whole site — until the worker-timeout killed it.
+    Duration must be probed from the local pre-save upload instead."""
+
+    def test_probe_duration_from_upload_reads_local_bytes_and_rewinds(self):
+        serializer = AudioAdminSerializer()
+        uploaded = SimpleUploadedFile("clip.mp3", b"fake-mp3-bytes", content_type="audio/mpeg")
+
+        with patch(
+            "apps.story.serializers.reading_time.probe_audio_duration_from_bytes",
+            return_value=12.5,
+        ) as probe_bytes:
+            duration = serializer._probe_duration_from_upload(uploaded)
+
+        probe_bytes.assert_called_once_with(b"fake-mp3-bytes")
+        self.assertEqual(duration, 12.5)
+        # Rewound so the real save immediately after (which reads the file
+        # again to upload it) still gets the full content.
+        self.assertEqual(uploaded.tell(), 0)
+
+    def test_create_probes_the_local_upload_not_remote_storage(self):
+        serializer = AudioAdminSerializer()
+        uploaded = SimpleUploadedFile("clip.mp3", b"fake-mp3-bytes", content_type="audio/mpeg")
+        created_instance = SimpleNamespace(duration_seconds=None, save=MagicMock())
+
+        with patch(
+            "rest_framework.serializers.ModelSerializer.create",
+            return_value=created_instance,
+        ), patch(
+            "apps.story.serializers.reading_time.probe_audio_duration_from_bytes",
+            return_value=7.0,
+        ) as probe_bytes, patch(
+            "apps.story.serializers.reading_time.probe_audio_duration_seconds"
+        ) as probe_remote:
+            result = serializer.create({"audio_file": uploaded})
+
+        probe_bytes.assert_called_once()
+        probe_remote.assert_not_called()
+        self.assertEqual(result.duration_seconds, 7.0)
+        created_instance.save.assert_called_once_with(update_fields=["duration_seconds"])
+
+    def test_update_without_a_new_file_does_not_probe(self):
+        serializer = AudioAdminSerializer()
+        existing_instance = SimpleNamespace(duration_seconds=42.0, save=MagicMock())
+
+        with patch(
+            "rest_framework.serializers.ModelSerializer.update",
+            return_value=existing_instance,
+        ), patch(
+            "apps.story.serializers.reading_time.probe_audio_duration_from_bytes"
+        ) as probe_bytes:
+            result = serializer.update(existing_instance, {"title": "Renamed"})
+
+        probe_bytes.assert_not_called()
+        existing_instance.save.assert_not_called()
+        self.assertEqual(result.duration_seconds, 42.0)
+
+
+class StoryAdminSerializerFileReadingCacheTests(SimpleTestCase):
+    """Same production-incident class as AudioAdminSerializerDurationProbeTests
+    above, but for epub/pdf reading-time estimates: these used to be parsed
+    live from remote storage on every chapterless-story detail-page view
+    (a much hotter path than admin audio uploads). They're now cached on
+    Story.cached_file_reading_minutes, computed from the local upload at
+    admin save time — never fetched from remote storage in a live request."""
+
+    def _create_with(self, epub_file=None, pdf_file=None):
+        serializer = StoryAdminSerializer()
+        created_instance = SimpleNamespace(cached_file_reading_minutes=None)
+        validated_data = {}
+        if epub_file is not None:
+            validated_data["epub_file"] = epub_file
+        if pdf_file is not None:
+            validated_data["pdf_file"] = pdf_file
+
+        with patch(
+            "rest_framework.serializers.ModelSerializer.create",
+            side_effect=lambda data: created_instance,
+        ) as create_super:
+            serializer.create(validated_data)
+        return create_super.call_args.args[0]
+
+    def test_create_with_epub_upload_caches_from_local_bytes(self):
+        uploaded = SimpleUploadedFile("book.epub", b"epub-bytes", content_type="application/epub+zip")
+        with patch(
+            "apps.story.serializers.reading_time.epub_minutes_from_bytes", return_value=15
+        ) as epub_probe, patch(
+            "apps.story.serializers.reading_time.pdf_minutes_from_bytes"
+        ) as pdf_probe:
+            submitted = self._create_with(epub_file=uploaded)
+
+        epub_probe.assert_called_once_with(b"epub-bytes")
+        pdf_probe.assert_not_called()
+        self.assertEqual(submitted["cached_file_reading_minutes"], 15)
+
+    def test_create_with_pdf_only_upload_caches_from_local_bytes(self):
+        uploaded = SimpleUploadedFile("book.pdf", b"pdf-bytes", content_type="application/pdf")
+        with patch(
+            "apps.story.serializers.reading_time.pdf_minutes_from_bytes", return_value=8
+        ) as pdf_probe:
+            submitted = self._create_with(pdf_file=uploaded)
+
+        pdf_probe.assert_called_once_with(b"pdf-bytes")
+        self.assertEqual(submitted["cached_file_reading_minutes"], 8)
+
+    def test_create_with_both_files_prefers_epub(self):
+        epub_uploaded = SimpleUploadedFile("book.epub", b"epub-bytes", content_type="application/epub+zip")
+        pdf_uploaded = SimpleUploadedFile("book.pdf", b"pdf-bytes", content_type="application/pdf")
+        with patch(
+            "apps.story.serializers.reading_time.epub_minutes_from_bytes", return_value=15
+        ), patch(
+            "apps.story.serializers.reading_time.pdf_minutes_from_bytes"
+        ) as pdf_probe:
+            submitted = self._create_with(epub_file=epub_uploaded, pdf_file=pdf_uploaded)
+
+        pdf_probe.assert_not_called()
+        self.assertEqual(submitted["cached_file_reading_minutes"], 15)
+
+    def _update(self, instance, validated_data):
+        serializer = StoryAdminSerializer()
+        with patch(
+            "rest_framework.serializers.ModelSerializer.update",
+            side_effect=lambda inst, data: inst,
+        ) as update_super:
+            serializer.update(instance, validated_data)
+        return update_super.call_args.args[1]
+
+    def test_update_removing_the_only_file_clears_the_cache(self):
+        instance = SimpleNamespace(
+            epub_file=MagicMock(__bool__=lambda self: True, delete=MagicMock()),
+            pdf_file=None,
+            cover_image_file=None,
+            cached_file_reading_minutes=15,
+        )
+        submitted = self._update(instance, {"remove_epub_file": True})
+        self.assertIsNone(submitted["cached_file_reading_minutes"])
+
+    def test_update_removing_one_file_leaves_the_surviving_files_cache_untouched(self):
+        # epub is being removed but a pdf survives, unchanged, un-reuploaded —
+        # recomputing from it would mean fetching it back from remote storage,
+        # so the existing cached estimate (whatever it is) is left alone.
+        instance = SimpleNamespace(
+            epub_file=MagicMock(__bool__=lambda self: True, delete=MagicMock()),
+            pdf_file=MagicMock(__bool__=lambda self: True),
+            cover_image_file=None,
+            cached_file_reading_minutes=15,
+        )
+        submitted = self._update(instance, {"remove_epub_file": True})
+        self.assertNotIn("cached_file_reading_minutes", submitted)
+
+    def test_update_uploading_new_epub_recomputes_even_if_a_pdf_already_exists(self):
+        instance = SimpleNamespace(
+            epub_file=None,
+            pdf_file=MagicMock(__bool__=lambda self: True),
+            cover_image_file=None,
+            cached_file_reading_minutes=8,
+        )
+        uploaded = SimpleUploadedFile("book.epub", b"epub-bytes", content_type="application/epub+zip")
+        with patch(
+            "apps.story.serializers.reading_time.epub_minutes_from_bytes", return_value=20
+        ) as epub_probe:
+            submitted = self._update(instance, {"epub_file": uploaded})
+
+        epub_probe.assert_called_once_with(b"epub-bytes")
+        self.assertEqual(submitted["cached_file_reading_minutes"], 20)
+
+
+class StoryReadingMinutesTests(SimpleTestCase):
+    def test_chapterless_story_returns_the_cached_value_without_touching_storage(self):
+        story = SimpleNamespace(
+            chapters=SimpleNamespace(exists=lambda: False),
+            cached_file_reading_minutes=12,
+        )
+        with patch("apps.story.reading_time.epub_reading_minutes") as epub_probe, patch(
+            "apps.story.reading_time.pdf_reading_minutes"
+        ) as pdf_probe:
+            result = reading_time.story_reading_minutes(story)
+
+        epub_probe.assert_not_called()
+        pdf_probe.assert_not_called()
+        self.assertEqual(result, 12)
+
+    def test_story_with_chapters_ignores_the_cached_file_value(self):
+        story = SimpleNamespace(
+            chapters=SimpleNamespace(
+                exists=lambda: True,
+                values_list=lambda *a, **k: ["<p>" + " ".join(["word"] * 400) + "</p>"],
+            ),
+            cached_file_reading_minutes=999,
+        )
+        result = reading_time.story_reading_minutes(story)
+        self.assertEqual(result, 2)
 
 
 class AudioStreamRangeTests(SimpleTestCase):

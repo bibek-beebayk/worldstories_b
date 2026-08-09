@@ -520,6 +520,11 @@ class SubmissionListSerializer(serializers.ModelSerializer):
 
 
 class StoryAdminSerializer(serializers.ModelSerializer):
+    # Sentinel distinguishing "leave cached_file_reading_minutes untouched"
+    # from a legitimate computed value of None (no words found, format not
+    # parseable, etc.) — see _file_reading_minutes_for_upload.
+    _CACHE_UNCHANGED = object()
+
     author = serializers.PrimaryKeyRelatedField(
         queryset=Author.objects.all(), required=False, allow_null=True
     )
@@ -626,6 +631,7 @@ class StoryAdminSerializer(serializers.ModelSerializer):
             "epub_file",
             "remove_epub_file",
             "epub_file_url",
+            "cached_file_reading_minutes",
             "is_completed",
             "genres",
             "categories",
@@ -634,7 +640,7 @@ class StoryAdminSerializer(serializers.ModelSerializer):
             "views",
             "source",
         ]
-        read_only_fields = ["rating", "views"]
+        read_only_fields = ["rating", "views", "cached_file_reading_minutes"]
         # slug isn't required at the request level — validate() below auto-generates
         # it from the title when omitted, but that only runs after field-level
         # validation, so `slug` must not be marked required there.
@@ -717,6 +723,26 @@ class StoryAdminSerializer(serializers.ModelSerializer):
         request = self.context.get("request")
         return request.build_absolute_uri(obj.epub_file.url) if request else obj.epub_file.url
 
+    # Computes the epub/pdf-derived reading-time estimate from whichever file
+    # was *just uploaded this request* — never from a file already sitting in
+    # remote storage, which would mean fetching it back over the network (see
+    # reading_time.py's module docstring). new_epub/new_pdf are the local,
+    # not-yet-saved upload objects from validated_data.
+    def _file_reading_minutes_for_upload(self, new_epub, new_pdf, epub_survives, pdf_survives):
+        if new_epub is not None:
+            raw_bytes = reading_time.read_local_upload_bytes(new_epub)
+            return reading_time.epub_minutes_from_bytes(raw_bytes) if raw_bytes is not None else None
+        if new_pdf is not None and not epub_survives:
+            raw_bytes = reading_time.read_local_upload_bytes(new_pdf)
+            return reading_time.pdf_minutes_from_bytes(raw_bytes) if raw_bytes is not None else None
+        if not epub_survives and not pdf_survives:
+            return None
+        # A file was removed/replaced but whatever's left (an unchanged epub
+        # or pdf) wasn't re-uploaded this request — recomputing it would mean
+        # fetching it back from remote storage, which this cache exists to
+        # avoid, so the previous estimate is left in place instead.
+        return self._CACHE_UNCHANGED
+
     def update(self, instance, validated_data):
         remove_cover_image_file = bool(validated_data.pop("remove_cover_image_file", False))
         remove_pdf_file = bool(validated_data.pop("remove_pdf_file", False))
@@ -732,6 +758,15 @@ class StoryAdminSerializer(serializers.ModelSerializer):
             instance.epub_file.delete(save=False)
             instance.epub_file = None
 
+        cached_minutes = self._file_reading_minutes_for_upload(
+            validated_data.get("epub_file"),
+            validated_data.get("pdf_file"),
+            epub_survives=bool(instance.epub_file),
+            pdf_survives=bool(instance.pdf_file),
+        )
+        if cached_minutes is not self._CACHE_UNCHANGED:
+            validated_data["cached_file_reading_minutes"] = cached_minutes
+
         return super().update(instance, validated_data)
 
     def create(self, validated_data):
@@ -739,6 +774,15 @@ class StoryAdminSerializer(serializers.ModelSerializer):
         validated_data.pop("remove_cover_image_file", None)
         validated_data.pop("remove_pdf_file", None)
         validated_data.pop("remove_epub_file", None)
+
+        new_epub = validated_data.get("epub_file")
+        new_pdf = validated_data.get("pdf_file")
+        cached_minutes = self._file_reading_minutes_for_upload(
+            new_epub, new_pdf, epub_survives=bool(new_epub), pdf_survives=bool(new_pdf)
+        )
+        if cached_minutes is not self._CACHE_UNCHANGED:
+            validated_data["cached_file_reading_minutes"] = cached_minutes
+
         return super().create(validated_data)
 
 
@@ -796,25 +840,37 @@ class AudioAdminSerializer(serializers.ModelSerializer):
         # some browsers can't decode — see audio_processing.py.
         return normalize_uploaded_audio(value) if value else value
 
-    def _probe_and_save_duration(self, instance):
-        duration = reading_time.probe_audio_duration_seconds(instance.audio_file)
-        instance.duration_seconds = duration
-        instance.save(update_fields=["duration_seconds"])
+    def _probe_duration_from_upload(self, uploaded_file):
+        # Probes the file that's about to be saved, not the one that was just
+        # saved — reading it back from instance.audio_file after super().create()/
+        # update() would mean a live network round-trip to remote storage (see
+        # reading_time.probe_audio_duration_seconds). The upload is already
+        # sitting in memory/local temp storage right here, pre-save.
+        raw_bytes = reading_time.read_local_upload_bytes(uploaded_file)
+        if raw_bytes is None:
+            return None
+        return reading_time.probe_audio_duration_from_bytes(raw_bytes)
 
     def create(self, validated_data):
         audio_file = validated_data.get("audio_file")
         validated_data["file_size_bytes"] = getattr(audio_file, "size", 0) or 0
+        duration = self._probe_duration_from_upload(audio_file)
         instance = super().create(validated_data)
-        self._probe_and_save_duration(instance)
+        if duration is not None:
+            instance.duration_seconds = duration
+            instance.save(update_fields=["duration_seconds"])
         return instance
 
     def update(self, instance, validated_data):
         audio_file = validated_data.get("audio_file")
+        duration = None
         if audio_file is not None:
             validated_data["file_size_bytes"] = getattr(audio_file, "size", 0) or 0
+            duration = self._probe_duration_from_upload(audio_file)
         instance = super().update(instance, validated_data)
-        if "audio_file" in validated_data:
-            self._probe_and_save_duration(instance)
+        if "audio_file" in validated_data and duration is not None:
+            instance.duration_seconds = duration
+            instance.save(update_fields=["duration_seconds"])
         return instance
 
     class Meta:

@@ -162,6 +162,12 @@ class Story(models.Model):
     cover_image_file = VersatileImageField(upload_to="story_covers/", blank=True, null=True)
     pdf_file = models.FileField(upload_to="story_files/pdfs/", blank=True, null=True)
     epub_file = models.FileField(upload_to="story_files/epubs/", blank=True, null=True)
+    # Estimated reading time (minutes) derived from epub_file/pdf_file, probed
+    # once at upload time (StoryAdminSerializer) rather than parsed live from
+    # remote storage on every story-detail view — see reading_time.py. Only
+    # meaningful for chapterless stories; chapter-based stories compute this
+    # live instead since chapter content is already in Postgres.
+    cached_file_reading_minutes = models.PositiveIntegerField(blank=True, null=True)
     is_completed = models.BooleanField(default=False)
     tags = models.ManyToManyField(Tag, blank=True)
     rating = models.FloatField(default=0.0)
