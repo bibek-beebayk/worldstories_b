@@ -5,6 +5,7 @@ from .models import Story
 class StoryFilter(filters.FilterSet):
     status = filters.CharFilter(method="filter_status", label="Status")
     genres = filters.CharFilter(method="filter_genres", label="Genres")
+    categories = filters.CharFilter(method="filter_categories", label="Categories")
     language = filters.CharFilter(method="filter_language", label="Language")
     story_type = filters.CharFilter(method="filter_story_type", label="Story type")
     sort = filters.CharFilter(method="filter_sort", label="Sort")
@@ -20,6 +21,10 @@ class StoryFilter(filters.FilterSet):
     def filter_genres(self, queryset, name, value):
         genre_ids = [genre.strip() for genre in value.split(",")]
         return queryset.filter(genres__id__in=genre_ids).distinct()
+
+    def filter_categories(self, queryset, name, value):
+        category_ids = [category.strip() for category in value.split(",")]
+        return queryset.filter(categories__id__in=category_ids).distinct()
 
     def filter_language(self, queryset, name, value):
         if not value or value.lower() == "all":
@@ -52,9 +57,10 @@ class StoryFilter(filters.FilterSet):
             | Q(about__icontains=query)
             | Q(author__name__icontains=query)
             | Q(genres__name__icontains=query)
+            | Q(categories__name__icontains=query)
             | Q(tags__name__icontains=query)
         ).distinct()
 
     class Meta:
         model = Story
-        fields = ["status", "genres", "language", "story_type", "sort", "q"]
+        fields = ["status", "genres", "categories", "language", "story_type", "sort", "q"]

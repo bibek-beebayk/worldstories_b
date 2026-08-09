@@ -22,6 +22,7 @@ from apps.stats.models import ReadingProgress, AudioReadingProgress
 from apps.users.models import User
 from .models import (
     Genre,
+    Category,
     Story,
     Chapter,
     Audio,
@@ -37,9 +38,11 @@ from .models import (
 )
 from .serializers import (
     GenreSerializer,
+    CategorySerializer,
     AuthorSerializer,
     AuthorDetailSerializer,
     AdminGenreSerializer,
+    AdminCategorySerializer,
     AdminAuthorSerializer,
     StoryListSerializer,
     FeaturedStorySerializer,
@@ -692,6 +695,23 @@ class GenreListAPIView(APIView):
         return Response(serializer.data)
 
 
+class CategoryListAPIView(APIView):
+    def get(self, request):
+        categories = (
+            Category.objects.filter(published_story_q("stories"))
+            .annotate(
+                published_stories_count=Count(
+                    "stories",
+                    filter=published_story_q("stories"),
+                    distinct=True,
+                )
+            )
+            .order_by("name")
+        )
+        serializer = CategorySerializer(categories, many=True)
+        return Response(serializer.data)
+
+
 class LibraryShelvesAPIView(APIView):
     """Paginates genres (the 'shelves'), not stories — each shelf carries only a small
     preview of its stories. This keeps a genre-organized library view cheap regardless
@@ -745,19 +765,45 @@ class LibraryShelvesAPIView(APIView):
         return paginator.get_paginated_response(shelves)
 
 
-class AdminAuthorListAPIView(APIView):
+class AuthorAdminViewSet(ModelViewSet):
+    """Full author management (list/create/update/delete) for the admin panel.
+
+    Deletion is blocked while the author still has stories — Story.author uses
+    on_delete=CASCADE, so an unguarded delete here would silently wipe out
+    every one of that author's stories along with them.
+    """
+
+    queryset = Author.objects.all().order_by("name")
+    serializer_class = AdminAuthorSerializer
     permission_classes = [IsSuperUser]
+    pagination_class = None
+    filter_backends = [SearchFilter]
+    search_fields = ["name", "bio"]
 
-    def get(self, request):
-        authors = Author.objects.all().order_by("name")
-        serializer = AdminAuthorSerializer(authors, many=True)
-        return Response(serializer.data)
+    def destroy(self, request, *args, **kwargs):
+        author = self.get_object()
+        stories_count = author.stories.count()
+        if stories_count:
+            return Response(
+                {
+                    "detail": (
+                        f"Can't delete \"{author.name}\" — {stories_count} "
+                        f"{'story is' if stories_count == 1 else 'stories are'} still "
+                        "assigned to them. Reassign or delete those stories first."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return super().destroy(request, *args, **kwargs)
 
-    def post(self, request):
-        serializer = AdminAuthorSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        author = serializer.save()
-        return Response(AdminAuthorSerializer(author).data, status=status.HTTP_201_CREATED)
+
+class CategoryAdminViewSet(ModelViewSet):
+    queryset = Category.objects.all().order_by("name")
+    serializer_class = AdminCategorySerializer
+    permission_classes = [IsSuperUser]
+    pagination_class = None
+    filter_backends = [SearchFilter]
+    search_fields = ["name"]
 
 
 class AdminGenreListCreateAPIView(APIView):
@@ -945,9 +991,21 @@ class DiscoverDataAPIView(APIView):
             )
             .order_by("name")
         )
+        categories = (
+            Category.objects.filter(published_story_q("stories"))
+            .annotate(
+                published_stories_count=Count(
+                    "stories",
+                    filter=published_story_q("stories"),
+                    distinct=True,
+                )
+            )
+            .order_by("name")
+        )
         return Response(
             {
                 "genres": GenreSerializer(genres, many=True).data,
+                "categories": CategorySerializer(categories, many=True).data,
                 "story_types": story_types,
                 "languages": languages,
                 "most_viewed": StoryListSerializer(

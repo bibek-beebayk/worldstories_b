@@ -10,6 +10,7 @@ from .models import (
     Audio,
     Story,
     Genre,
+    Category,
     Chapter,
     Tag,
     Author,
@@ -39,6 +40,20 @@ class GenreSerializer(serializers.ModelSerializer):
         fields = ["id", "name", "stories_count"]
 
 
+class CategorySerializer(serializers.ModelSerializer):
+    stories_count = serializers.SerializerMethodField()
+
+    def get_stories_count(self, obj):
+        annotated_count = getattr(obj, "published_stories_count", None)
+        if annotated_count is not None:
+            return annotated_count
+        return obj.stories.filter(published_story_q()).count()
+
+    class Meta:
+        model = Category
+        fields = ["id", "name", "stories_count"]
+
+
 class AuthorSerializer(serializers.ModelSerializer):
     stories_count = serializers.SerializerMethodField()
 
@@ -61,9 +76,14 @@ class StoryUserSerializer(serializers.Serializer):
 
 
 class AdminAuthorSerializer(serializers.ModelSerializer):
+    stories_count = serializers.SerializerMethodField(read_only=True)
+
+    def get_stories_count(self, obj):
+        return obj.stories.count()
+
     class Meta:
         model = Author
-        fields = ["id", "name", "bio", "image"]
+        fields = ["id", "name", "bio", "image", "stories_count"]
 
 
 class AdminGenreSerializer(serializers.ModelSerializer):
@@ -72,8 +92,20 @@ class AdminGenreSerializer(serializers.ModelSerializer):
         fields = ["id", "name"]
 
 
+class AdminCategorySerializer(serializers.ModelSerializer):
+    stories_count = serializers.SerializerMethodField(read_only=True)
+
+    def get_stories_count(self, obj):
+        return obj.stories.count()
+
+    class Meta:
+        model = Category
+        fields = ["id", "name", "stories_count"]
+
+
 class StoryListSerializer(serializers.ModelSerializer):
     genres = serializers.SerializerMethodField()
+    categories = serializers.SerializerMethodField()
     reviews_count = serializers.SerializerMethodField()
     is_favorite = serializers.SerializerMethodField()
     favorites_count = serializers.SerializerMethodField()
@@ -81,7 +113,10 @@ class StoryListSerializer(serializers.ModelSerializer):
 
     def get_genres(self, obj):
         return list(obj.genres.values_list("name", flat=True)[:2])
-    
+
+    def get_categories(self, obj):
+        return list(obj.categories.values_list("name", flat=True)[:2])
+
     def get_reviews_count(self, obj):
         return obj.reviews.count()
 
@@ -114,6 +149,7 @@ class StoryListSerializer(serializers.ModelSerializer):
             "views",
             "has_audio",
             "genres",
+            "categories",
             "reviews_count",
             "is_favorite",
             "favorites_count",
@@ -176,6 +212,7 @@ class StoryDetailSerializer(serializers.ModelSerializer):
     pdf_file = serializers.SerializerMethodField()
     epub_file = serializers.SerializerMethodField()
     genres = GenreSerializer(many=True, read_only=True)
+    categories = CategorySerializer(many=True, read_only=True)
     author = AuthorSerializer(read_only=True)
     submitted_by = serializers.SerializerMethodField()
     chapter_count = serializers.SerializerMethodField()
@@ -328,6 +365,7 @@ class StoryDetailSerializer(serializers.ModelSerializer):
             "about",
             "summary",
             "genres",
+            "categories",
             "story_type",
             "language",
             "translations",
@@ -488,6 +526,9 @@ class StoryAdminSerializer(serializers.ModelSerializer):
     genres = serializers.PrimaryKeyRelatedField(
         queryset=Genre.objects.all(), many=True, required=False
     )
+    categories = serializers.PrimaryKeyRelatedField(
+        queryset=Category.objects.all(), many=True, required=False
+    )
     tags = serializers.PrimaryKeyRelatedField(
         queryset=Tag.objects.all(), many=True, required=False
     )
@@ -587,6 +628,7 @@ class StoryAdminSerializer(serializers.ModelSerializer):
             "epub_file_url",
             "is_completed",
             "genres",
+            "categories",
             "tags",
             "rating",
             "views",

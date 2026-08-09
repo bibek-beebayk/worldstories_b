@@ -76,6 +76,21 @@ class Genre(models.Model):
         return self.name
 
 
+class Category(models.Model):
+    """A second, independent browsing taxonomy alongside Genre — e.g. for a
+    homepage/discover "browse by category" surface distinct from the genre
+    filter. Same shape as Genre (many-to-many, admin-managed) on purpose."""
+
+    name = models.CharField(max_length=100, unique=True)
+
+    class Meta:
+        verbose_name_plural = "Categories"
+        ordering = ["name"]
+
+    def __str__(self):
+        return self.name
+
+
 class Tag(models.Model):
     name = models.CharField(max_length=50)
 
@@ -102,6 +117,7 @@ class Story(models.Model):
     about = models.TextField(blank=True, null=True)
     summary = CKEditor5Field('Text', config_name='extends', blank=True, null=True)
     genres = models.ManyToManyField(Genre, related_name="stories")
+    categories = models.ManyToManyField(Category, related_name="stories", blank=True)
     story_type = models.CharField(
         max_length=50, choices=STORY_TYPE_CHOICES, default="Short Story"
     )

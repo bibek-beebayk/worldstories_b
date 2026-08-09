@@ -3,7 +3,7 @@ from django.db import transaction
 from django.utils.html import strip_tags
 from django.utils import timezone
 from django.utils.text import slugify
-from .models import Audio, Story, Genre, Tag, Author, Chapter, Review, Submission, StoryView
+from .models import Audio, Story, Genre, Category, Tag, Author, Chapter, Review, Submission, StoryView
 
 
 class ChapterInline(admin.TabularInline):
@@ -112,7 +112,7 @@ class StoryAdmin(admin.ModelAdmin):
         (
             "Classification",
             {
-                "fields": ("genres", "tags", "is_completed"),
+                "fields": ("genres", "categories", "tags", "is_completed"),
             },
         ),
         (
@@ -160,6 +160,7 @@ class StoryAdmin(admin.ModelAdmin):
         "summary",
         "author__name",
         "genres__name",
+        "categories__name",
         "tags__name",
     )
     list_filter = (
@@ -168,12 +169,13 @@ class StoryAdmin(admin.ModelAdmin):
         "is_completed",
         "site_published_date",
         "genres",
+        "categories",
         "tags",
     )
     ordering = ("-site_published_date", "-id")
     date_hierarchy = "site_published_date"
     list_select_related = ("author", "submitted_by")
-    filter_horizontal = ("genres", "tags")
+    filter_horizontal = ("genres", "categories", "tags")
     autocomplete_fields = ("author",)
 
     @admin.display(description="Chapters")
@@ -188,6 +190,11 @@ class StoryAdmin(admin.ModelAdmin):
 @admin.register(Genre)
 class GenreAdmin(admin.ModelAdmin):
     pass
+
+
+@admin.register(Category)
+class CategoryAdmin(admin.ModelAdmin):
+    search_fields = ("name",)
 
 
 @admin.register(Tag)

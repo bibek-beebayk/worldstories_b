@@ -24,6 +24,8 @@ router.register("admin/stories", story_api.StoryAdminViewSet, basename="admin-st
 router.register("admin/chapters", story_api.ChapterAdminViewSet, basename="admin-chapter")
 router.register("admin/audios", story_api.AudioAdminViewSet, basename="admin-audio")
 router.register("admin/submissions", story_api.SubmissionAdminViewSet, basename="admin-submission")
+router.register("admin/authors", story_api.AuthorAdminViewSet, basename="admin-author")
+router.register("admin/categories", story_api.CategoryAdminViewSet, basename="admin-category")
 router.register("auth", users_api.AuthenticationViewSet, basename="auth")
 
 
@@ -129,7 +131,6 @@ urlpatterns = [
         story_analytics_api.AdminAnalyticsAudienceAPIView.as_view(),
         name="admin-analytics-audience",
     ),
-    path("api/admin/authors/", story_api.AdminAuthorListAPIView.as_view(), name="admin-authors"),
     path("api/admin/genres/", story_api.AdminGenreListCreateAPIView.as_view(), name="admin-genres"),
     path(
         "api/reading-progress/<slug:story_slug>/",
@@ -147,6 +148,7 @@ urlpatterns = [
         name="file-reading-progress",
     ),
     path("api/genres/", story_api.GenreListAPIView.as_view(), name="genre-list"),
+    path("api/categories/", story_api.CategoryListAPIView.as_view(), name="category-list"),
     path("api/library-shelves/", story_api.LibraryShelvesAPIView.as_view(), name="library-shelves"),
     path("api/sitemap.xml", sitemap, name="sitemap"),
     path("ckeditor5/", include("django_ckeditor_5.urls")),
