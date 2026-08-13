@@ -274,13 +274,14 @@ class ScheduledPublishingTests(SimpleTestCase):
     @patch("apps.story.api.Story.objects.published")
     def test_public_queryset_is_built_for_each_request(self, published):
         queryset = MagicMock()
-        queryset.order_by.return_value = queryset
+        queryset.select_related.return_value.order_by.return_value = queryset
         published.return_value = queryset
         view = StoryViewSet()
         view.action = "retrieve"
 
         self.assertIs(view.get_queryset(), queryset)
         published.assert_called_once_with()
+        queryset.select_related.assert_called_once_with("author")
 
     @patch("django.db.models.Model.save")
     def test_scheduled_story_uses_schedule_date_as_site_date(self, model_save):

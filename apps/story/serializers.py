@@ -106,6 +106,7 @@ class AdminCategorySerializer(serializers.ModelSerializer):
 class StoryListSerializer(serializers.ModelSerializer):
     genres = serializers.SerializerMethodField()
     categories = serializers.SerializerMethodField()
+    author = serializers.SerializerMethodField()
     reviews_count = serializers.SerializerMethodField()
     is_favorite = serializers.SerializerMethodField()
     favorites_count = serializers.SerializerMethodField()
@@ -116,6 +117,13 @@ class StoryListSerializer(serializers.ModelSerializer):
 
     def get_categories(self, obj):
         return list(obj.categories.values_list("name", flat=True)[:2])
+
+    # Name only (not the full nested author object list responses use
+    # elsewhere) — just enough for cards/fallback covers to credit the
+    # author without bloating list payloads. Pair with select_related("author")
+    # on the queryset wherever this serializer is used, or this N+1s per row.
+    def get_author(self, obj):
+        return obj.author.name if obj.author_id else None
 
     def get_reviews_count(self, obj):
         return obj.reviews.count()
@@ -150,6 +158,7 @@ class StoryListSerializer(serializers.ModelSerializer):
             "has_audio",
             "genres",
             "categories",
+            "author",
             "reviews_count",
             "is_favorite",
             "favorites_count",
@@ -167,7 +176,7 @@ class AuthorDetailSerializer(AuthorSerializer):
     stories = serializers.SerializerMethodField()
 
     def get_stories(self, obj):
-        stories = obj.stories.published().order_by("-site_published_date", "-id")
+        stories = obj.stories.published().select_related("author").order_by("-site_published_date", "-id")
         stories = with_preferred_translation_only(stories)
         return StoryListSerializer(stories, many=True, context=self.context).data
 
@@ -279,7 +288,7 @@ class StoryDetailSerializer(serializers.ModelSerializer):
         if obj.author_id:
             matching |= Q(author_id=obj.author_id)
 
-        candidates = Story.objects.published().filter(matching).exclude(
+        candidates = Story.objects.published().select_related("author").filter(matching).exclude(
             translation_group=obj.translation_group
         )
         candidates = with_preferred_translation_only(candidates).annotate(

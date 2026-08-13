@@ -204,7 +204,7 @@ class StoryViewSet(ReadOnlyModelViewSet):
     pagination_class = CataloguePagination
 
     def get_queryset(self):
-        queryset = Story.objects.published().order_by("-id")
+        queryset = Story.objects.published().select_related("author").order_by("-id")
         # Only the "list" action (the public browse/search listing) collapses
         # each translation_group down to one edition — retrieve and the other
         # detail actions (chapter, favorite, reviews, etc.) must still resolve
@@ -748,6 +748,7 @@ class LibraryShelvesAPIView(APIView):
         for genre in page:
             preview_stories = (
                 preferred_stories.filter(genres=genre)
+                .select_related("author")
                 .prefetch_related("genres", "audios")
                 .order_by("-views", "-rating", "-id")[: self.PREVIEW_SIZE]
             )
@@ -823,7 +824,7 @@ class AdminGenreListCreateAPIView(APIView):
 
 class HomeDataAPIView(APIView):
     def get(self, request):
-        base_qs = Story.objects.published().prefetch_related("genres", "audios")
+        base_qs = Story.objects.published().select_related("author").prefetch_related("genres", "audios")
         used_ids = set()
 
         def take(queryset, limit):
@@ -897,6 +898,7 @@ class TrendingDataAPIView(APIView):
     def get(self, request):
         base_qs = (
             Story.objects.published()
+            .select_related("author")
             .prefetch_related("genres", "audios")
             .annotate(
                 favorites_total=Count("favorites", distinct=True),
@@ -931,7 +933,7 @@ class TrendingDataAPIView(APIView):
 
 class OriginalsDataAPIView(APIView):
     def get(self, request):
-        base_qs = Story.objects.published().prefetch_related("genres", "audios")
+        base_qs = Story.objects.published().select_related("author").prefetch_related("genres", "audios")
         return Response(
             {
                 "stories": StoryListSerializer(
@@ -945,7 +947,7 @@ class OriginalsDataAPIView(APIView):
 
 class DiscoverDataAPIView(APIView):
     def get(self, request):
-        base_qs = Story.objects.published().prefetch_related("genres", "audios")
+        base_qs = Story.objects.published().select_related("author").prefetch_related("genres", "audios")
         trending_qs = base_qs.annotate(
             favorites_total=Count("favorites", distinct=True),
             reviews_total=Count("reviews", distinct=True),
