@@ -12,7 +12,7 @@ from rest_framework.test import APITestCase
 from storages.backends.s3 import S3Storage
 
 from apps.story.api import StoryViewSet, open_s3_audio_stream
-from apps.story.models import Author, Genre, Story
+from apps.story.models import Audio, Author, Genre, Story
 from apps.story.serializers import AudioAdminSerializer, StoryAdminSerializer
 from apps.story import reading_time
 from core.urls import sitemap
@@ -491,6 +491,30 @@ class PublicAuthorApiTests(APITestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual([story["slug"] for story in response.data["results"]], ["published-novel"])
+
+    def test_story_list_can_filter_by_has_audio(self):
+        with_audio = Story.objects.create(
+            title="Story With Audio",
+            slug="story-with-audio",
+            is_published=True,
+        )
+        Audio.objects.create(
+            story=with_audio,
+            title="Chapter 1",
+            slug="chapter-1",
+            order=1,
+            audio_file="story_audios/fake.mp3",
+        )
+        Story.objects.create(
+            title="Story Without Audio",
+            slug="story-without-audio",
+            is_published=True,
+        )
+
+        response = self.client.get(reverse("story-list"), {"has_audio": "true"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([story["slug"] for story in response.data["results"]], ["story-with-audio"])
 
     def test_story_list_language_filter_returns_matching_translation(self):
         english = Story.objects.get(slug="published-book")

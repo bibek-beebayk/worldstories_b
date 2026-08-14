@@ -39,6 +39,7 @@ def sitemap(request):
             "/",
             "/library",
             "/discover",
+            "/audiobooks",
             "/authors",
             "/contest",
             "/about",
