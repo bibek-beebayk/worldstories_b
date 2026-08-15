@@ -107,6 +107,7 @@ class StoryListSerializer(serializers.ModelSerializer):
     genres = serializers.SerializerMethodField()
     categories = serializers.SerializerMethodField()
     author = serializers.SerializerMethodField()
+    summary_reading_minutes = serializers.SerializerMethodField()
     reviews_count = serializers.SerializerMethodField()
     is_favorite = serializers.SerializerMethodField()
     favorites_count = serializers.SerializerMethodField()
@@ -124,6 +125,13 @@ class StoryListSerializer(serializers.ModelSerializer):
     # on the queryset wherever this serializer is used, or this N+1s per row.
     def get_author(self, obj):
         return obj.author.name if obj.author_id else None
+
+    # Availability + estimate only — never the full summary body — so the
+    # homepage Quick Read section (and any other list view) can show "3 min
+    # read" and link to /quick-read/:slug without shipping the whole summary
+    # HTML in every list response. The full text is only in StoryDetailSerializer.
+    def get_summary_reading_minutes(self, obj):
+        return reading_time.summary_reading_minutes(obj.summary) if obj.summary else None
 
     def get_reviews_count(self, obj):
         return obj.reviews.count()
@@ -159,6 +167,7 @@ class StoryListSerializer(serializers.ModelSerializer):
             "genres",
             "categories",
             "author",
+            "summary_reading_minutes",
             "reviews_count",
             "is_favorite",
             "favorites_count",

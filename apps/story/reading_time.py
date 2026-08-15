@@ -16,6 +16,7 @@ import io
 import re
 
 WORDS_PER_MINUTE = 200
+SUMMARY_WORDS_PER_MINUTE = 220
 PDF_MINUTES_PER_PAGE = 2
 
 
@@ -59,6 +60,20 @@ def chapters_reading_minutes(story):
         for content in story.chapters.values_list("content", flat=True)
     )
     return _minutes_from_word_count(total_words)
+
+
+def summary_reading_minutes(summary_html):
+    """Quick Read reading-time estimate — summaries read faster than full
+    prose, so this uses a higher words-per-minute rate than the general
+    WORDS_PER_MINUTE above. Mirrors the frontend's estimateSummaryReadingMinutes
+    (src/lib/summaryReadingTime.ts), which is the source of truth on a story's
+    own page/Quick Read page; this server-side copy exists only for the
+    homepage Quick Read section (StoryListSerializer), which needs the
+    estimate without shipping the full summary text in a list response."""
+    word_count = _word_count_from_html(summary_html)
+    if word_count <= 0:
+        return None
+    return max(1, round(word_count / SUMMARY_WORDS_PER_MINUTE))
 
 
 def epub_minutes_from_bytes(raw_bytes):

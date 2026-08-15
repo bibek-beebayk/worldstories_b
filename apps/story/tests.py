@@ -216,6 +216,50 @@ class StoryReadingMinutesTests(SimpleTestCase):
         self.assertEqual(result, 2)
 
 
+class SummaryReadingMinutesTests(SimpleTestCase):
+    def test_empty_summary_returns_none(self):
+        self.assertIsNone(reading_time.summary_reading_minutes(""))
+        self.assertIsNone(reading_time.summary_reading_minutes(None))
+
+    def test_uses_220_words_per_minute_not_the_general_200_rate(self):
+        # 300 words is a count where the two rates actually disagree
+        # (300/220 -> 1 min, 300/200 -> 2 min) — using the wrong constant
+        # here would silently pass a test built on a count where they
+        # happen to agree, so this is the one that actually catches it.
+        html = "<p>" + " ".join(["word"] * 300) + "</p>"
+        self.assertEqual(reading_time.summary_reading_minutes(html), 1)
+        self.assertEqual(reading_time._minutes_from_word_count(300), 2)
+
+
+class HomeDataQuickReadsTests(APITestCase):
+    def test_quick_reads_only_includes_published_stories_with_a_summary(self):
+        Story.objects.create(
+            title="Has Summary",
+            slug="has-summary",
+            summary="<p>" + " ".join(["word"] * 50) + "</p>",
+            is_published=True,
+        )
+        Story.objects.create(
+            title="No Summary",
+            slug="no-summary",
+            summary="",
+            is_published=True,
+        )
+        Story.objects.create(
+            title="Draft With Summary",
+            slug="draft-with-summary",
+            summary="<p>word word word</p>",
+            is_published=False,
+        )
+
+        response = self.client.get(reverse("home-data"))
+
+        self.assertEqual(response.status_code, 200)
+        quick_read_slugs = [story["slug"] for story in response.data["quick_reads"]]
+        self.assertEqual(quick_read_slugs, ["has-summary"])
+        self.assertIsNotNone(response.data["quick_reads"][0]["summary_reading_minutes"])
+
+
 class AudioStreamRangeTests(SimpleTestCase):
     def make_view(self, payload=b"0123456789"):
         audio_file = MagicMock()

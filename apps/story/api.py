@@ -850,6 +850,14 @@ class HomeDataAPIView(APIView):
         popular = take(base_qs.order_by("-views", "-rating", "-id"), 6)
         new_releases = take(base_qs.order_by("-site_published_date", "-id"), 6)
         more_to_explore = take(base_qs.order_by("-id"), 12)
+        # Independent of `used_ids` — this is a distinctly-filtered set (has a
+        # summary) rather than a "next best" pick from the shared pool, and
+        # gating it on the other sections' leftovers could easily leave it
+        # empty while summary-having stories are actually available.
+        quick_reads = list(
+            base_qs.exclude(Q(summary__isnull=True) | Q(summary__exact=""))
+            .order_by("-site_published_date", "-id")[:8]
+        )
 
         readers_count = (
             Story.objects.published().aggregate(total_readers=Sum("views")).get("total_readers") or 0
@@ -868,6 +876,9 @@ class HomeDataAPIView(APIView):
                 ).data,
                 "more_to_explore": StoryListSerializer(
                     more_to_explore, many=True, context={"request": request}
+                ).data,
+                "quick_reads": StoryListSerializer(
+                    quick_reads, many=True, context={"request": request}
                 ).data,
                 "tabs": {
                     "recommended": StoryListSerializer(
