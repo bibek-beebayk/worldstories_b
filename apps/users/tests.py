@@ -13,7 +13,7 @@ from apps.stats.models import (
     FileReadingProgress,
     ReadingProgress,
 )
-from apps.story.models import Audio, Chapter, Favorite, Genre, Story
+from apps.story.models import Audio, Chapter, Favorite, Genre, Review, Story
 
 
 User = get_user_model()
@@ -380,6 +380,125 @@ class PreferredGenresRecommendationApiTests(APITestCase):
 
         titles = [story["title"] for story in response.data]
         self.assertEqual(titles, [fresh.title])
+
+
+class BlendedRecommendationApiTests(APITestCase):
+    """Covers the warm path: once a user has crossed SUFFICIENT_DATA_THRESHOLD
+    engaged stories, recommendations should also draw on implicit genre
+    affinity (what they actually engaged with, not just what they picked)
+    and a collaborative signal (what similar users engaged with)."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            email="reader@example.com", username="reader", password="x"
+        )
+        self.horror = Genre.objects.create(name="Horror")
+        self.romance = Genre.objects.create(name="Romance")
+
+    def _story(self, title, slug, rating, genres):
+        story = Story.objects.create(title=title, slug=slug, is_published=True, rating=rating)
+        story.genres.set(genres)
+        return story
+
+    def test_stays_on_the_genre_only_path_below_the_sufficient_data_threshold(self):
+        self.user.preferred_genres.set([self.horror])
+        engaged = [self._story(f"Engaged {i}", f"engaged-{i}", 4.0, [self.horror]) for i in range(2)]
+        for story in engaged:
+            Favorite.objects.create(user=self.user, story=story)
+
+        # A neighbor who overlaps on those 2 stories and also likes something
+        # outside horror — this should NOT surface yet, since 2 engaged
+        # stories is below the threshold and the collaborative path isn't
+        # active.
+        neighbor = User.objects.create_user(email="n@example.com", username="neighbor", password="x")
+        for story in engaged:
+            Favorite.objects.create(user=neighbor, story=story)
+        collaborative_only_pick = self._story("Collab Pick", "collab-pick", 5.0, [self.romance])
+        Favorite.objects.create(user=neighbor, story=collaborative_only_pick)
+
+        fresh_horror = self._story("Fresh Horror", "fresh-horror", 3.0, [self.horror])
+        self.client.force_authenticate(self.user)
+
+        response = self.client.get(reverse("auth-library-recommendations"))
+
+        titles = {story["title"] for story in response.data}
+        self.assertIn(fresh_horror.title, titles)
+        self.assertNotIn(collaborative_only_pick.title, titles)
+
+    def test_implicit_genre_affinity_kicks_in_without_any_explicit_preference(self):
+        # No preferred_genres set at all — the signal has to come purely
+        # from what the user actually engaged with.
+        engaged = [self._story(f"Horror {i}", f"horror-{i}", 4.0, [self.horror]) for i in range(3)]
+        for story in engaged:
+            Favorite.objects.create(user=self.user, story=story)
+        fresh_horror = self._story("New Horror", "new-horror", 3.5, [self.horror])
+        self._story("Unrelated Romance", "unrelated-romance", 5.0, [self.romance])
+        self.client.force_authenticate(self.user)
+
+        response = self.client.get(reverse("auth-library-recommendations"))
+
+        titles = [story["title"] for story in response.data]
+        self.assertIn(fresh_horror.title, titles)
+        self.assertNotIn("Unrelated Romance", titles)
+
+    def test_collaborative_signal_surfaces_stories_outside_genre_affinity(self):
+        shared = [self._story(f"Shared {i}", f"shared-{i}", 4.0, [self.horror]) for i in range(3)]
+        for story in shared:
+            Favorite.objects.create(user=self.user, story=story)
+
+        neighbor = User.objects.create_user(email="n@example.com", username="neighbor", password="x")
+        for story in shared:
+            Favorite.objects.create(user=neighbor, story=story)
+        # The neighbor also liked something in a genre this user has no
+        # affinity for at all — collaborative filtering should still surface
+        # it, since it isn't gated on genre match.
+        cross_genre_pick = self._story("Neighbor's Pick", "neighbor-pick", 3.0, [self.romance])
+        Favorite.objects.create(user=neighbor, story=cross_genre_pick)
+        self.client.force_authenticate(self.user)
+
+        response = self.client.get(reverse("auth-library-recommendations"))
+
+        titles = [story["title"] for story in response.data]
+        self.assertIn(cross_genre_pick.title, titles)
+
+    def test_a_reviewed_story_counts_as_engaged_and_is_excluded(self):
+        engaged = [self._story(f"Horror {i}", f"horror-{i}", 4.0, [self.horror]) for i in range(2)]
+        for story in engaged:
+            Favorite.objects.create(user=self.user, story=story)
+        reviewed_only = self._story("Reviewed Only", "reviewed-only", 4.5, [self.horror])
+        Review.objects.create(user=self.user, story=reviewed_only, rating=5)
+        self.client.force_authenticate(self.user)
+
+        response = self.client.get(reverse("auth-library-recommendations"))
+
+        titles = [story["title"] for story in response.data]
+        self.assertNotIn(reviewed_only.title, titles)
+
+    def test_sub_threshold_progress_still_excludes_but_does_not_count_toward_sufficiency(self):
+        engaged = [self._story(f"Horror {i}", f"horror-{i}", 4.0, [self.horror]) for i in range(2)]
+        for story in engaged:
+            Favorite.objects.create(user=self.user, story=story)
+        # Barely started (10% in) — should still be excluded from being
+        # re-recommended, but shouldn't count as real "engagement" toward
+        # the collaborative path activating.
+        barely_started = self._story("Barely Started", "barely-started", 4.0, [self.horror])
+        ReadingProgress.objects.create(user=self.user, story=barely_started, progress=0.1)
+
+        neighbor = User.objects.create_user(email="n@example.com", username="neighbor", password="x")
+        for story in engaged:
+            Favorite.objects.create(user=neighbor, story=story)
+        Favorite.objects.create(user=neighbor, story=barely_started)
+        collaborative_only_pick = self._story("Collab Pick", "collab-pick", 5.0, [self.romance])
+        Favorite.objects.create(user=neighbor, story=collaborative_only_pick)
+        self.client.force_authenticate(self.user)
+
+        response = self.client.get(reverse("auth-library-recommendations"))
+
+        titles = [story["title"] for story in response.data]
+        self.assertNotIn(barely_started.title, titles)
+        # Still below the 3-story threshold (the sub-threshold progress row
+        # doesn't count), so the collaborative-only pick shouldn't surface.
+        self.assertNotIn(collaborative_only_pick.title, titles)
 
 
 class UsernameAvailabilityApiTests(APITestCase):

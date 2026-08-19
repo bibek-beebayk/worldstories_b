@@ -18,6 +18,7 @@ from datetime import timedelta
 from django.db.models import Count, Q
 from django.utils import timezone
 from .models import OTP
+from .recommendations import recommend_stories_for
 from apps.story.api import IsSuperUser
 from apps.story.models import Favorite, Review, Story
 from apps.story.serializers import StoryListSerializer
@@ -636,36 +637,8 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
 
     @action(detail=False, methods=["get"], url_path="library/recommendations")
     def library_recommendations(self, request):
-        genre_ids = list(request.user.preferred_genres.values_list("id", flat=True))
-        if not genre_ids:
-            return Response([])
-
-        # Weighted by how many preferred genres each story matches, then by
-        # the same rating/views ordering the (non-personalized) homepage
-        # sections use. Excludes anything the user has already favorited or
-        # made any reading/listening progress on — a story they've already
-        # started isn't a useful "recommendation".
-        queryset = (
-            Story.objects.published()
-            .filter(genres__id__in=genre_ids)
-            .exclude(
-                Q(favorites__user=request.user)
-                | Q(reading_progress__user=request.user)
-                | Q(chapter_reading_progress__user=request.user)
-                | Q(file_reading_progress__user=request.user)
-                | Q(audio_reading_progress__user=request.user)
-            )
-            .annotate(
-                matching_genres=Count(
-                    "genres", filter=Q(genres__id__in=genre_ids), distinct=True
-                )
-            )
-            .select_related("author")
-            .prefetch_related("genres", "audios")
-            .distinct()
-            .order_by("-matching_genres", "-rating", "-views", "-id")[:12]
-        )
-        serializer = StoryListSerializer(queryset, many=True, context={"request": request})
+        stories = recommend_stories_for(request.user)
+        serializer = StoryListSerializer(stories, many=True, context={"request": request})
         return Response(serializer.data)
 
 
