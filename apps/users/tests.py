@@ -1,5 +1,8 @@
+from unittest.mock import patch
+
 from django.contrib.auth import get_user_model
 from django.core.cache import cache
+from django.test import override_settings
 from django.urls import reverse
 from rest_framework.test import APITestCase
 from rest_framework_simplejwt.tokens import RefreshToken
@@ -10,7 +13,7 @@ from apps.stats.models import (
     FileReadingProgress,
     ReadingProgress,
 )
-from apps.story.models import Audio, Chapter, Genre, Story
+from apps.story.models import Audio, Chapter, Favorite, Genre, Story
 
 
 User = get_user_model()
@@ -290,3 +293,136 @@ class UserAdminApiTests(APITestCase):
         response = self.client.get(reverse("auth-profile-insights"))
 
         self.assertEqual(response.status_code, 401)
+
+
+@override_settings(GOOGLE_CLIENT_ID="test-client-id")
+class GoogleLoginFirstLoginApiTests(APITestCase):
+    """`is_first_login` is what the frontend uses to decide whether to show
+    the genre-picker onboarding step — it must be True exactly once, on the
+    request that actually creates the account."""
+
+    def _mock_google_response(self, email, name="Test User"):
+        return patch(
+            "google.oauth2.id_token.verify_oauth2_token",
+            return_value={"email": email, "name": name},
+        )
+
+    def test_is_first_login_true_for_a_brand_new_user(self):
+        with self._mock_google_response("new@example.com"):
+            response = self.client.post(reverse("auth-google-login"), {"token": "fake"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.data["user"]["is_first_login"])
+
+    def test_is_first_login_false_for_a_returning_user(self):
+        User.objects.create_user(email="existing@example.com", username="existing", password="x")
+
+        with self._mock_google_response("existing@example.com"):
+            response = self.client.post(reverse("auth-google-login"), {"token": "fake"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.data["user"]["is_first_login"])
+
+    def test_rejects_a_deactivated_user(self):
+        User.objects.create_user(
+            email="banned@example.com", username="banned", password="x", is_active=False
+        )
+
+        with self._mock_google_response("banned@example.com"):
+            response = self.client.post(reverse("auth-google-login"), {"token": "fake"})
+
+        self.assertEqual(response.status_code, 403)
+
+
+class PreferredGenresRecommendationApiTests(APITestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(
+            email="reader@example.com", username="reader", password="x"
+        )
+        self.fantasy = Genre.objects.create(name="Fantasy")
+        self.scifi = Genre.objects.create(name="SciFi")
+        self.romance = Genre.objects.create(name="Romance")
+
+    def _story(self, title, slug, rating, genres):
+        story = Story.objects.create(title=title, slug=slug, is_published=True, rating=rating)
+        story.genres.set(genres)
+        return story
+
+    def test_returns_empty_list_when_no_genres_are_set(self):
+        self._story("Dragon Tale", "dragon-tale", 4.5, [self.fantasy])
+        self.client.force_authenticate(self.user)
+
+        response = self.client.get(reverse("auth-library-recommendations"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, [])
+
+    def test_ranks_stories_matching_more_preferred_genres_first(self):
+        self.user.preferred_genres.set([self.fantasy, self.scifi])
+        single_match = self._story("Dragon Tale", "dragon-tale", 4.5, [self.fantasy])
+        double_match = self._story("Dragon SciFi Crossover", "dragon-scifi", 3.0, [self.fantasy, self.scifi])
+        self._story("Love Story", "love-story", 5.0, [self.romance])  # unrelated genre, excluded
+        self.client.force_authenticate(self.user)
+
+        response = self.client.get(reverse("auth-library-recommendations"))
+
+        titles = [story["title"] for story in response.data]
+        self.assertEqual(titles, [double_match.title, single_match.title])
+
+    def test_excludes_stories_the_user_has_already_favorited(self):
+        self.user.preferred_genres.set([self.fantasy])
+        already_favorited = self._story("Old Favorite", "old-favorite", 5.0, [self.fantasy])
+        Favorite.objects.create(user=self.user, story=already_favorited)
+        fresh = self._story("Fresh Pick", "fresh-pick", 4.0, [self.fantasy])
+        self.client.force_authenticate(self.user)
+
+        response = self.client.get(reverse("auth-library-recommendations"))
+
+        titles = [story["title"] for story in response.data]
+        self.assertEqual(titles, [fresh.title])
+
+
+class UsernameAvailabilityApiTests(APITestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(
+            email="alice@example.com", username="alice", password="x"
+        )
+        self.other = User.objects.create_user(
+            email="bob@example.com", username="bob", password="x"
+        )
+
+    def test_requires_authentication(self):
+        response = self.client.get(reverse("auth-check-username"), {"username": "alice"})
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_reports_a_taken_username_as_unavailable(self):
+        self.client.force_authenticate(self.other)
+
+        response = self.client.get(reverse("auth-check-username"), {"username": "alice"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.data["available"])
+
+    def test_reports_a_free_username_as_available(self):
+        self.client.force_authenticate(self.other)
+
+        response = self.client.get(reverse("auth-check-username"), {"username": "brand-new-name"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.data["available"])
+
+    def test_does_not_flag_your_own_current_username_as_taken(self):
+        self.client.force_authenticate(self.user)
+
+        response = self.client.get(reverse("auth-check-username"), {"username": "alice"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.data["available"])
+
+    def test_requires_a_non_empty_username(self):
+        self.client.force_authenticate(self.user)
+
+        response = self.client.get(reverse("auth-check-username"), {"username": "  "})
+
+        self.assertEqual(response.status_code, 400)

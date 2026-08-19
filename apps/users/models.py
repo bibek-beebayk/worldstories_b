@@ -43,6 +43,13 @@ class User(AbstractBaseUser, PermissionsMixin):
     is_superuser = models.BooleanField(default=False)
     otp_verified = models.BooleanField(default=False)
 
+    # Picked on first login (skippable) and used to power the "Recommended
+    # for you" homepage section — see AuthenticationViewSet.recommendations.
+    # String reference to avoid users<->story import ordering issues.
+    preferred_genres = models.ManyToManyField(
+        "story.Genre", blank=True, related_name="users_who_prefer"
+    )
+
     # address_country = models.CharField(max_length=255)
     # address_state = models.CharField(max_length=255, null=True, blank=True)
     # address_city = models.CharField(max_length=255)

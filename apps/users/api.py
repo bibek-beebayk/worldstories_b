@@ -15,7 +15,7 @@ import logging
 import os
 from collections import defaultdict
 from datetime import timedelta
-from django.db.models import Count
+from django.db.models import Count, Q
 from django.utils import timezone
 from .models import OTP
 from apps.story.api import IsSuperUser
@@ -84,7 +84,9 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
             "library_continue_listening",
             "library_favorites",
             "library_reviews",
+            "library_recommendations",
             "profile_insights",
+            "check_username",
         }:
             from rest_framework.permissions import IsAuthenticated
 
@@ -265,9 +267,28 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
                     "id": user.id,
                     "email": user.email,
                     "name": name or user.username,
+                    # Drives the "pick your genres" onboarding step on the
+                    # frontend — `created` is a cleaner first-login signal
+                    # than login_count, which nothing in this codebase
+                    # actually increments.
+                    "is_first_login": created,
                 },
             }
         )
+
+    @action(detail=False, methods=["get"], url_path="username-available")
+    def check_username(self, request):
+        # Powers the debounced live-availability check in the onboarding/
+        # profile-settings username field. Mirrors UserProfileUpdateSerializer.
+        # validate_username's uniqueness check exactly (same exact-match
+        # comparison, same self-exclusion) — that serializer is still the
+        # actual source of truth on save, this just gives fast feedback
+        # while typing.
+        username = (request.query_params.get("username") or "").strip()
+        if not username:
+            return Response({"available": False, "detail": "Username is required."}, status=400)
+        is_taken = User.objects.exclude(pk=request.user.pk).filter(username=username).exists()
+        return Response({"available": not is_taken})
 
     @action(detail=False, methods=["get", "patch"], url_path="me")
     def me(self, request):
@@ -611,6 +632,40 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
             serializer = MyReviewItemSerializer(page, many=True, context={"request": request})
             return self.get_paginated_response(serializer.data)
         serializer = MyReviewItemSerializer(queryset, many=True, context={"request": request})
+        return Response(serializer.data)
+
+    @action(detail=False, methods=["get"], url_path="library/recommendations")
+    def library_recommendations(self, request):
+        genre_ids = list(request.user.preferred_genres.values_list("id", flat=True))
+        if not genre_ids:
+            return Response([])
+
+        # Weighted by how many preferred genres each story matches, then by
+        # the same rating/views ordering the (non-personalized) homepage
+        # sections use. Excludes anything the user has already favorited or
+        # made any reading/listening progress on — a story they've already
+        # started isn't a useful "recommendation".
+        queryset = (
+            Story.objects.published()
+            .filter(genres__id__in=genre_ids)
+            .exclude(
+                Q(favorites__user=request.user)
+                | Q(reading_progress__user=request.user)
+                | Q(chapter_reading_progress__user=request.user)
+                | Q(file_reading_progress__user=request.user)
+                | Q(audio_reading_progress__user=request.user)
+            )
+            .annotate(
+                matching_genres=Count(
+                    "genres", filter=Q(genres__id__in=genre_ids), distinct=True
+                )
+            )
+            .select_related("author")
+            .prefetch_related("genres", "audios")
+            .distinct()
+            .order_by("-matching_genres", "-rating", "-views", "-id")[:12]
+        )
+        serializer = StoryListSerializer(queryset, many=True, context={"request": request})
         return Response(serializer.data)
 
 

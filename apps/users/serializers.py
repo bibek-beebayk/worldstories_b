@@ -2,8 +2,8 @@ from django.contrib.auth import authenticate
 from django.contrib.auth import get_user_model
 from rest_framework import serializers
 
-from apps.story.models import Favorite, Review, Submission
-from apps.story.serializers import StoryListSerializer
+from apps.story.models import Favorite, Genre, Review, Submission
+from apps.story.serializers import GenreSerializer, StoryListSerializer
 
 
 User = get_user_model()
@@ -66,6 +66,7 @@ class UserProfileSerializer(serializers.ModelSerializer):
     reviews_count = serializers.SerializerMethodField()
     reading_in_progress_count = serializers.SerializerMethodField()
     listening_in_progress_count = serializers.SerializerMethodField()
+    preferred_genres = GenreSerializer(many=True, read_only=True)
 
     class Meta:
         model = User
@@ -82,6 +83,7 @@ class UserProfileSerializer(serializers.ModelSerializer):
             "reviews_count",
             "reading_in_progress_count",
             "listening_in_progress_count",
+            "preferred_genres",
         ]
 
     def get_favorites_count(self, obj):
@@ -151,9 +153,13 @@ class UserAdminSerializer(serializers.ModelSerializer):
 
 
 class UserProfileUpdateSerializer(serializers.ModelSerializer):
+    preferred_genres = serializers.PrimaryKeyRelatedField(
+        queryset=Genre.objects.all(), many=True, required=False
+    )
+
     class Meta:
         model = User
-        fields = ["username", "display_name", "bio", "avatar_url"]
+        fields = ["username", "display_name", "bio", "avatar_url", "preferred_genres"]
 
     def validate_username(self, value):
         username = value.strip()
