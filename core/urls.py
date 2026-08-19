@@ -59,7 +59,7 @@ def sitemap(request):
         .prefetch_related("chapters")
         .only("slug", "site_published_date")
     )
-    for story in stories.iterator():
+    for story in stories.iterator(chunk_size=2000):
         last_modified = (
             f"<lastmod>{story.site_published_date.isoformat()}</lastmod>"
             if story.site_published_date
