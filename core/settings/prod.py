@@ -28,20 +28,24 @@ STATIC_ROOT = os.path.join(BASE_DIR, "static")
 
 
 # logging
+# Logs to stdout at WARNING+ rather than a local DEBUG-level file: Railway
+# captures container stdout natively, so a FileHandler here just grows
+# unbounded on the ephemeral filesystem for no offsetting benefit — and
+# DEBUG-level logging in production risks writing request bodies/tokens to
+# disk.
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
     "handlers": {
-        "file": {
-            "level": "DEBUG",
-            "class": "logging.FileHandler",
-            "filename": "./debug.log",
+        "console": {
+            "level": "WARNING",
+            "class": "logging.StreamHandler",
         },
     },
     "loggers": {
         "": {  # empty string
-            "handlers": ["file"],
-            "level": "DEBUG",
+            "handlers": ["console"],
+            "level": "WARNING",
             "propagate": True,
             },
     },
