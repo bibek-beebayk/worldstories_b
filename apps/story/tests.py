@@ -13,7 +13,7 @@ from storages.backends.s3 import S3Storage
 
 from apps.story.api import StoryViewSet, open_s3_audio_stream
 from apps.story.models import Audio, Author, Genre, Story
-from apps.story.serializers import AudioAdminSerializer, StoryAdminSerializer
+from apps.story.serializers import AudioAdminSerializer, StoryAdminSerializer, SubmissionSerializer
 from apps.story import reading_time
 from core.urls import sitemap
 
@@ -638,3 +638,59 @@ class StoryAdminMultipartValidationTests(TestCase):
         self.assertTrue(serializer.is_valid(), serializer.errors)
         self.assertIsNone(serializer.validated_data["site_published_date"])
         self.assertIs(serializer.validated_data["pdf_file"], upload)
+
+
+class SubmissionFileUploadValidationTests(SimpleTestCase):
+    """A logged-in user can submit whatever bytes they like under a
+    pdf_file/epub_file field — the model previously had no extension or size
+    validation, so a mislabeled or oversized upload would sail straight
+    through to public R2 storage. These pin the FileExtensionValidator /
+    FileSizeValidator now declared on the model fields."""
+
+    def _minimal_submission_data(self, **overrides):
+        data = {
+            "title": "Test Submission",
+            "about": "A story about testing.",
+            "content": "Once upon a time.",
+            "story_type": "Short Story",
+            "language": "en",
+            "genres": [],
+        }
+        data.update(overrides)
+        return data
+
+    def test_rejects_pdf_file_with_the_wrong_extension(self):
+        disguised = SimpleUploadedFile(
+            "not-a-pdf.exe", b"MZ fake executable bytes", content_type="application/octet-stream"
+        )
+        serializer = SubmissionSerializer(data=self._minimal_submission_data(pdf_file=disguised))
+
+        self.assertFalse(serializer.is_valid())
+        self.assertIn("pdf_file", serializer.errors)
+
+    def test_rejects_epub_file_over_the_size_cap(self):
+        oversized = SimpleUploadedFile("book.epub", b"0" * 1024, content_type="application/epub+zip")
+        oversized.size = 51 * 1024 * 1024  # 1MB over the 50MB cap, without allocating 51MB
+        serializer = SubmissionSerializer(data=self._minimal_submission_data(epub_file=oversized))
+
+        self.assertFalse(serializer.is_valid())
+        self.assertIn("epub_file", serializer.errors)
+
+    def test_accepts_a_correctly_typed_pdf_file_within_the_size_cap(self):
+        valid = SimpleUploadedFile("story.pdf", b"%PDF-1.4 test document", content_type="application/pdf")
+        serializer = SubmissionSerializer(data=self._minimal_submission_data(pdf_file=valid))
+
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+
+
+class AudioFileUploadValidationTests(SimpleTestCase):
+    def test_rejects_audio_file_with_the_wrong_extension(self):
+        disguised = SimpleUploadedFile(
+            "not-audio.exe", b"MZ fake executable bytes", content_type="application/octet-stream"
+        )
+        serializer = AudioAdminSerializer(
+            data={"title": "Chapter One", "order": 1, "audio_file": disguised}
+        )
+
+        self.assertFalse(serializer.is_valid())
+        self.assertIn("audio_file", serializer.errors)

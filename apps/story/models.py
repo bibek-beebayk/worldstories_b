@@ -3,12 +3,16 @@ import uuid
 
 from django.db import models
 from django_ckeditor_5.fields import CKEditor5Field
-from django.core.validators import MinValueValidator, MaxValueValidator
+from django.core.validators import FileExtensionValidator, MinValueValidator, MaxValueValidator
 from django.conf import settings
 from django.utils import timezone
 from versatileimagefield.fields import VersatileImageField
 
 from core.libs.models import TimeStampModel
+from core.libs.validators import FileSizeValidator
+
+MAX_DOCUMENT_UPLOAD_SIZE = 50 * 1024 * 1024  # pdf/epub
+MAX_AUDIO_UPLOAD_SIZE = 150 * 1024 * 1024
 
 
 def published_story_q(prefix=""):
@@ -160,8 +164,24 @@ class Story(models.Model):
     )
     cover_image = models.URLField(blank=True, null=True)
     cover_image_file = VersatileImageField(upload_to="story_covers/", blank=True, null=True)
-    pdf_file = models.FileField(upload_to="story_files/pdfs/", blank=True, null=True)
-    epub_file = models.FileField(upload_to="story_files/epubs/", blank=True, null=True)
+    pdf_file = models.FileField(
+        upload_to="story_files/pdfs/",
+        blank=True,
+        null=True,
+        validators=[
+            FileExtensionValidator(allowed_extensions=["pdf"]),
+            FileSizeValidator(MAX_DOCUMENT_UPLOAD_SIZE),
+        ],
+    )
+    epub_file = models.FileField(
+        upload_to="story_files/epubs/",
+        blank=True,
+        null=True,
+        validators=[
+            FileExtensionValidator(allowed_extensions=["epub"]),
+            FileSizeValidator(MAX_DOCUMENT_UPLOAD_SIZE),
+        ],
+    )
     # Estimated reading time (minutes) derived from epub_file/pdf_file, probed
     # once at upload time (StoryAdminSerializer) rather than parsed live from
     # remote storage on every story-detail view — see reading_time.py. Only
@@ -279,7 +299,13 @@ class Audio(models.Model):
     story = models.ForeignKey(Story, on_delete=models.CASCADE, related_name="audios")
     title = models.CharField(max_length=256)
     slug = models.SlugField(max_length=256, null=True)
-    audio_file = models.FileField(upload_to='story_audios/')
+    audio_file = models.FileField(
+        upload_to='story_audios/',
+        validators=[
+            FileExtensionValidator(allowed_extensions=["mp3"]),
+            FileSizeValidator(MAX_AUDIO_UPLOAD_SIZE),
+        ],
+    )
     uploaded_at = models.DateTimeField(auto_now_add=True)
     order = models.PositiveIntegerField(default=1)
 
@@ -353,8 +379,24 @@ class Submission(models.Model):
         upload_to="submission_covers/", blank=True, null=True
     )
     notes = models.TextField(blank=True, null=True)
-    pdf_file = models.FileField(upload_to="submission_pdfs/", blank=True, null=True)
-    epub_file = models.FileField(upload_to="submission_epubs/", blank=True, null=True)
+    pdf_file = models.FileField(
+        upload_to="submission_pdfs/",
+        blank=True,
+        null=True,
+        validators=[
+            FileExtensionValidator(allowed_extensions=["pdf"]),
+            FileSizeValidator(MAX_DOCUMENT_UPLOAD_SIZE),
+        ],
+    )
+    epub_file = models.FileField(
+        upload_to="submission_epubs/",
+        blank=True,
+        null=True,
+        validators=[
+            FileExtensionValidator(allowed_extensions=["epub"]),
+            FileSizeValidator(MAX_DOCUMENT_UPLOAD_SIZE),
+        ],
+    )
     status = models.CharField(
         max_length=20, choices=SUBMISSION_STATUS_CHOICES, default="pending"
     )
