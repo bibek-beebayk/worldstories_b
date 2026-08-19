@@ -9,6 +9,7 @@ class StoryFilter(filters.FilterSet):
     language = filters.CharFilter(method="filter_language", label="Language")
     story_type = filters.CharFilter(method="filter_story_type", label="Story type")
     has_audio = filters.CharFilter(method="filter_has_audio", label="Has audio")
+    has_summary = filters.CharFilter(method="filter_has_summary", label="Has summary")
     sort = filters.CharFilter(method="filter_sort", label="Sort")
     q = filters.CharFilter(method="filter_q", label="Query")
 
@@ -44,6 +45,14 @@ class StoryFilter(filters.FilterSet):
             return queryset.filter(audios__isnull=True)
         return queryset
 
+    def filter_has_summary(self, queryset, name, value):
+        no_summary = Q(summary__isnull=True) | Q(summary__exact="")
+        if value.lower() == "true":
+            return queryset.exclude(no_summary)
+        if value.lower() == "false":
+            return queryset.filter(no_summary)
+        return queryset
+
     def filter_sort(self, queryset, name, value):
         if value.lower() == "recent":
             return queryset.order_by("-site_published_date")
@@ -71,4 +80,4 @@ class StoryFilter(filters.FilterSet):
 
     class Meta:
         model = Story
-        fields = ["status", "genres", "categories", "language", "story_type", "has_audio", "sort", "q"]
+        fields = ["status", "genres", "categories", "language", "story_type", "has_audio", "has_summary", "sort", "q"]

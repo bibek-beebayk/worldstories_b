@@ -560,6 +560,25 @@ class PublicAuthorApiTests(APITestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual([story["slug"] for story in response.data["results"]], ["story-with-audio"])
 
+    def test_story_list_can_filter_by_has_summary(self):
+        Story.objects.create(
+            title="Story With Summary",
+            slug="story-with-summary",
+            summary="<p>" + " ".join(["word"] * 50) + "</p>",
+            is_published=True,
+        )
+        Story.objects.create(
+            title="Story Without Summary",
+            slug="story-without-summary",
+            summary="",
+            is_published=True,
+        )
+
+        response = self.client.get(reverse("story-list"), {"has_summary": "true"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([story["slug"] for story in response.data["results"]], ["story-with-summary"])
+
     def test_story_list_language_filter_returns_matching_translation(self):
         english = Story.objects.get(slug="published-book")
         spanish = Story.objects.create(
