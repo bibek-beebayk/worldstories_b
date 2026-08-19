@@ -1,5 +1,6 @@
 from rest_framework import viewsets
 from django.contrib.auth import get_user_model
+from rest_framework.filters import SearchFilter
 from rest_framework.permissions import AllowAny
 from rest_framework.decorators import action
 from rest_framework.throttling import ScopedRateThrottle
@@ -17,6 +18,7 @@ from datetime import timedelta
 from django.db.models import Count
 from django.utils import timezone
 from .models import OTP
+from apps.story.api import IsSuperUser
 from apps.story.models import Favorite, Review, Story
 from apps.story.serializers import StoryListSerializer
 from apps.stats.models import (
@@ -30,6 +32,7 @@ from .serializers import (
     LoginSerializer,
     OTPValidateSerializer,
     OTPResendSerializer,
+    UserAdminSerializer,
     UserProfileSerializer,
     UserProfileUpdateSerializer,
     ContinueReadingItemSerializer,
@@ -235,6 +238,17 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
                 "otp_verified": True,
             },
         )
+
+        if not user.is_active:
+            # JWTAuthentication already rejects tokens for a deactivated user
+            # on every subsequent request (CHECK_USER_IS_ACTIVE), but this
+            # flow mints tokens directly via RefreshToken.for_user() rather
+            # than Django's authenticate() — so without this check, a
+            # deactivated user could still complete Google login and walk
+            # away with a fresh, working session.
+            return Response(
+                {"error": "This account has been deactivated."}, status=403
+            )
 
         if not user.otp_verified:
             user.otp_verified = True
@@ -597,4 +611,43 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
             serializer = MyReviewItemSerializer(page, many=True, context={"request": request})
             return self.get_paginated_response(serializer.data)
         serializer = MyReviewItemSerializer(queryset, many=True, context={"request": request})
+        return Response(serializer.data)
+
+
+class UserAdminViewSet(viewsets.ModelViewSet):
+    """List/search/view users and manage their staff, superuser, and active
+    status from the admin panel. No create action — accounts are only ever
+    provisioned via Google login, never manually. No delete action either:
+    hard-deleting a user cascades away their reviews, favorites, and
+    submissions, so deactivation (is_active) is the reversible alternative
+    exposed here instead."""
+
+    http_method_names = ["get", "patch", "head", "options"]
+    queryset = User.objects.all().order_by("-date_joined")
+    serializer_class = UserAdminSerializer
+    permission_classes = [IsSuperUser]
+    filter_backends = [SearchFilter]
+    search_fields = ["email", "username", "display_name"]
+
+    def partial_update(self, request, *args, **kwargs):
+        instance = self.get_object()
+        serializer = self.get_serializer(instance, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+
+        # Checked against validated_data, not raw request.data — a
+        # multipart/form request would otherwise arrive as the string
+        # "False" rather than the boolean False, silently slipping past an
+        # `is False` check on the unparsed value.
+        if instance.pk == request.user.pk:
+            attempting_self_lockout = (
+                serializer.validated_data.get("is_active") is False
+                or serializer.validated_data.get("is_superuser") is False
+            )
+            if attempting_self_lockout:
+                return Response(
+                    {"detail": "You can't deactivate or demote your own account."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        self.perform_update(serializer)
         return Response(serializer.data)

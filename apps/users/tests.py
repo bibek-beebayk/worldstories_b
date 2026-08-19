@@ -177,3 +177,116 @@ class ProfileInsightsApiTests(APITestCase):
         self.assertEqual(response.data["genres"], [{"name": "Fantasy", "value": 1}])
         self.assertEqual(response.data["activity"][-1]["reading"], 2)
         self.assertEqual(response.data["activity"][-1]["listening"], 1)
+
+
+class UserAdminApiTests(APITestCase):
+    def setUp(self):
+        self.superuser = User.objects.create_user(
+            email="admin@example.com", username="admin", password="x",
+            is_staff=True, is_superuser=True,
+        )
+        self.reader = User.objects.create_user(
+            email="reader@example.com", username="reader", password="x",
+        )
+
+    def test_requires_superuser(self):
+        self.client.force_authenticate(self.reader)
+
+        response = self.client.get(reverse("admin-user-list"))
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_lists_and_searches_users(self):
+        self.client.force_authenticate(self.superuser)
+
+        list_response = self.client.get(reverse("admin-user-list"))
+        self.assertEqual(list_response.status_code, 200)
+        self.assertEqual(list_response.data["pagination"]["count"], 2)
+
+        search_response = self.client.get(reverse("admin-user-list"), {"search": "reader"})
+        emails = [row["email"] for row in search_response.data["results"]]
+        self.assertEqual(emails, ["reader@example.com"])
+
+    def test_promotes_another_user_to_staff(self):
+        self.client.force_authenticate(self.superuser)
+
+        response = self.client.patch(
+            reverse("admin-user-detail", args=[self.reader.pk]), {"is_staff": True}
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.reader.refresh_from_db()
+        self.assertTrue(self.reader.is_staff)
+
+    def test_deactivates_another_user(self):
+        self.client.force_authenticate(self.superuser)
+
+        response = self.client.patch(
+            reverse("admin-user-detail", args=[self.reader.pk]), {"is_active": False}
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.reader.refresh_from_db()
+        self.assertFalse(self.reader.is_active)
+
+    def test_blocks_deactivating_your_own_account(self):
+        self.client.force_authenticate(self.superuser)
+
+        response = self.client.patch(
+            reverse("admin-user-detail", args=[self.superuser.pk]), {"is_active": False}
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.superuser.refresh_from_db()
+        self.assertTrue(self.superuser.is_active)
+
+    def test_blocks_demoting_your_own_account(self):
+        self.client.force_authenticate(self.superuser)
+
+        response = self.client.patch(
+            reverse("admin-user-detail", args=[self.superuser.pk]), {"is_superuser": False}
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.superuser.refresh_from_db()
+        self.assertTrue(self.superuser.is_superuser)
+
+    def test_blocks_self_lockout_even_when_form_encoded(self):
+        # Regression test: the guard used to read raw request.data, where a
+        # multipart-encoded payload carries "False" as a string rather than
+        # the boolean False — silently bypassing the check for any client
+        # that doesn't send strict JSON.
+        self.client.force_authenticate(self.superuser)
+
+        response = self.client.patch(
+            reverse("admin-user-detail", args=[self.superuser.pk]),
+            {"is_active": False},
+            format="multipart",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.superuser.refresh_from_db()
+        self.assertTrue(self.superuser.is_active)
+
+    def test_delete_is_not_allowed(self):
+        self.client.force_authenticate(self.superuser)
+
+        response = self.client.delete(reverse("admin-user-detail", args=[self.reader.pk]))
+
+        self.assertEqual(response.status_code, 405)
+        self.assertTrue(User.objects.filter(pk=self.reader.pk).exists())
+
+    def test_deactivated_user_cannot_authenticate_with_an_existing_token(self):
+        # force_authenticate() bypasses JWTAuthentication entirely, so this
+        # uses a real bearer token to actually exercise simplejwt's
+        # CHECK_USER_IS_ACTIVE check on every request — confirming
+        # deactivation revokes an already-issued token, not just future
+        # logins.
+        access_token = str(RefreshToken.for_user(self.reader).access_token)
+        self.reader.is_active = False
+        self.reader.save(update_fields=["is_active"])
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {access_token}")
+
+        response = self.client.get(reverse("auth-profile-insights"))
+
+        self.assertEqual(response.status_code, 401)

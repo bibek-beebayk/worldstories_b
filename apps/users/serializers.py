@@ -2,7 +2,7 @@ from django.contrib.auth import authenticate
 from django.contrib.auth import get_user_model
 from rest_framework import serializers
 
-from apps.story.models import Favorite, Review
+from apps.story.models import Favorite, Review, Submission
 from apps.story.serializers import StoryListSerializer
 
 
@@ -95,6 +95,59 @@ class UserProfileSerializer(serializers.ModelSerializer):
 
     def get_listening_in_progress_count(self, obj):
         return obj.audio_reading_progress.filter(progress__gt=0, progress__lt=1).count()
+
+
+class UserAdminSerializer(serializers.ModelSerializer):
+    """Powers the admin-panel Users page. Only is_staff/is_superuser/is_active
+    are writable here — everything else (identity, join date, activity
+    counts) is admin-visible but not editable from this endpoint."""
+
+    favorites_count = serializers.SerializerMethodField()
+    reviews_count = serializers.SerializerMethodField()
+    submissions_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = User
+        fields = [
+            "id",
+            "email",
+            "username",
+            "display_name",
+            "avatar_url",
+            "date_joined",
+            "last_login",
+            "login_count",
+            "otp_verified",
+            "is_staff",
+            "is_superuser",
+            "is_active",
+            "favorites_count",
+            "reviews_count",
+            "submissions_count",
+        ]
+        read_only_fields = [
+            "id",
+            "email",
+            "username",
+            "display_name",
+            "avatar_url",
+            "date_joined",
+            "last_login",
+            "login_count",
+            "otp_verified",
+            "favorites_count",
+            "reviews_count",
+            "submissions_count",
+        ]
+
+    def get_favorites_count(self, obj):
+        return Favorite.objects.filter(user=obj).count()
+
+    def get_reviews_count(self, obj):
+        return Review.objects.filter(user=obj).count()
+
+    def get_submissions_count(self, obj):
+        return Submission.objects.filter(user=obj).count()
 
 
 class UserProfileUpdateSerializer(serializers.ModelSerializer):

@@ -26,6 +26,7 @@ router.register("admin/audios", story_api.AudioAdminViewSet, basename="admin-aud
 router.register("admin/submissions", story_api.SubmissionAdminViewSet, basename="admin-submission")
 router.register("admin/authors", story_api.AuthorAdminViewSet, basename="admin-author")
 router.register("admin/categories", story_api.CategoryAdminViewSet, basename="admin-category")
+router.register("admin/users", users_api.UserAdminViewSet, basename="admin-user")
 router.register("auth", users_api.AuthenticationViewSet, basename="auth")
 
 
