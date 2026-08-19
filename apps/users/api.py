@@ -3,6 +3,7 @@ from django.contrib.auth import get_user_model
 from rest_framework.permissions import AllowAny
 from rest_framework.decorators import action
 from rest_framework_simplejwt.tokens import RefreshToken
+from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework.response import Response
 from django.conf import settings
 from rest_framework import status
@@ -64,6 +65,7 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
     def get_permissions(self):
         if self.action in {
             "me",
+            "logout",
             "library_continue_reading",
             "library_completed_reading",
             "library_continue_listening",
@@ -129,6 +131,23 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
             {"message": "Email/password login is disabled. Use Google login."},
             status=status.HTTP_410_GONE,
         )
+
+    @action(detail=False, methods=["post"])
+    def logout(self, request):
+        # Blacklists the refresh token so it (and, with ROTATE_REFRESH_TOKENS,
+        # any token minted from it) can't be used again — without this, the
+        # access token expiring locally is the only thing that ends the
+        # session; the refresh token would otherwise stay valid server-side
+        # for its full lifetime even after the user has "logged out".
+        # Missing/already-invalid tokens still return success — the caller's
+        # goal (not being logged in anymore) is already satisfied either way.
+        refresh_token = request.data.get("refresh")
+        if refresh_token:
+            try:
+                RefreshToken(refresh_token).blacklist()
+            except TokenError:
+                pass
+        return Response({"detail": "Logged out."}, status=status.HTTP_200_OK)
 
     @action(detail=False, methods=["post"], url_path="admin-login")
     def admin_login(self, request):

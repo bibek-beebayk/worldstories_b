@@ -1,6 +1,7 @@
 from django.contrib.auth import get_user_model
 from django.urls import reverse
 from rest_framework.test import APITestCase
+from rest_framework_simplejwt.tokens import RefreshToken
 
 from apps.stats.models import (
     AudioReadingProgress,
@@ -12,6 +13,54 @@ from apps.story.models import Audio, Chapter, Genre, Story
 
 
 User = get_user_model()
+
+
+class TokenLifecycleApiTests(APITestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(
+            email="reader@example.com",
+            username="reader",
+            password="test-password",
+        )
+
+    def test_refresh_rotates_and_blacklists_the_old_token(self):
+        original_refresh = str(RefreshToken.for_user(self.user))
+
+        first_response = self.client.post(reverse("token_refresh"), {"refresh": original_refresh})
+        self.assertEqual(first_response.status_code, 200)
+        rotated_refresh = first_response.data["refresh"]
+        self.assertNotEqual(rotated_refresh, original_refresh)
+
+        # The original token was single-use — replaying it must fail now,
+        # even though its own lifetime hasn't expired.
+        replay_response = self.client.post(reverse("token_refresh"), {"refresh": original_refresh})
+        self.assertEqual(replay_response.status_code, 401)
+
+        # The rotated token it handed back is the one that's actually live.
+        second_response = self.client.post(reverse("token_refresh"), {"refresh": rotated_refresh})
+        self.assertEqual(second_response.status_code, 200)
+
+    def test_logout_blacklists_the_refresh_token(self):
+        refresh_token = str(RefreshToken.for_user(self.user))
+        self.client.force_authenticate(self.user)
+
+        response = self.client.post(reverse("auth-logout"), {"refresh": refresh_token})
+
+        self.assertEqual(response.status_code, 200)
+        replay_response = self.client.post(reverse("token_refresh"), {"refresh": refresh_token})
+        self.assertEqual(replay_response.status_code, 401)
+
+    def test_logout_requires_authentication(self):
+        response = self.client.post(reverse("auth-logout"), {"refresh": "irrelevant"})
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_logout_without_a_refresh_token_still_succeeds(self):
+        self.client.force_authenticate(self.user)
+
+        response = self.client.post(reverse("auth-logout"), {})
+
+        self.assertEqual(response.status_code, 200)
 
 
 class ProfileInsightsApiTests(APITestCase):

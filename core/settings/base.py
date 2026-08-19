@@ -25,6 +25,7 @@ INSTALLED_APPS = [
     # "django_extensions",
     "rest_framework",
     "rest_framework_simplejwt",
+    "rest_framework_simplejwt.token_blacklist",
     # 'rest_framework.authtoken',
     "versatileimagefield",
     "django_filters",
@@ -172,9 +173,23 @@ REST_FRAMEWORK = {
     "PAGE_SIZE": 20,
 }
 
-SIMPLEJWT = {
+SIMPLE_JWT = {
+    # NOTE: djangorestframework-simplejwt reads the setting named "SIMPLE_JWT"
+    # specifically — this used to be spelled "SIMPLEJWT" here, which the
+    # library silently never read at all, so every value below was actually
+    # falling back to the library's own defaults (a 5-minute access token,
+    # among others) regardless of what was written here.
     "ACCESS_TOKEN_LIFETIME": timezone.timedelta(minutes=60),
-    "REFRESH_TOKEN_LIFETIME": timezone.timedelta(days=1),
+    "REFRESH_TOKEN_LIFETIME": timezone.timedelta(days=30),
+    # A refresh call returns a brand-new refresh token (and the one just used
+    # is blacklisted, see token_blacklist in INSTALLED_APPS) instead of the
+    # same one being reused for 30 days straight — an active user's session
+    # keeps extending, and a stolen/old refresh token stops working the
+    # moment the real one gets used again. The frontend must store the
+    # rotated refresh token from each /auth/refresh/ response, not the one
+    # it sent — see tryRefreshTokens() in api/client.ts.
+    "ROTATE_REFRESH_TOKENS": True,
+    "BLACKLIST_AFTER_ROTATION": True,
 }
 
 VERSATILEIMAGEFIELD_SETTINGS = {
