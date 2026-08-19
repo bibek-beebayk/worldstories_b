@@ -1,4 +1,5 @@
 from django.contrib.auth import get_user_model
+from django.core.cache import cache
 from django.urls import reverse
 from rest_framework.test import APITestCase
 from rest_framework_simplejwt.tokens import RefreshToken
@@ -61,6 +62,47 @@ class TokenLifecycleApiTests(APITestCase):
         response = self.client.post(reverse("auth-logout"), {})
 
         self.assertEqual(response.status_code, 200)
+
+
+class LoginThrottleApiTests(APITestCase):
+    """Pins the fix for a previously-missing brute-force guard: login and
+    admin-login had no rate limiting at all, so a scripted client could
+    attempt unlimited password guesses. Both actions now share a "login"
+    ScopedRateThrottle scope (5/min per IP, see DEFAULT_THROTTLE_RATES)."""
+
+    def setUp(self):
+        # LocMemCache (DRF throttling's backing store) isn't reset between
+        # test methods by default — without this, an earlier test's attempts
+        # would count against this one's budget depending on run order.
+        cache.clear()
+
+    def test_admin_login_is_throttled_after_five_attempts_per_ip(self):
+        for _ in range(5):
+            response = self.client.post(
+                reverse("auth-admin-login"), {"email": "x@example.com", "password": "wrong"}
+            )
+            self.assertNotEqual(response.status_code, 429)
+
+        throttled_response = self.client.post(
+            reverse("auth-admin-login"), {"email": "x@example.com", "password": "wrong"}
+        )
+        self.assertEqual(throttled_response.status_code, 429)
+
+    def test_login_and_admin_login_share_the_same_throttle_budget(self):
+        for _ in range(5):
+            self.client.post(reverse("auth-login"), {"email": "x@example.com", "password": "wrong"})
+
+        throttled_response = self.client.post(
+            reverse("auth-admin-login"), {"email": "x@example.com", "password": "wrong"}
+        )
+        self.assertEqual(throttled_response.status_code, 429)
+
+    def test_unrelated_endpoints_are_not_affected_by_the_login_scope(self):
+        for _ in range(5):
+            self.client.post(reverse("auth-admin-login"), {"email": "x@example.com", "password": "wrong"})
+
+        unrelated_response = self.client.get(reverse("story-list"))
+        self.assertNotEqual(unrelated_response.status_code, 429)
 
 
 class ProfileInsightsApiTests(APITestCase):

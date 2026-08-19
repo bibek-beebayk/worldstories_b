@@ -2,6 +2,7 @@ from rest_framework import viewsets
 from django.contrib.auth import get_user_model
 from rest_framework.permissions import AllowAny
 from rest_framework.decorators import action
+from rest_framework.throttling import ScopedRateThrottle
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework.response import Response
@@ -61,6 +62,15 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
     queryset = User.objects.all()
     serializer_class = None  # Placeholder for actual serializer class
     permission_classes = [AllowAny]
+    # Read by ScopedRateThrottle for whichever actions opt into it below —
+    # both login and admin_login share this scope/rate (see
+    # DEFAULT_THROTTLE_RATES["login"] in settings).
+    throttle_scope = "login"
+
+    def get_throttles(self):
+        if self.action in {"login", "admin_login"}:
+            return [ScopedRateThrottle()]
+        return super().get_throttles()
 
     def get_permissions(self):
         if self.action in {

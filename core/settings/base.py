@@ -171,6 +171,17 @@ REST_FRAMEWORK = {
     ],
     "DEFAULT_PAGINATION_CLASS": "core.libs.pagination.PageNumberPagination",
     "PAGE_SIZE": 20,
+    "DEFAULT_THROTTLE_CLASSES": [
+        "rest_framework.throttling.AnonRateThrottle",
+        "rest_framework.throttling.UserRateThrottle",
+    ],
+    "DEFAULT_THROTTLE_RATES": {
+        "anon": "100/min",
+        "user": "300/min",
+        # Tighter, IP-keyed limit applied only to the login/admin-login
+        # actions via ScopedRateThrottle — see apps/users/api.py.
+        "login": "5/min",
+    },
 }
 
 SIMPLE_JWT = {

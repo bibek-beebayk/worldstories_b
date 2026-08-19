@@ -7,6 +7,21 @@ DEBUG = False
 
 ALLOWED_HOSTS = ["worldstories-b-production.up.railway.app"]
 
+# HTTPS / cookie hardening. Railway terminates TLS at a proxy in front of the
+# app and forwards plain HTTP internally, so SECURE_PROXY_SSL_HEADER must
+# come first — without it, Django can't tell a real HTTPS request from a
+# plain HTTP one, and SECURE_SSL_REDIRECT/SESSION_COOKIE_SECURE below would
+# either redirect-loop real HTTPS traffic or silently refuse to set cookies.
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+SECURE_SSL_REDIRECT = True
+SESSION_COOKIE_SECURE = True
+CSRF_COOKIE_SECURE = True
+# Starting conservative (1 hour) rather than the usual 1-year production
+# value — HSTS makes browsers refuse plain HTTP for the whole duration, so
+# it's safer to confirm HTTPS holds up under real traffic before raising
+# this. Bump toward 31536000 (1 year) once that's confirmed.
+SECURE_HSTS_SECONDS = 3600
+
 CSRF_TRUSTED_ORIGINS = [
     "https://worldstories-b-production.up.railway.app", "https://worldstories-f.netlify.app", "http://localhost:8080", "http://127.0.0.1:8080", "https://worldstories.net", "https://www.worldstories.net"
 ]
