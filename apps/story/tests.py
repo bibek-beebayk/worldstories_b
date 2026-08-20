@@ -1170,14 +1170,30 @@ class GenerateFieldPromptLogicTests(SimpleTestCase):
 
 
 class GenerationHtmlSanitizationTests(SimpleTestCase):
-    def test_paragraphs_wrapped_and_injected_markup_neutralized(self):
+    def test_markdown_formatting_is_converted_to_rich_text_html(self):
         from apps.story.ai_generation import _to_html
 
-        html = _to_html("First paragraph.\n\n<script>alert('xss')</script> Second, with a & an amp.")
+        html = _to_html(
+            "# A Heading\n\nThis is **bold** and *italic* text.\n\n"
+            "- First point\n- Second point\n\n> A quoted line."
+        )
 
-        self.assertIn("<p>First paragraph.</p>", html)
+        self.assertIn("<h1>A Heading</h1>", html)
+        self.assertIn("<strong>bold</strong>", html)
+        self.assertIn("<em>italic</em>", html)
+        self.assertIn("<li>First point</li>", html)
+        self.assertIn("<blockquote>", html)
+
+    def test_injected_markup_is_neutralized_despite_markdown_passthrough(self):
+        from apps.story.ai_generation import _to_html
+
+        # Markdown passes raw HTML blocks through unchanged by design — nh3
+        # sanitization afterward is the real security boundary here, not the
+        # markdown conversion step.
+        html = _to_html("Normal text.\n\n<script>alert('xss')</script>\n\n[click](javascript:alert(1))")
+
         self.assertNotIn("<script", html)
-        self.assertIn("&amp;", html)
+        self.assertNotIn("javascript:", html)
 
 
 class RunGenerateFieldTests(TransactionTestCase):

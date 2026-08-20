@@ -10,9 +10,9 @@ from dataclasses import dataclass
 from typing import Literal, Optional
 
 import anthropic
+import markdown
 import nh3
 from django.conf import settings
-from django.utils.html import escape
 from pydantic import BaseModel
 
 from .epub_import import ALLOWED_ATTRIBUTES, ALLOWED_TAGS
@@ -67,17 +67,19 @@ def _build_user_message(
         )
     lines.append(
         f"\nWrite the {action} described in the system instructions. Return "
-        "plain-text paragraphs separated by a blank line — no markdown, no HTML."
+        "it as Markdown (paragraphs, and **bold**/*italics*/lists/headings/"
+        "blockquotes where they genuinely help — not HTML)."
     )
     return "\n".join(lines)
 
 
 def _to_html(raw_text: str) -> str:
-    # Claude is instructed to return plain-text paragraphs; wrap, HTML-escape,
-    # and sanitize regardless of what it actually returns rather than trusting
-    # any markup it might produce despite instructions.
-    paragraphs = [p.strip() for p in raw_text.split("\n\n") if p.strip()]
-    html = "".join(f"<p>{escape(p)}</p>" for p in paragraphs)
+    # Claude is instructed to return Markdown — converted here to the same
+    # rich-text HTML the CKEditor5 summary/retrospective fields already
+    # store, then sanitized regardless of what it actually returns (Markdown
+    # passes raw HTML blocks through unchanged by design, so this is the
+    # real security boundary, not a redundant step).
+    html = markdown.markdown(raw_text, extensions=["extra"])
     return nh3.clean(html, tags=ALLOWED_TAGS, attributes=ALLOWED_ATTRIBUTES, link_rel=None)
 
 
