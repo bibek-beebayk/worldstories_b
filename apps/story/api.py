@@ -33,12 +33,14 @@ from .models import (
     Submission,
     StoryView,
     EpubImportJob,
+    PromptSettings,
     with_preferred_translation_only,
     published_story_q,
     STORY_TYPE_CHOICES,
     LANGUAGE_CHOICES,
 )
 from .epub_import_jobs import executor as epub_import_executor, run_epub_import
+from .ai_generation_jobs import executor as ai_generation_executor, run_generate_field
 from .serializers import (
     GenreSerializer,
     CategorySerializer,
@@ -61,6 +63,7 @@ from .serializers import (
     AudioAdminSerializer,
     SubmissionAdminSerializer,
     EpubImportJobSerializer,
+    PromptSettingsSerializer,
 )
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -527,6 +530,12 @@ class SubmissionViewSet(ModelViewSet):
         return super().destroy(request, *args, **kwargs)
 
 
+_VALID_INPUT_FIELD_SETS = (
+    frozenset({"title", "author"}),
+    frozenset({"title", "author", "content"}),
+)
+
+
 class StoryAdminViewSet(ModelViewSet):
     queryset = Story.objects.select_related("author", "submitted_by", "submission").all().order_by("-id")
     serializer_class = StoryAdminSerializer
@@ -599,6 +608,39 @@ class StoryAdminViewSet(ModelViewSet):
         except EpubImportJob.DoesNotExist:
             return Response({"detail": "Import job not found."}, status=status.HTTP_404_NOT_FOUND)
         return Response(EpubImportJobSerializer(job).data)
+
+    @action(detail=True, methods=["post"], url_path="generate-summary")
+    def generate_summary(self, request, pk=None):
+        return self._trigger_generation(request, "summary")
+
+    @action(detail=True, methods=["post"], url_path="generate-retrospective")
+    def generate_retrospective(self, request, pk=None):
+        return self._trigger_generation(request, "retrospective")
+
+    def _trigger_generation(self, request, action):
+        story = self.get_object()
+        input_fields = request.data.get("input_fields", ["title", "author", "content"])
+        if (
+            not isinstance(input_fields, list)
+            or len(set(input_fields)) != len(input_fields)
+            or frozenset(input_fields) not in _VALID_INPUT_FIELD_SETS
+        ):
+            return Response(
+                {"detail": 'input_fields must be exactly ["title", "author"] or ["title", "author", "content"].'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if "content" in input_fields and not story.chapters.exists():
+            return Response(
+                {"detail": "This story has no chapters to generate from. Add chapters first, or omit \"content\"."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        Story.objects.filter(pk=story.pk).update(**{f"{action}_status": Story.GEN_STATUS_PENDING})
+        story.refresh_from_db()
+        transaction.on_commit(
+            lambda: ai_generation_executor.submit(run_generate_field, story.id, action, input_fields)
+        )
+        return Response(self.get_serializer(story).data, status=status.HTTP_202_ACCEPTED)
 
 
 class ChapterAdminViewSet(ModelViewSet):
@@ -1213,6 +1255,25 @@ class AdminOverviewAPIView(APIView):
                 "top_rated_stories": top_rated_stories,
             }
         )
+
+
+class PromptSettingsAPIView(APIView):
+    """Exposes the same PromptSettings singleton editable at /django-admin/
+    (apps/story/admin.py's SingletonModelAdmin registration) through the
+    custom admin panel too — both surfaces read/write the same one row via
+    PromptSettings.get_solo()."""
+
+    permission_classes = [IsSuperUser]
+
+    def get(self, request):
+        return Response(PromptSettingsSerializer(PromptSettings.get_solo()).data)
+
+    def patch(self, request):
+        instance = PromptSettings.get_solo()
+        serializer = PromptSettingsSerializer(instance, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data)
 
 
 class SearchStoryAPIView(APIView):

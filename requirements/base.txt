@@ -17,3 +17,4 @@ mutagen
 pypdf
 ebooklib
 nh3
+anthropic

@@ -19,21 +19,15 @@ never fires for a thread that isn't a request, so it must be closed manually
 in the finally block below or it leaks for the life of the thread.
 """
 import logging
-from concurrent.futures import ThreadPoolExecutor
 
 from django.db import connections, transaction
 from django.utils.text import slugify
 
+from .background_jobs import executor
 from .epub_import import EpubParseError, extract_chapters
 from .models import Chapter, EpubImportJob
 
 logger = logging.getLogger(__name__)
-
-# Small on purpose: this is I/O (remote-storage fetch) plus moderate CPU
-# parsing work, not meant to compete with gunicorn's own worker processes
-# for cores. Module-level so it's shared/reused across requests within one
-# process rather than spun up per-request.
-executor = ThreadPoolExecutor(max_workers=2)
 
 
 def _build_unique_chapter_slug(story, title: str) -> str:

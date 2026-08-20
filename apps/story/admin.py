@@ -3,7 +3,10 @@ from django.db import transaction
 from django.utils.html import strip_tags
 from django.utils import timezone
 from django.utils.text import slugify
-from .models import Audio, Story, Genre, Category, Tag, Author, Chapter, Review, Submission, StoryView
+from solo.admin import SingletonModelAdmin
+from .models import Audio, Story, Genre, Category, Tag, Author, Chapter, PromptSettings, Review, Submission, StoryView
+
+admin.site.register(PromptSettings, SingletonModelAdmin)
 
 
 class ChapterInline(admin.TabularInline):

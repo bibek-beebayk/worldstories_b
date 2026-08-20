@@ -6,6 +6,7 @@ from django_ckeditor_5.fields import CKEditor5Field
 from django.core.validators import FileExtensionValidator, MinValueValidator, MaxValueValidator
 from django.conf import settings
 from django.utils import timezone
+from solo.models import SingletonModel
 from versatileimagefield.fields import VersatileImageField
 
 from core.libs.models import TimeStampModel
@@ -115,12 +116,44 @@ class Author(models.Model):
 
 
 class Story(models.Model):
+    # Status/source tracking for Claude-generated summary/retrospective text
+    # (apps/story/ai_generation.py, ai_generation_jobs.py). "source" is a
+    # transparency flag — "metadata" means Claude wrote this from title/
+    # author alone (its own general knowledge, not this book's actual text),
+    # "content" means it was grounded in this story's real chapter content.
+    GEN_STATUS_PENDING = "pending"
+    GEN_STATUS_PROCESSING = "processing"
+    GEN_STATUS_COMPLETED = "completed"
+    GEN_STATUS_FAILED = "failed"
+    GEN_STATUS_CHOICES = [
+        (GEN_STATUS_PENDING, "Pending"),
+        (GEN_STATUS_PROCESSING, "Processing"),
+        (GEN_STATUS_COMPLETED, "Completed"),
+        (GEN_STATUS_FAILED, "Failed"),
+    ]
+    GEN_SOURCE_METADATA = "metadata"
+    GEN_SOURCE_CONTENT = "content"
+    GEN_SOURCE_CHOICES = [
+        (GEN_SOURCE_METADATA, "Metadata only (title/author)"),
+        (GEN_SOURCE_CONTENT, "Full chapter content"),
+    ]
+
     title = models.CharField(max_length=256)
     # content = models.TextField()
     slug = models.SlugField(max_length=256, unique=True)
     about = models.TextField(blank=True, null=True)
     summary = CKEditor5Field('Text', config_name='extends', blank=True, null=True)
+    summary_status = models.CharField(max_length=16, choices=GEN_STATUS_CHOICES, blank=True, null=True)
+    summary_source = models.CharField(max_length=16, choices=GEN_SOURCE_CHOICES, blank=True, null=True)
+    summary_confident = models.BooleanField(blank=True, null=True)
+    summary_confidence_note = models.TextField(blank=True, null=True)
+    summary_error = models.TextField(blank=True, null=True)
     retrospective = CKEditor5Field('Text', config_name='extends', blank=True, null=True)
+    retrospective_status = models.CharField(max_length=16, choices=GEN_STATUS_CHOICES, blank=True, null=True)
+    retrospective_source = models.CharField(max_length=16, choices=GEN_SOURCE_CHOICES, blank=True, null=True)
+    retrospective_confident = models.BooleanField(blank=True, null=True)
+    retrospective_confidence_note = models.TextField(blank=True, null=True)
+    retrospective_error = models.TextField(blank=True, null=True)
     genres = models.ManyToManyField(Genre, related_name="stories")
     categories = models.ManyToManyField(Category, related_name="stories", blank=True)
     story_type = models.CharField(
@@ -318,6 +351,50 @@ class EpubImportJob(TimeStampModel):
 
     def __str__(self):
         return f"{self.story.title} - epub import ({self.status})"
+
+
+class PromptSettings(SingletonModel):
+    """Admin-tunable instructions for Claude-generated Summary/Retrospective
+    text (apps/story/ai_generation.py). Deliberately holds only the
+    instructional/system-prompt portion — title/author/chapter content are
+    assembled into the actual request by code, never templated from this
+    text, so editing this can't reshape the request's structure or leak
+    unintended instructions into the data-assembly part of the prompt."""
+
+    MODEL_CHOICES = [
+        ("claude-opus-5", "Claude Opus 5 (most capable, most expensive)"),
+        ("claude-sonnet-5", "Claude Sonnet 5 (balanced)"),
+        ("claude-haiku-4-5", "Claude Haiku 4.5 (fastest, cheapest)"),
+    ]
+
+    summary_instructions = models.TextField(
+        default=(
+            "Write a concise, spoiler-free 2-3 paragraph summary of this book for "
+            "potential readers browsing the site. Focus on premise, tone, and what "
+            "makes it worth reading — do not reveal the ending."
+        ),
+        help_text=(
+            "Instructions for the 'Generate Summary' admin action. Title, author, "
+            "and (if selected) chapter content are assembled separately by code — "
+            "do not template those into this text."
+        ),
+    )
+    summary_model = models.CharField(max_length=32, choices=MODEL_CHOICES, default="claude-sonnet-5")
+    retrospective_instructions = models.TextField(
+        default=(
+            "Write a reflective retrospective essay analyzing this book's themes, "
+            "historical context, reception, and lasting significance, aimed at "
+            "readers who have already finished it (spoilers are fine)."
+        ),
+        help_text="Instructions for the 'Generate Retrospective' admin action.",
+    )
+    retrospective_model = models.CharField(max_length=32, choices=MODEL_CHOICES, default="claude-sonnet-5")
+
+    class Meta:
+        verbose_name = "AI Generation Prompt Settings"
+
+    def __str__(self):
+        return "AI Generation Prompt Settings"
 
 
 class Audio(models.Model):

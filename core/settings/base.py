@@ -217,6 +217,11 @@ OTP_LENGTH = 4
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 
+# Anthropic (Claude) API — used for admin-triggered book Summary/
+# Retrospective generation (apps/story/ai_generation.py). Never accept/store
+# a key from end users; this is operator-owned infra like GOOGLE_CLIENT_ID.
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+
 # Email (Google Workspace / SMTP)
 EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
 EMAIL_HOST = "smtp.gmail.com"

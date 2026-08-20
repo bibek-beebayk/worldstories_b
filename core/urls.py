@@ -108,6 +108,7 @@ urlpatterns = [
     ),
     path("api/search/", story_api.SearchStoryAPIView.as_view(), name="search-data"),
     path("api/admin/overview/", story_api.AdminOverviewAPIView.as_view(), name="admin-overview"),
+    path("api/admin/prompt-settings/", story_api.PromptSettingsAPIView.as_view(), name="admin-prompt-settings"),
     path(
         "api/admin/analytics/content/",
         story_analytics_api.AdminAnalyticsContentAPIView.as_view(),

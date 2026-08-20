@@ -12,10 +12,14 @@ from rest_framework.exceptions import ValidationError
 from rest_framework.test import APITestCase
 from storages.backends.s3 import S3Storage
 
+import anthropic
+
 from apps.story.api import StoryViewSet, open_s3_audio_stream
+from apps.story.ai_generation import GenerationError, _GenerationOutput, generate
+from apps.story.ai_generation_jobs import _concatenated_chapter_text, run_generate_field
 from apps.story.epub_import import EpubParseError, extract_chapters
 from apps.story.epub_import_jobs import run_epub_import
-from apps.story.models import Audio, Author, Chapter, EpubImportJob, Genre, Story
+from apps.story.models import Audio, Author, Chapter, EpubImportJob, Genre, PromptSettings, Story
 from apps.story.serializers import AudioAdminSerializer, StoryAdminSerializer, SubmissionSerializer
 from apps.story import reading_time
 from apps.users.models import User
@@ -1070,3 +1074,377 @@ class DeleteChapterReordersRemainingChaptersTests(APITestCase):
         remaining = list(Chapter.objects.filter(story=story).order_by("order"))
         self.assertEqual([c.order for c in remaining], [1, 2])
         self.assertEqual([c.title for c in remaining], ["Chapter 1", "Chapter 2"])
+
+
+def _mock_response(text="Generated text.", confident=True, note=""):
+    resp = MagicMock()
+    resp.parsed_output = _GenerationOutput(text=text, confident=confident, confidence_note=note)
+    return resp
+
+
+class GenerateFieldPromptLogicTests(SimpleTestCase):
+    """ai_generation.py is pure (no DB) — exercises the retry/fallback state
+    machine against a mocked anthropic.Anthropic client."""
+
+    def test_metadata_mode_single_success_makes_one_call(self):
+        with patch("apps.story.ai_generation._client") as mock_client:
+            mock_client.return_value.messages.parse.return_value = _mock_response()
+            result = generate("summary", "instructions", "Title", "Author", ["title", "author"], None)
+
+        self.assertEqual(result.source, "metadata")
+        self.assertEqual(mock_client.return_value.messages.parse.call_count, 1)
+
+    def test_content_mode_single_success_makes_one_call(self):
+        with patch("apps.story.ai_generation._client") as mock_client:
+            mock_client.return_value.messages.parse.return_value = _mock_response()
+            result = generate(
+                "summary", "instructions", "Title", "Author", ["title", "author", "content"], "chapter text"
+            )
+
+        self.assertEqual(result.source, "content")
+        self.assertEqual(mock_client.return_value.messages.parse.call_count, 1)
+
+    def test_low_confidence_is_returned_as_is_without_an_extra_retry_call(self):
+        # Regression guard for the explicit product decision: a
+        # confident=False result must never trigger an automatic retry — the
+        # admin decides whether to retry, not the backend.
+        with patch("apps.story.ai_generation._client") as mock_client:
+            mock_client.return_value.messages.parse.return_value = _mock_response(
+                confident=False, note="Not familiar with this specific edition."
+            )
+            result = generate("summary", "instructions", "Title", "Author", ["title", "author"], None)
+
+        self.assertFalse(result.confident)
+        self.assertEqual(result.confidence_note, "Not familiar with this specific edition.")
+        self.assertEqual(mock_client.return_value.messages.parse.call_count, 1)
+
+    def test_hard_failure_then_retry_success_makes_two_calls_no_fallback(self):
+        with patch("apps.story.ai_generation._client") as mock_client:
+            mock_client.return_value.messages.parse.side_effect = [
+                anthropic.APIConnectionError(request=MagicMock()),
+                _mock_response(),
+            ]
+            result = generate("summary", "instructions", "Title", "Author", ["title", "author"], None)
+
+        self.assertEqual(result.source, "metadata")
+        self.assertEqual(mock_client.return_value.messages.parse.call_count, 2)
+
+    def test_metadata_fails_twice_then_falls_back_to_content_and_succeeds(self):
+        with patch("apps.story.ai_generation._client") as mock_client:
+            err = anthropic.APIConnectionError(request=MagicMock())
+            mock_client.return_value.messages.parse.side_effect = [err, err, _mock_response()]
+            result = generate(
+                "summary", "instructions", "Title", "Author", ["title", "author"], "chapter text"
+            )
+
+        self.assertEqual(result.source, "content")
+        self.assertEqual(mock_client.return_value.messages.parse.call_count, 3)
+
+    def test_metadata_fails_twice_and_fallback_also_fails_raises(self):
+        with patch("apps.story.ai_generation._client") as mock_client:
+            err = anthropic.APIConnectionError(request=MagicMock())
+            mock_client.return_value.messages.parse.side_effect = [err, err, err]
+            with self.assertRaises(GenerationError):
+                generate("summary", "instructions", "Title", "Author", ["title", "author"], "chapter text")
+
+        self.assertEqual(mock_client.return_value.messages.parse.call_count, 3)
+
+    def test_content_mode_failure_twice_raises_after_exactly_two_calls(self):
+        # No fallback from content mode — there's nothing further to fall
+        # back to.
+        with patch("apps.story.ai_generation._client") as mock_client:
+            err = anthropic.APIConnectionError(request=MagicMock())
+            mock_client.return_value.messages.parse.side_effect = [err, err]
+            with self.assertRaises(GenerationError):
+                generate(
+                    "summary", "instructions", "Title", "Author", ["title", "author", "content"], "chapter text"
+                )
+
+        self.assertEqual(mock_client.return_value.messages.parse.call_count, 2)
+
+    def test_empty_response_text_is_treated_as_a_failure(self):
+        with patch("apps.story.ai_generation._client") as mock_client:
+            mock_client.return_value.messages.parse.return_value = _mock_response(text="   ")
+            with self.assertRaises(GenerationError):
+                generate("summary", "instructions", "Title", "Author", ["title", "author"], None)
+
+
+class GenerationHtmlSanitizationTests(SimpleTestCase):
+    def test_paragraphs_wrapped_and_injected_markup_neutralized(self):
+        from apps.story.ai_generation import _to_html
+
+        html = _to_html("First paragraph.\n\n<script>alert('xss')</script> Second, with a & an amp.")
+
+        self.assertIn("<p>First paragraph.</p>", html)
+        self.assertNotIn("<script", html)
+        self.assertIn("&amp;", html)
+
+
+class RunGenerateFieldTests(TransactionTestCase):
+    """Uses TransactionTestCase (not TestCase) for the same reason as
+    RunEpubImportTests — this touches real DB connections from what's
+    effectively a standalone function call, mirroring how it runs from a
+    worker thread in production."""
+
+    def _make_story(self, with_chapter=True):
+        story = Story.objects.create(title="Story", slug="story")
+        if with_chapter:
+            Chapter.objects.create(story=story, title="Ch1", slug="ch1", content="<p>Some chapter text.</p>", order=1)
+        return story
+
+    def test_success_path_updates_only_the_targeted_actions_columns(self):
+        story = self._make_story()
+        with patch("apps.story.ai_generation_jobs.generate") as mock_generate:
+            mock_generate.return_value = MagicMock(
+                html="<p>Generated summary.</p>", source="content", confident=True, confidence_note=""
+            )
+            run_generate_field(story.id, "summary", ["title", "author", "content"])
+
+        story.refresh_from_db()
+        self.assertEqual(story.summary, "<p>Generated summary.</p>")
+        self.assertEqual(story.summary_status, Story.GEN_STATUS_COMPLETED)
+        self.assertEqual(story.summary_source, "content")
+        self.assertTrue(story.summary_confident)
+        self.assertIsNone(story.summary_error)
+        # Retrospective columns untouched
+        self.assertIsNone(story.retrospective_status)
+        self.assertIsNone(story.retrospective)
+
+    def test_uses_the_admin_selected_model_per_action(self):
+        story = self._make_story()
+        prompt_settings = PromptSettings.get_solo()
+        prompt_settings.summary_model = "claude-haiku-4-5"
+        prompt_settings.retrospective_model = "claude-opus-5"
+        prompt_settings.save()
+
+        with patch("apps.story.ai_generation_jobs.generate") as mock_generate:
+            mock_generate.return_value = MagicMock(html="<p>S.</p>", source="content", confident=True, confidence_note="")
+            run_generate_field(story.id, "summary", ["title", "author", "content"])
+            mock_generate.return_value = MagicMock(html="<p>R.</p>", source="content", confident=True, confidence_note="")
+            run_generate_field(story.id, "retrospective", ["title", "author", "content"])
+
+        summary_call_kwargs = mock_generate.call_args_list[0].kwargs
+        retrospective_call_kwargs = mock_generate.call_args_list[1].kwargs
+        self.assertEqual(summary_call_kwargs["model"], "claude-haiku-4-5")
+        self.assertEqual(retrospective_call_kwargs["model"], "claude-opus-5")
+
+    def test_failure_path_marks_failed_and_leaves_text_field_untouched(self):
+        story = self._make_story()
+        story.summary = "<p>Pre-existing hand-written summary.</p>"
+        story.save(update_fields=["summary"])
+
+        with patch("apps.story.ai_generation_jobs.generate", side_effect=GenerationError("boom")):
+            run_generate_field(story.id, "summary", ["title", "author"])
+
+        story.refresh_from_db()
+        self.assertEqual(story.summary_status, Story.GEN_STATUS_FAILED)
+        self.assertEqual(story.summary_error, "boom")
+        self.assertEqual(story.summary, "<p>Pre-existing hand-written summary.</p>")
+
+    def test_concatenated_chapter_text_follows_order_not_insertion_order(self):
+        story = Story.objects.create(title="Story", slug="story")
+        Chapter.objects.create(story=story, title="Second", slug="second", content="<p>second text</p>", order=2)
+        Chapter.objects.create(story=story, title="First", slug="first", content="<p>first text</p>", order=1)
+
+        text = _concatenated_chapter_text(story)
+
+        self.assertLess(text.index("first text"), text.index("second text"))
+        self.assertNotIn("<p>", text)
+
+    def test_concatenated_chapter_text_truncates_at_cap(self):
+        from apps.story.ai_generation import MAX_CONTENT_CHARS
+
+        story = Story.objects.create(title="Story", slug="story")
+        Chapter.objects.create(story=story, title="Long", slug="long", content="x" * (MAX_CONTENT_CHARS + 5000), order=1)
+
+        text = _concatenated_chapter_text(story)
+
+        self.assertLessEqual(len(text), MAX_CONTENT_CHARS)
+
+    def test_concurrent_summary_and_retrospective_runs_dont_clobber_each_other(self):
+        story = self._make_story()
+        with patch("apps.story.ai_generation_jobs.generate") as mock_generate:
+            mock_generate.return_value = MagicMock(html="<p>Summary.</p>", source="content", confident=True, confidence_note="")
+            run_generate_field(story.id, "summary", ["title", "author", "content"])
+
+            mock_generate.return_value = MagicMock(html="<p>Retrospective.</p>", source="metadata", confident=False, confidence_note="unsure")
+            run_generate_field(story.id, "retrospective", ["title", "author"])
+
+        story.refresh_from_db()
+        self.assertEqual(story.summary, "<p>Summary.</p>")
+        self.assertEqual(story.summary_status, Story.GEN_STATUS_COMPLETED)
+        self.assertEqual(story.summary_source, "content")
+        self.assertEqual(story.retrospective, "<p>Retrospective.</p>")
+        self.assertEqual(story.retrospective_status, Story.GEN_STATUS_COMPLETED)
+        self.assertEqual(story.retrospective_source, "metadata")
+        self.assertFalse(story.retrospective_confident)
+
+
+class GenerateSummaryRetrospectiveApiTests(APITestCase):
+    def _make_superuser(self):
+        return User.objects.create(
+            email="admin3@example.com", username="admin3", is_superuser=True, is_staff=True, is_active=True
+        )
+
+    def _make_story(self, with_chapter=True):
+        story = Story.objects.create(title="Story", slug="story")
+        if with_chapter:
+            Chapter.objects.create(story=story, title="Ch1", slug="ch1", content="text", order=1)
+        return story
+
+    def test_generate_summary_returns_202_immediately_without_waiting_on_processing(self):
+        story = self._make_story()
+        self.client.force_authenticate(user=self._make_superuser())
+
+        with patch("apps.story.api.ai_generation_executor") as mock_executor:
+            with self.captureOnCommitCallbacks(execute=True):
+                response = self.client.post(f"/api/admin/stories/{story.id}/generate-summary/")
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.data["summary_status"], Story.GEN_STATUS_PENDING)
+        mock_executor.submit.assert_called_once()
+        _, called_story_id, called_action, called_fields = mock_executor.submit.call_args.args
+        self.assertEqual(called_story_id, story.id)
+        self.assertEqual(called_action, "summary")
+        self.assertEqual(called_fields, ["title", "author", "content"])
+
+    def test_omitted_input_fields_defaults_to_content_mode(self):
+        story = self._make_story()
+        self.client.force_authenticate(user=self._make_superuser())
+
+        with patch("apps.story.api.ai_generation_executor") as mock_executor:
+            with self.captureOnCommitCallbacks(execute=True):
+                self.client.post(f"/api/admin/stories/{story.id}/generate-summary/", {}, format="json")
+
+        _, _, _, called_fields = mock_executor.submit.call_args.args
+        self.assertEqual(called_fields, ["title", "author", "content"])
+
+    def test_explicit_metadata_mode_accepted(self):
+        story = self._make_story()
+        self.client.force_authenticate(user=self._make_superuser())
+
+        with patch("apps.story.api.ai_generation_executor"):
+            with self.captureOnCommitCallbacks(execute=True):
+                response = self.client.post(
+                    f"/api/admin/stories/{story.id}/generate-summary/",
+                    {"input_fields": ["title", "author"]},
+                    format="json",
+                )
+
+        self.assertEqual(response.status_code, 202)
+
+    def test_invalid_input_fields_rejected(self):
+        story = self._make_story()
+        self.client.force_authenticate(user=self._make_superuser())
+
+        for bad_value in (
+            ["content"],
+            [],
+            ["title"],
+            ["title", "author", "content", "extra"],
+            ["title", "title", "author"],
+            "not-a-list",
+        ):
+            response = self.client.post(
+                f"/api/admin/stories/{story.id}/generate-summary/", {"input_fields": bad_value}, format="json"
+            )
+            self.assertEqual(response.status_code, 400, f"expected 400 for {bad_value!r}")
+        self.assertIsNone(Story.objects.get(pk=story.id).summary_status)
+
+    def test_content_mode_rejected_when_story_has_no_chapters(self):
+        story = self._make_story(with_chapter=False)
+        self.client.force_authenticate(user=self._make_superuser())
+
+        response = self.client.post(
+            f"/api/admin/stories/{story.id}/generate-summary/",
+            {"input_fields": ["title", "author", "content"]},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_gated_to_superusers(self):
+        story = self._make_story()
+        regular_user = User.objects.create(
+            email="regular2@example.com", username="regular2", is_superuser=False, is_active=True
+        )
+        self.client.force_authenticate(user=regular_user)
+
+        response = self.client.post(f"/api/admin/stories/{story.id}/generate-summary/")
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_generate_retrospective_is_wired_to_its_own_fields_not_summarys(self):
+        story = self._make_story()
+        self.client.force_authenticate(user=self._make_superuser())
+
+        with patch("apps.story.api.ai_generation_executor") as mock_executor:
+            with self.captureOnCommitCallbacks(execute=True):
+                response = self.client.post(f"/api/admin/stories/{story.id}/generate-retrospective/")
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.data["retrospective_status"], Story.GEN_STATUS_PENDING)
+        self.assertIsNone(response.data["summary_status"])
+        _, _, called_action, _ = mock_executor.submit.call_args.args
+        self.assertEqual(called_action, "retrospective")
+
+
+class PromptSettingsApiTests(APITestCase):
+    def _make_superuser(self):
+        return User.objects.create(
+            email="admin4@example.com", username="admin4", is_superuser=True, is_staff=True, is_active=True
+        )
+
+    def test_get_returns_defaults_on_first_access(self):
+        self.client.force_authenticate(user=self._make_superuser())
+
+        response = self.client.get("/api/admin/prompt-settings/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.data["summary_instructions"])
+        self.assertEqual(response.data["summary_model"], "claude-sonnet-5")
+        self.assertTrue(response.data["retrospective_instructions"])
+        self.assertEqual(response.data["retrospective_model"], "claude-sonnet-5")
+
+    def test_patch_updates_and_persists(self):
+        self.client.force_authenticate(user=self._make_superuser())
+
+        response = self.client.patch(
+            "/api/admin/prompt-settings/",
+            {"summary_instructions": "Custom summary instructions.", "summary_model": "claude-opus-5"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["summary_instructions"], "Custom summary instructions.")
+        self.assertEqual(response.data["summary_model"], "claude-opus-5")
+
+        # Persisted to the same singleton row read elsewhere (get_solo()).
+        self.assertEqual(PromptSettings.get_solo().summary_instructions, "Custom summary instructions.")
+
+    def test_patch_updating_summary_leaves_retrospective_untouched(self):
+        self.client.force_authenticate(user=self._make_superuser())
+        PromptSettings.get_solo()  # ensure the row exists first
+
+        self.client.patch("/api/admin/prompt-settings/", {"summary_model": "claude-haiku-4-5"}, format="json")
+
+        self.assertEqual(PromptSettings.get_solo().retrospective_model, "claude-sonnet-5")
+
+    def test_invalid_model_choice_rejected(self):
+        self.client.force_authenticate(user=self._make_superuser())
+
+        response = self.client.patch(
+            "/api/admin/prompt-settings/", {"summary_model": "gpt-4"}, format="json"
+        )
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_gated_to_superusers(self):
+        regular_user = User.objects.create(
+            email="regular3@example.com", username="regular3", is_superuser=False, is_active=True
+        )
+        self.client.force_authenticate(user=regular_user)
+
+        response = self.client.get("/api/admin/prompt-settings/")
+
+        self.assertEqual(response.status_code, 403)

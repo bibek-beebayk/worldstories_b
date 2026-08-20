@@ -17,6 +17,7 @@ from .models import (
     Review,
     Submission,
     EpubImportJob,
+    PromptSettings,
     published_story_q,
     with_preferred_translation_only,
 )
@@ -637,7 +638,17 @@ class StoryAdminSerializer(serializers.ModelSerializer):
             "slug",
             "about",
             "summary",
+            "summary_status",
+            "summary_source",
+            "summary_confident",
+            "summary_confidence_note",
+            "summary_error",
             "retrospective",
+            "retrospective_status",
+            "retrospective_source",
+            "retrospective_confident",
+            "retrospective_confidence_note",
+            "retrospective_error",
             "story_type",
             "language",
             "translations",
@@ -671,7 +682,12 @@ class StoryAdminSerializer(serializers.ModelSerializer):
             "views",
             "source",
         ]
-        read_only_fields = ["rating", "views", "cached_file_reading_minutes"]
+        read_only_fields = [
+            "rating", "views", "cached_file_reading_minutes",
+            "summary_status", "summary_source", "summary_confident", "summary_confidence_note", "summary_error",
+            "retrospective_status", "retrospective_source", "retrospective_confident",
+            "retrospective_confidence_note", "retrospective_error",
+        ]
         # slug isn't required at the request level — validate() below auto-generates
         # it from the title when omitted, but that only runs after field-level
         # validation, so `slug` must not be marked required there.
@@ -852,6 +868,15 @@ class EpubImportJobSerializer(serializers.ModelSerializer):
             "created_at", "updated_at",
         ]
         read_only_fields = fields
+
+
+class PromptSettingsSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PromptSettings
+        fields = [
+            "summary_instructions", "summary_model",
+            "retrospective_instructions", "retrospective_model",
+        ]
 
 
 class AudioAdminSerializer(serializers.ModelSerializer):
