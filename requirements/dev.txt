@@ -11,6 +11,5 @@ black
 python-magic; sys_platform == 'linux'
 python-magic-bin; sys_platform == 'win32' or sys_platform == 'darwin'
 
-# used only by manage.py seed_demo_data to generate mock PDF/EPUB files
+# used only by manage.py seed_demo_data to generate mock PDF files
 fpdf2
-ebooklib

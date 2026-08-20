@@ -5,17 +5,50 @@ from unittest.mock import MagicMock, patch
 
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.http import QueryDict
-from django.test import RequestFactory, SimpleTestCase, TestCase
+from django.test import RequestFactory, SimpleTestCase, TestCase, TransactionTestCase
 from django.urls import reverse
+from ebooklib import epub
 from rest_framework.exceptions import ValidationError
 from rest_framework.test import APITestCase
 from storages.backends.s3 import S3Storage
 
 from apps.story.api import StoryViewSet, open_s3_audio_stream
-from apps.story.models import Audio, Author, Genre, Story
+from apps.story.epub_import import EpubParseError, extract_chapters
+from apps.story.epub_import_jobs import run_epub_import
+from apps.story.models import Audio, Author, Chapter, EpubImportJob, Genre, Story
 from apps.story.serializers import AudioAdminSerializer, StoryAdminSerializer, SubmissionSerializer
 from apps.story import reading_time
+from apps.users.models import User
 from core.urls import sitemap
+
+
+def _build_test_epub(guide=None, toc=None, spine_items=None, extra_items=None):
+    """Builds a small real in-memory EPUB (via ebooklib) for exercising
+    extract_chapters against actual EPUB container/spine/TOC structure,
+    rather than hand-rolled fixture HTML."""
+    book = epub.EpubBook()
+    book.set_identifier("test-id")
+    book.set_title("Test Book")
+    book.set_language("en")
+
+    nav = epub.EpubNav()
+    book.add_item(nav)
+    book.add_item(epub.EpubNcx())
+
+    items = spine_items or []
+    for item in items:
+        book.add_item(item)
+    for item in extra_items or []:
+        book.add_item(item)
+
+    if guide:
+        book.guide.extend(guide)
+    book.toc = toc or ()
+    book.spine = ["nav"] + items
+
+    buf = BytesIO()
+    epub.write_epub(buf, book)
+    return buf.getvalue()
 
 
 class AudioAdminSerializerDurationProbeTests(SimpleTestCase):
@@ -694,3 +727,346 @@ class AudioFileUploadValidationTests(SimpleTestCase):
 
         self.assertFalse(serializer.is_valid())
         self.assertIn("audio_file", serializer.errors)
+
+
+class ExtractChaptersTests(SimpleTestCase):
+    """extract_chapters (epub_import.py) is pure — no DB/Django ORM — so
+    these build small real in-memory EPUBs via ebooklib rather than mocking
+    it, exercising the actual container/spine/TOC parsing path."""
+
+    def test_well_formed_epub3_nav_orders_by_spine_and_titles_by_toc(self):
+        cover = epub.EpubHtml(title="Cover", file_name="cover.xhtml", lang="en")
+        cover.content = "<html><body><h1>Cover</h1></body></html>"
+        c1 = epub.EpubHtml(title="c1", file_name="chap1.xhtml", lang="en")
+        c1.content = "<html><body><h1>Intro</h1><p>First chapter body.</p></body></html>"
+        c2 = epub.EpubHtml(title="c2", file_name="chap2.xhtml", lang="en")
+        c2.content = "<html><body><p>Second chapter body.</p></body></html>"
+
+        data = _build_test_epub(
+            guide=[{"href": "cover.xhtml", "title": "Cover", "type": "cover"}],
+            toc=(
+                epub.Link("chap1.xhtml", "Chapter One", "c1"),
+                epub.Link("chap2.xhtml", "Chapter Two", "c2"),
+            ),
+            spine_items=[cover, c1, c2],
+        )
+
+        chapters = extract_chapters(data)
+
+        self.assertEqual([c.order for c in chapters], [1, 2])
+        self.assertEqual([c.title for c in chapters], ["Chapter One", "Chapter Two"])
+        self.assertIn("First chapter body.", chapters[0].content_html)
+        self.assertIn("Second chapter body.", chapters[1].content_html)
+
+    def test_well_formed_epub2_ncx_style_still_parses_via_toc(self):
+        c1 = epub.EpubHtml(title="c1", file_name="chap1.xhtml", lang="en")
+        c1.content = "<html><body><p>Only chapter.</p></body></html>"
+
+        data = _build_test_epub(
+            toc=(epub.Link("chap1.xhtml", "NCX Chapter Title", "c1"),),
+            spine_items=[c1],
+        )
+
+        chapters = extract_chapters(data)
+
+        self.assertEqual(len(chapters), 1)
+        self.assertEqual(chapters[0].title, "NCX Chapter Title")
+
+    def test_title_falls_back_to_heading_then_generated_placeholder(self):
+        with_heading = epub.EpubHtml(title="a", file_name="a.xhtml", lang="en")
+        with_heading.content = "<html><body><h2>Heading Title</h2><p>text</p></body></html>"
+        without_heading = epub.EpubHtml(title="b", file_name="b.xhtml", lang="en")
+        without_heading.content = "<html><body><p>no heading at all</p></body></html>"
+
+        data = _build_test_epub(toc=(), spine_items=[with_heading, without_heading])
+
+        chapters = extract_chapters(data)
+
+        self.assertEqual(chapters[0].title, "Heading Title")
+        self.assertEqual(chapters[1].title, "Chapter 2")
+
+    def test_cover_and_nav_items_are_excluded_from_output(self):
+        cover = epub.EpubHtml(title="Cover", file_name="cover.xhtml", lang="en")
+        cover.content = "<html><body><h1>Cover</h1></body></html>"
+        c1 = epub.EpubHtml(title="c1", file_name="chap1.xhtml", lang="en")
+        c1.content = "<html><body><p>Real chapter.</p></body></html>"
+
+        data = _build_test_epub(
+            guide=[{"href": "cover.xhtml", "title": "Cover", "type": "cover"}],
+            toc=(epub.Link("chap1.xhtml", "Real Chapter", "c1"),),
+            spine_items=[cover, c1],
+        )
+
+        chapters = extract_chapters(data)
+
+        self.assertEqual(len(chapters), 1)
+        self.assertEqual(chapters[0].title, "Real Chapter")
+
+    def test_images_are_stripped_and_internal_links_unwrapped(self):
+        c1 = epub.EpubHtml(title="c1", file_name="chap1.xhtml", lang="en")
+        c1.content = (
+            "<html><body><p>Hello <img src='pic.jpg'/> world "
+            "<a href='chap2.xhtml'>internal link text</a> and "
+            "<a href='https://example.com'>external link</a>.</p></body></html>"
+        )
+
+        data = _build_test_epub(toc=(), spine_items=[c1])
+
+        chapters = extract_chapters(data)
+
+        self.assertNotIn("<img", chapters[0].content_html)
+        self.assertNotIn("chap2", chapters[0].content_html)
+        self.assertIn("internal link text", chapters[0].content_html)
+        self.assertIn('href="https://example.com"', chapters[0].content_html)
+
+    def test_non_ascii_smart_quotes_and_dashes_are_not_mangled(self):
+        # Regression: get_body_content() returns undecoded UTF-8 bytes with
+        # no encoding declaration of its own (that lives in the full
+        # document's <head>, absent from a body-only fragment). Parsing
+        # those bytes directly let libxml2 guess the encoding — defaulting
+        # to a Latin-1-style byte-for-char mapping that mangled every
+        # multi-byte character into mojibake (e.g. a UTF-8 curly quote
+        # became a stray "â").
+        c1 = epub.EpubHtml(title="c1", file_name="chap1.xhtml", lang="en")
+        c1.content = (
+            "<html><body><p>“I incline to Cain’s heresy,” he said "
+            "— quaintly.</p></body></html>"
+        )
+        data = _build_test_epub(toc=(epub.Link("chap1.xhtml", "Chapter", "c1"),), spine_items=[c1])
+
+        chapters = extract_chapters(data)
+
+        self.assertIn("“I incline to Cain’s heresy,”", chapters[0].content_html)
+        self.assertIn("—", chapters[0].content_html)
+        self.assertNotIn("â", chapters[0].content_html)
+
+    def test_malformed_non_epub_bytes_raise_epub_parse_error(self):
+        with self.assertRaises(EpubParseError):
+            extract_chapters(b"this is not a zip file at all")
+
+    def test_valid_zip_but_missing_ocf_mimetype_entry_raises(self):
+        buf = BytesIO()
+        import zipfile
+
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("hello.txt", "not an epub")
+
+        with self.assertRaises(EpubParseError):
+            extract_chapters(buf.getvalue())
+
+
+class RunEpubImportTests(TransactionTestCase):
+    """Uses TransactionTestCase (not TestCase) because run_epub_import calls
+    transaction.atomic() and connections.close_all() itself — behavior that
+    TestCase's wrap-everything-in-one-rolled-back-transaction would mask."""
+
+    def _make_story(self):
+        return Story.objects.create(title="Story", slug="story", epub_file="story_files/epubs/book.epub")
+
+    def _run_import_with_epub_bytes(self, job_id, epub_bytes):
+        # run_epub_import re-fetches its own Story instance from the DB (by
+        # design — it runs in a worker thread with its own connection), so
+        # instance-level monkeypatching on a test's local `story` object
+        # never reaches it. Patch FieldFile.open at the class level instead,
+        # which intercepts the call regardless of which instance opens it.
+        from django.db.models.fields.files import FieldFile
+
+        mock_file = MagicMock(__enter__=MagicMock(return_value=BytesIO(epub_bytes)), __exit__=MagicMock(return_value=False))
+        with patch.object(FieldFile, "open", return_value=mock_file):
+            run_epub_import(job_id)
+
+    def test_success_path_creates_chapters_and_marks_job_completed(self):
+        c1 = epub.EpubHtml(title="c1", file_name="chap1.xhtml", lang="en")
+        c1.content = "<html><body><p>Chapter body.</p></body></html>"
+        epub_bytes = _build_test_epub(
+            toc=(epub.Link("chap1.xhtml", "Only Chapter", "c1"),), spine_items=[c1]
+        )
+        story = self._make_story()
+        job = EpubImportJob.objects.create(story=story)
+
+        self._run_import_with_epub_bytes(job.id, epub_bytes)
+
+        job.refresh_from_db()
+        self.assertEqual(job.status, EpubImportJob.STATUS_COMPLETED)
+        self.assertEqual(job.chapters_created, 1)
+        self.assertEqual(story.chapters.count(), 1)
+        self.assertEqual(story.chapters.first().title, "Only Chapter")
+
+    def test_parse_failure_marks_job_failed_with_message_and_creates_no_chapters(self):
+        story = self._make_story()
+        job = EpubImportJob.objects.create(story=story)
+
+        self._run_import_with_epub_bytes(job.id, b"not a real epub")
+
+        job.refresh_from_db()
+        self.assertEqual(job.status, EpubImportJob.STATUS_FAILED)
+        self.assertTrue(job.error_message)
+        self.assertEqual(story.chapters.count(), 0)
+
+    def test_reimport_replaces_rather_than_duplicates_chapters(self):
+        c1 = epub.EpubHtml(title="c1", file_name="chap1.xhtml", lang="en")
+        c1.content = "<html><body><p>Body.</p></body></html>"
+        epub_bytes = _build_test_epub(
+            toc=(epub.Link("chap1.xhtml", "Chapter", "c1"),), spine_items=[c1]
+        )
+        story = self._make_story()
+        Chapter.objects.create(story=story, title="Hand-written", slug="hand-written", content="x", order=1)
+
+        job = EpubImportJob.objects.create(story=story)
+        self._run_import_with_epub_bytes(job.id, epub_bytes)
+
+        self.assertEqual(story.chapters.count(), 1)
+        self.assertEqual(story.chapters.first().title, "Chapter")
+
+
+class ImportEpubApiTests(APITestCase):
+    def _make_superuser(self):
+        return User.objects.create(
+            email="admin@example.com", username="admin", is_superuser=True, is_staff=True, is_active=True
+        )
+
+    def test_import_epub_returns_202_immediately_without_waiting_on_processing(self):
+        story = Story.objects.create(title="Story", slug="story", epub_file="story_files/epubs/book.epub")
+        self.client.force_authenticate(user=self._make_superuser())
+
+        # APITestCase wraps each test in its own transaction that's rolled
+        # back afterwards, so transaction.on_commit callbacks never fire
+        # under a plain request — captureOnCommitCallbacks(execute=True) is
+        # Django's own helper for exercising them in tests anyway.
+        with patch("apps.story.api.epub_import_executor") as mock_executor:
+            with self.captureOnCommitCallbacks(execute=True):
+                response = self.client.post(f"/api/admin/stories/{story.id}/import-epub/")
+
+        self.assertEqual(response.status_code, 202)
+        self.assertIn("id", response.data)
+        self.assertEqual(response.data["status"], EpubImportJob.STATUS_PENDING)
+        mock_executor.submit.assert_called_once()
+        self.assertEqual(EpubImportJob.objects.filter(story=story).count(), 1)
+
+    def test_import_epub_requires_story_to_have_an_epub_file(self):
+        story = Story.objects.create(title="Story", slug="story")
+        self.client.force_authenticate(user=self._make_superuser())
+
+        response = self.client.post(f"/api/admin/stories/{story.id}/import-epub/")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(EpubImportJob.objects.filter(story=story).count(), 0)
+
+    def test_import_epub_accepts_a_direct_upload_when_story_has_no_epub_file(self):
+        story = Story.objects.create(title="Story", slug="story")
+        self.client.force_authenticate(user=self._make_superuser())
+        c1 = epub.EpubHtml(title="c1", file_name="chap1.xhtml", lang="en")
+        c1.content = "<html><body><p>Body.</p></body></html>"
+        epub_bytes = _build_test_epub(toc=(epub.Link("chap1.xhtml", "Chapter", "c1"),), spine_items=[c1])
+        uploaded = SimpleUploadedFile("book.epub", epub_bytes, content_type="application/epub+zip")
+
+        # Story.epub_file uses the real (S3/R2-backed) DEFAULT_FILE_STORAGE —
+        # patch the storage save/exists calls so this stays a hermetic test,
+        # same reasoning as RunEpubImportTests patching FieldFile.open.
+        from django.core.files.storage import default_storage
+
+        with patch.object(default_storage, "save", return_value="story_files/epubs/book.epub"), patch.object(
+            default_storage, "exists", return_value=False
+        ):
+            response = self.client.post(
+                f"/api/admin/stories/{story.id}/import-epub/", {"epub_file": uploaded}, format="multipart"
+            )
+
+        self.assertEqual(response.status_code, 202)
+        story.refresh_from_db()
+        self.assertTrue(story.epub_file)
+        self.assertEqual(EpubImportJob.objects.filter(story=story).count(), 1)
+
+    def test_import_epub_rejects_a_direct_upload_with_the_wrong_extension(self):
+        story = Story.objects.create(title="Story", slug="story")
+        self.client.force_authenticate(user=self._make_superuser())
+        disguised = SimpleUploadedFile("not-epub.exe", b"MZ fake executable bytes", content_type="application/octet-stream")
+
+        response = self.client.post(
+            f"/api/admin/stories/{story.id}/import-epub/", {"epub_file": disguised}, format="multipart"
+        )
+
+        self.assertEqual(response.status_code, 400)
+        story.refresh_from_db()
+        self.assertFalse(story.epub_file)
+        self.assertEqual(EpubImportJob.objects.filter(story=story).count(), 0)
+
+    def test_import_epub_is_gated_to_superusers(self):
+        story = Story.objects.create(title="Story", slug="story", epub_file="story_files/epubs/book.epub")
+        regular_user = User.objects.create(
+            email="user@example.com", username="user", is_superuser=False, is_active=True
+        )
+        self.client.force_authenticate(user=regular_user)
+
+        response = self.client.post(f"/api/admin/stories/{story.id}/import-epub/")
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_import_epub_status_returns_current_job_state(self):
+        story = Story.objects.create(title="Story", slug="story", epub_file="story_files/epubs/book.epub")
+        job = EpubImportJob.objects.create(
+            story=story, status=EpubImportJob.STATUS_COMPLETED, chapters_created=3
+        )
+        self.client.force_authenticate(user=self._make_superuser())
+
+        response = self.client.get(f"/api/admin/stories/{story.id}/import-epub/{job.id}/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["status"], EpubImportJob.STATUS_COMPLETED)
+        self.assertEqual(response.data["chapters_created"], 3)
+
+    def test_import_epub_status_404s_for_unknown_job(self):
+        story = Story.objects.create(title="Story", slug="story", epub_file="story_files/epubs/book.epub")
+        self.client.force_authenticate(user=self._make_superuser())
+
+        response = self.client.get(f"/api/admin/stories/{story.id}/import-epub/999999/")
+
+        self.assertEqual(response.status_code, 404)
+
+
+class DeleteChapterReordersRemainingChaptersTests(APITestCase):
+    def _make_superuser(self):
+        return User.objects.create(
+            email="admin2@example.com", username="admin2", is_superuser=True, is_staff=True, is_active=True
+        )
+
+    def _make_story_with_chapters(self, count):
+        story = Story.objects.create(title="Story", slug="story")
+        chapters = [
+            Chapter.objects.create(story=story, title=f"Chapter {n}", slug=f"chapter-{n}", content="x", order=n)
+            for n in range(1, count + 1)
+        ]
+        return story, chapters
+
+    def test_deleting_a_middle_chapter_shifts_later_ones_down_and_leaves_earlier_ones_alone(self):
+        story, chapters = self._make_story_with_chapters(4)
+        self.client.force_authenticate(user=self._make_superuser())
+
+        response = self.client.delete(f"/api/admin/chapters/{chapters[3].id}/")  # order=4
+
+        self.assertEqual(response.status_code, 204)
+        remaining = list(Chapter.objects.filter(story=story).order_by("order"))
+        self.assertEqual([c.order for c in remaining], [1, 2, 3])
+        self.assertEqual([c.title for c in remaining], ["Chapter 1", "Chapter 2", "Chapter 3"])
+
+    def test_deleting_the_first_chapter_shifts_everything_else_down(self):
+        story, chapters = self._make_story_with_chapters(4)
+        self.client.force_authenticate(user=self._make_superuser())
+
+        response = self.client.delete(f"/api/admin/chapters/{chapters[0].id}/")  # order=1
+
+        self.assertEqual(response.status_code, 204)
+        remaining = list(Chapter.objects.filter(story=story).order_by("order"))
+        self.assertEqual([c.order for c in remaining], [1, 2, 3])
+        self.assertEqual([c.title for c in remaining], ["Chapter 2", "Chapter 3", "Chapter 4"])
+
+    def test_deleting_the_last_chapter_leaves_the_rest_untouched(self):
+        story, chapters = self._make_story_with_chapters(3)
+        self.client.force_authenticate(user=self._make_superuser())
+
+        response = self.client.delete(f"/api/admin/chapters/{chapters[2].id}/")  # order=3
+
+        self.assertEqual(response.status_code, 204)
+        remaining = list(Chapter.objects.filter(story=story).order_by("order"))
+        self.assertEqual([c.order for c in remaining], [1, 2])
+        self.assertEqual([c.title for c in remaining], ["Chapter 1", "Chapter 2"])

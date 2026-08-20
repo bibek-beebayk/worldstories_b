@@ -16,6 +16,7 @@ from .models import (
     Author,
     Review,
     Submission,
+    EpubImportJob,
     published_story_q,
     with_preferred_translation_only,
 )
@@ -841,6 +842,16 @@ class ChapterAdminSerializer(serializers.ModelSerializer):
     class Meta:
         model = Chapter
         fields = ["id", "story", "title", "slug", "content", "order"]
+
+
+class EpubImportJobSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = EpubImportJob
+        fields = [
+            "id", "story", "status", "error_message", "chapters_created",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = fields
 
 
 class AudioAdminSerializer(serializers.ModelSerializer):

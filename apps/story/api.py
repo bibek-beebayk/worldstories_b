@@ -5,6 +5,7 @@ import uuid
 
 from rest_framework.viewsets import ReadOnlyModelViewSet, ModelViewSet
 from rest_framework.views import APIView
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db.models import Sum, Avg, Count, F
 from django.db.models import Q
 from django.http import FileResponse, HttpResponse, StreamingHttpResponse
@@ -31,11 +32,13 @@ from .models import (
     Favorite,
     Submission,
     StoryView,
+    EpubImportJob,
     with_preferred_translation_only,
     published_story_q,
     STORY_TYPE_CHOICES,
     LANGUAGE_CHOICES,
 )
+from .epub_import_jobs import executor as epub_import_executor, run_epub_import
 from .serializers import (
     GenreSerializer,
     CategorySerializer,
@@ -57,6 +60,7 @@ from .serializers import (
     ChapterAdminSerializer,
     AudioAdminSerializer,
     SubmissionAdminSerializer,
+    EpubImportJobSerializer,
 )
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -556,6 +560,46 @@ class StoryAdminViewSet(ModelViewSet):
         story.save(update_fields=["translation_group"])
         return Response(self.get_serializer(story).data)
 
+    @action(detail=True, methods=["post"], url_path="import-epub")
+    def import_epub(self, request, pk=None):
+        story = self.get_object()
+
+        # If the story already has an epub_file, import from that (no
+        # re-upload needed). Otherwise the request may carry a new file
+        # directly — validated with the same validators declared on
+        # Story.epub_file itself (extension + size cap), then saved onto
+        # the story so it's the one source of truth for future imports.
+        uploaded_file = request.FILES.get("epub_file")
+        if uploaded_file:
+            epub_field = Story._meta.get_field("epub_file")
+            try:
+                for validator in epub_field.validators:
+                    validator(uploaded_file)
+            except DjangoValidationError as exc:
+                return Response({"detail": "; ".join(exc.messages)}, status=status.HTTP_400_BAD_REQUEST)
+            story.epub_file = uploaded_file
+            story.save(update_fields=["epub_file"])
+        elif not story.epub_file:
+            return Response(
+                {"detail": "Upload an EPUB file to import chapters from."}, status=status.HTTP_400_BAD_REQUEST
+            )
+
+        job = EpubImportJob.objects.create(story=story, status=EpubImportJob.STATUS_PENDING)
+        # Submitted only after this view's own transaction commits — the
+        # worker thread opens its own DB connection and must never race the
+        # still-open request transaction (ATOMIC_REQUESTS=True). See
+        # epub_import_jobs.py's module docstring.
+        transaction.on_commit(lambda: epub_import_executor.submit(run_epub_import, job.id))
+        return Response(EpubImportJobSerializer(job).data, status=status.HTTP_202_ACCEPTED)
+
+    @action(detail=True, methods=["get"], url_path=r"import-epub/(?P<job_id>\d+)")
+    def import_epub_status(self, request, pk=None, job_id=None):
+        try:
+            job = EpubImportJob.objects.get(pk=job_id, story_id=pk)
+        except EpubImportJob.DoesNotExist:
+            return Response({"detail": "Import job not found."}, status=status.HTTP_404_NOT_FOUND)
+        return Response(EpubImportJobSerializer(job).data)
+
 
 class ChapterAdminViewSet(ModelViewSet):
     queryset = Chapter.objects.select_related("story").all().order_by("story_id", "order")
@@ -571,6 +615,21 @@ class ChapterAdminViewSet(ModelViewSet):
         if story_id:
             queryset = queryset.filter(story_id=story_id).order_by("order", "id")
         return queryset
+
+    def perform_destroy(self, instance):
+        story = instance.story
+        deleted_order = instance.order
+        instance.delete()
+
+        # Close the gap left by the deleted chapter so order stays
+        # contiguous from 1 — chapters before it are untouched, chapters
+        # after it each shift down by one. Updated ascending so every write
+        # lands on the slot the previous iteration just vacated, never
+        # colliding with unique_together("story", "order").
+        later_chapters = Chapter.objects.filter(story=story, order__gt=deleted_order).order_by("order")
+        for chapter in later_chapters:
+            chapter.order -= 1
+            chapter.save(update_fields=["order"])
 
 
 class AudioAdminViewSet(ModelViewSet):

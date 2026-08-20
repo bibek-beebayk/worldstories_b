@@ -294,7 +294,31 @@ class Chapter(models.Model):
 
     def __str__(self):
         return f"{self.story.title} - Chapter {self.order}: {self.title}"
-    
+
+
+class EpubImportJob(TimeStampModel):
+    STATUS_PENDING = "pending"
+    STATUS_PROCESSING = "processing"
+    STATUS_COMPLETED = "completed"
+    STATUS_FAILED = "failed"
+    STATUS_CHOICES = [
+        (STATUS_PENDING, "Pending"),
+        (STATUS_PROCESSING, "Processing"),
+        (STATUS_COMPLETED, "Completed"),
+        (STATUS_FAILED, "Failed"),
+    ]
+
+    story = models.ForeignKey(Story, on_delete=models.CASCADE, related_name="epub_import_jobs")
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES, default=STATUS_PENDING)
+    error_message = models.TextField(blank=True, null=True)
+    chapters_created = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"{self.story.title} - epub import ({self.status})"
+
 
 class Audio(models.Model):
     story = models.ForeignKey(Story, on_delete=models.CASCADE, related_name="audios")
