@@ -382,6 +382,7 @@ class StoryDetailSerializer(serializers.ModelSerializer):
             "slug",
             "about",
             "summary",
+            "retrospective",
             "genres",
             "categories",
             "story_type",
@@ -566,6 +567,14 @@ class StoryAdminSerializer(serializers.ModelSerializer):
     source = serializers.SerializerMethodField(read_only=True)
     translations = serializers.SerializerMethodField(read_only=True)
     published_date_label = serializers.SerializerMethodField(read_only=True)
+    chapter_count = serializers.SerializerMethodField(read_only=True)
+    audio_count = serializers.SerializerMethodField(read_only=True)
+
+    def get_chapter_count(self, obj):
+        return obj.chapters.count()
+
+    def get_audio_count(self, obj):
+        return obj.audios.count()
 
     def get_published_date_label(self, obj):
         original = obj.original_published_date_display()
@@ -627,6 +636,7 @@ class StoryAdminSerializer(serializers.ModelSerializer):
             "slug",
             "about",
             "summary",
+            "retrospective",
             "story_type",
             "language",
             "translations",
@@ -639,6 +649,8 @@ class StoryAdminSerializer(serializers.ModelSerializer):
             "site_published_date",
             "is_published",
             "publish_at",
+            "chapter_count",
+            "audio_count",
             "cover_image",
             "cover_image_file",
             "remove_cover_image_file",

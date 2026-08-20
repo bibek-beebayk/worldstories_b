@@ -100,7 +100,14 @@ class StoryAdmin(admin.ModelAdmin):
             "Summary",
             {
                 "fields": ("summary",),
-                "description": "Longer-form rich-text summary shown in its own tab on the story page.",
+                "description": "Longer-form rich-text summary shown on the story's Quick Read page.",
+            },
+        ),
+        (
+            "Retrospective",
+            {
+                "fields": ("retrospective",),
+                "description": "Rich-text retrospective shown in its own tab on the story page.",
             },
         ),
         (
@@ -158,6 +165,7 @@ class StoryAdmin(admin.ModelAdmin):
         "slug",
         "about",
         "summary",
+        "retrospective",
         "author__name",
         "genres__name",
         "categories__name",

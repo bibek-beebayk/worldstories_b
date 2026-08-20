@@ -120,6 +120,7 @@ class Story(models.Model):
     slug = models.SlugField(max_length=256, unique=True)
     about = models.TextField(blank=True, null=True)
     summary = CKEditor5Field('Text', config_name='extends', blank=True, null=True)
+    retrospective = CKEditor5Field('Text', config_name='extends', blank=True, null=True)
     genres = models.ManyToManyField(Genre, related_name="stories")
     categories = models.ManyToManyField(Category, related_name="stories", blank=True)
     story_type = models.CharField(
