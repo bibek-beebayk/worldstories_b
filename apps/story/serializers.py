@@ -1,6 +1,7 @@
 import json
 
 from rest_framework import serializers
+from django.core.files.base import ContentFile
 from django.db.models import Case, Count, IntegerField, Q, Value, When
 from django.http import QueryDict
 from django.utils.text import slugify
@@ -18,6 +19,7 @@ from .models import (
     Submission,
     EpubImportJob,
     PromptSettings,
+    Blog,
     published_story_q,
     with_preferred_translation_only,
 )
@@ -26,6 +28,7 @@ from .audio_processing import normalize_uploaded_audio
 
 CARD_COVER_SIZE = "480x640"
 LARGE_COVER_SIZE = "900x1200"
+BLOG_COVER_SIZE = "1200x630"
 
 
 class GenreSerializer(serializers.ModelSerializer):
@@ -877,6 +880,147 @@ class PromptSettingsSerializer(serializers.ModelSerializer):
             "summary_instructions", "summary_model",
             "retrospective_instructions", "retrospective_model",
         ]
+
+
+class LinkedStorySummarySerializer(serializers.ModelSerializer):
+    cover_image = serializers.SerializerMethodField()
+
+    def get_cover_image(self, obj):
+        request = self.context.get("request")
+        return get_cover_image_url(obj.cover_image_file, obj.cover_image, request, size=CARD_COVER_SIZE)
+
+    class Meta:
+        model = Story
+        fields = ["id", "slug", "title", "cover_image"]
+
+
+class BlogSerializer(serializers.ModelSerializer):
+    cover_image = serializers.SerializerMethodField()
+    linked_story = LinkedStorySummarySerializer(read_only=True)
+    published_at = serializers.DateTimeField(source="created_at", read_only=True)
+
+    def get_cover_image(self, obj):
+        request = self.context.get("request")
+        return get_cover_image_url(obj.cover_image_file, None, request, size=BLOG_COVER_SIZE)
+
+    class Meta:
+        model = Blog
+        fields = [
+            "id", "title", "slug", "excerpt", "content", "cover_image",
+            "author_name", "linked_story", "published_at",
+        ]
+
+
+class BlogAdminSerializer(serializers.ModelSerializer):
+    linked_story = serializers.PrimaryKeyRelatedField(
+        queryset=Story.objects.all(), required=False, allow_null=True
+    )
+    linked_story_detail = serializers.SerializerMethodField(read_only=True)
+    remove_cover_image_file = serializers.BooleanField(required=False, write_only=True)
+    cover_image_url = serializers.SerializerMethodField(read_only=True)
+    # Copies a story's cover image onto this blog post server-side (avoids a
+    # browser-side cross-origin fetch of the R2-hosted image, which R2's
+    # default bucket CORS config would likely block) — see the "use this
+    # story's cover" admin-panel prompt shown when linking a story.
+    copy_cover_from_story = serializers.PrimaryKeyRelatedField(
+        queryset=Story.objects.all(), required=False, allow_null=True, write_only=True
+    )
+
+    CLEARABLE_DATE_FIELDS = ("publish_at",)
+
+    def to_internal_value(self, data):
+        # Same multipart-empty-string-means-"clear this field" handling as
+        # StoryAdminSerializer, including the Python 3.14 QueryDict.copy()
+        # pickle-on-open-UploadedFile-streams workaround.
+        if isinstance(data, QueryDict):
+            normalized = QueryDict("", mutable=True, encoding=data.encoding)
+            for key in data:
+                normalized.setlist(key, list(data.getlist(key)))
+            data = normalized
+        elif hasattr(data, "copy"):
+            data = data.copy()
+
+        if hasattr(data, "get"):
+            for field_name in self.CLEARABLE_DATE_FIELDS:
+                if data.get(field_name) == "":
+                    data[field_name] = None
+        return super().to_internal_value(data)
+
+    def get_linked_story_detail(self, obj):
+        if not obj.linked_story:
+            return None
+        return {"id": obj.linked_story.id, "title": obj.linked_story.title, "slug": obj.linked_story.slug}
+
+    def get_cover_image_url(self, obj):
+        if obj.cover_image_file:
+            request = self.context.get("request")
+            return request.build_absolute_uri(obj.cover_image_file.url) if request else obj.cover_image_file.url
+        return ""
+
+    def _build_unique_slug(self, title: str, instance=None) -> str:
+        base_slug = slugify(title) or "blog"
+        slug = base_slug
+        suffix = 2
+        queryset = Blog.objects.all()
+        if instance is not None:
+            queryset = queryset.exclude(pk=instance.pk)
+        while queryset.filter(slug=slug).exists():
+            slug = f"{base_slug}-{suffix}"
+            suffix += 1
+        return slug
+
+    def validate(self, attrs):
+        title = attrs.get("title") or getattr(self.instance, "title", "")
+        if not attrs.get("slug") and title:
+            attrs["slug"] = self._build_unique_slug(title, self.instance)
+        return attrs
+
+    def _copy_cover_from_story(self, instance, story):
+        if not story.cover_image_file:
+            return
+        source = story.cover_image_file
+        source.open("rb")
+        try:
+            content = source.read()
+        finally:
+            source.close()
+        filename = source.name.rsplit("/", 1)[-1]
+        instance.cover_image_file.save(filename, ContentFile(content), save=False)
+
+    def update(self, instance, validated_data):
+        copy_cover_from_story = validated_data.pop("copy_cover_from_story", None)
+        # Explicit removal/upload takes priority over a "copy from story"
+        # request landing in the same payload — not reachable via the admin
+        # UI today (they're presented as alternatives), but this keeps the
+        # precedence unambiguous if it ever is.
+        if validated_data.pop("remove_cover_image_file", False) and instance.cover_image_file:
+            instance.cover_image_file.delete(save=False)
+            instance.cover_image_file = None
+        instance = super().update(instance, validated_data)
+        if copy_cover_from_story and "cover_image_file" not in validated_data:
+            self._copy_cover_from_story(instance, copy_cover_from_story)
+            instance.save(update_fields=["cover_image_file"])
+        return instance
+
+    def create(self, validated_data):
+        copy_cover_from_story = validated_data.pop("copy_cover_from_story", None)
+        validated_data.pop("remove_cover_image_file", None)
+        instance = super().create(validated_data)
+        if copy_cover_from_story and "cover_image_file" not in validated_data:
+            self._copy_cover_from_story(instance, copy_cover_from_story)
+            instance.save(update_fields=["cover_image_file"])
+        return instance
+
+    class Meta:
+        model = Blog
+        fields = [
+            "id", "title", "slug", "excerpt", "content", "cover_image_file",
+            "remove_cover_image_file", "copy_cover_from_story", "cover_image_url", "author_name",
+            "linked_story", "linked_story_detail", "is_published", "publish_at",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = ["created_at", "updated_at"]
+        extra_kwargs = {"slug": {"required": False}}
 
 
 class AudioAdminSerializer(serializers.ModelSerializer):

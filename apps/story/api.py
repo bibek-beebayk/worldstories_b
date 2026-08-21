@@ -34,6 +34,7 @@ from .models import (
     StoryView,
     EpubImportJob,
     PromptSettings,
+    Blog,
     with_preferred_translation_only,
     published_story_q,
     STORY_TYPE_CHOICES,
@@ -64,6 +65,8 @@ from .serializers import (
     SubmissionAdminSerializer,
     EpubImportJobSerializer,
     PromptSettingsSerializer,
+    BlogSerializer,
+    BlogAdminSerializer,
 )
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -169,6 +172,10 @@ class AuthorPagination(PageNumberPagination):
 class SearchAuthorPagination(PageNumberPagination):
     page_size = 12
     page_query_param = "author_page"
+
+
+class BlogPagination(PageNumberPagination):
+    page_size = 12
 
 
 class IsSuperUser(BasePermission):
@@ -484,6 +491,29 @@ class StoryViewSet(ReadOnlyModelViewSet):
         return response
 
 
+class BlogViewSet(ReadOnlyModelViewSet):
+    queryset = Blog.objects.all()
+    lookup_field = "slug"
+    serializer_class = BlogSerializer
+    pagination_class = BlogPagination
+    filter_backends = [SearchFilter]
+    search_fields = ["title", "excerpt"]
+
+    def get_queryset(self):
+        queryset = Blog.objects.published().select_related("linked_story").order_by("-created_at")
+        if self.request.query_params.get("sort") == "oldest":
+            queryset = queryset.order_by("created_at")
+        linked = self.request.query_params.get("linked_to_story")
+        if linked == "true":
+            queryset = queryset.filter(linked_story__isnull=False)
+        elif linked == "false":
+            queryset = queryset.filter(linked_story__isnull=True)
+        linked_story_slug = self.request.query_params.get("linked_story")
+        if linked_story_slug:
+            queryset = queryset.filter(linked_story__slug=linked_story_slug)
+        return queryset
+
+
 class SubmissionViewSet(ModelViewSet):
     parser_classes = [MultiPartParser, FormParser, JSONParser]
     permission_classes = [IsAuthenticated]
@@ -641,6 +671,16 @@ class StoryAdminViewSet(ModelViewSet):
             lambda: ai_generation_executor.submit(run_generate_field, story.id, action, input_fields)
         )
         return Response(self.get_serializer(story).data, status=status.HTTP_202_ACCEPTED)
+
+
+class BlogAdminViewSet(ModelViewSet):
+    queryset = Blog.objects.select_related("linked_story").all().order_by("-created_at")
+    serializer_class = BlogAdminSerializer
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
+    permission_classes = [IsSuperUser]
+    pagination_class = BlogPagination
+    filter_backends = [SearchFilter]
+    search_fields = ["title", "slug", "excerpt"]
 
 
 class ChapterAdminViewSet(ModelViewSet):

@@ -13,13 +13,14 @@ from apps.story import api as story_api
 from apps.story import analytics_api as story_analytics_api
 from apps.stats import views as stats_views
 from apps.users import api as users_api
-from apps.story.models import Author, Story
+from apps.story.models import Author, Story, Blog
 
 router = DefaultRouter()
 
 router.register("stories", story_api.StoryViewSet, basename="story")
 router.register("authors", story_api.AuthorViewSet, basename="author")
 router.register("submissions", story_api.SubmissionViewSet, basename="submission")
+router.register("blog", story_api.BlogViewSet, basename="blog")
 router.register("admin/stories", story_api.StoryAdminViewSet, basename="admin-story")
 router.register("admin/chapters", story_api.ChapterAdminViewSet, basename="admin-chapter")
 router.register("admin/audios", story_api.AudioAdminViewSet, basename="admin-audio")
@@ -27,6 +28,7 @@ router.register("admin/submissions", story_api.SubmissionAdminViewSet, basename=
 router.register("admin/authors", story_api.AuthorAdminViewSet, basename="admin-author")
 router.register("admin/categories", story_api.CategoryAdminViewSet, basename="admin-category")
 router.register("admin/users", users_api.UserAdminViewSet, basename="admin-user")
+router.register("admin/blog", story_api.BlogAdminViewSet, basename="admin-blog")
 router.register("auth", users_api.AuthenticationViewSet, basename="auth")
 
 
@@ -76,6 +78,13 @@ def sitemap(request):
                 f"<url><loc>{escape(f'{site_url}/read/{story.slug}/{chapter.slug}')}</loc>"
                 f"{last_modified}</url>"
             )
+
+    blogs = Blog.objects.published().only("slug", "created_at")
+    for blog in blogs.iterator(chunk_size=2000):
+        entries.append(
+            f"<url><loc>{escape(f'{site_url}/blog/{blog.slug}')}</loc>"
+            f"<lastmod>{blog.created_at.date().isoformat()}</lastmod></url>"
+        )
 
     authors = Author.objects.all().only("id")
     for author in authors.iterator():

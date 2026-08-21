@@ -4,7 +4,7 @@ from django.utils.html import strip_tags
 from django.utils import timezone
 from django.utils.text import slugify
 from solo.admin import SingletonModelAdmin
-from .models import Audio, Story, Genre, Category, Tag, Author, Chapter, PromptSettings, Review, Submission, StoryView
+from .models import Audio, Blog, Story, Genre, Category, Tag, Author, Chapter, PromptSettings, Review, Submission, StoryView
 
 admin.site.register(PromptSettings, SingletonModelAdmin)
 
@@ -196,6 +196,35 @@ class StoryAdmin(admin.ModelAdmin):
     @admin.display(description="Audios")
     def audios_count(self, obj):
         return obj.audios.count()
+
+
+@admin.register(Blog)
+class BlogAdmin(admin.ModelAdmin):
+    prepopulated_fields = {"slug": ("title",)}
+    fieldsets = (
+        ("Core Details", {"fields": ("title", "slug", "excerpt", "author_name")}),
+        ("Content", {"fields": ("content",)}),
+        ("Cover Image", {"fields": ("cover_image_file",)}),
+        (
+            "Linked Story",
+            {
+                "fields": ("linked_story",),
+                "description": "Optional — shows a 'Read the full story' link on the published post.",
+            },
+        ),
+        ("Publishing", {"fields": ("is_published", "publish_at")}),
+    )
+    list_display = ("title", "author_name", "linked_story", "is_published", "publish_at", "created_at")
+    list_filter = ("is_published", "linked_story")
+    search_fields = ("title", "slug", "excerpt", "author_name")
+    autocomplete_fields = ("linked_story",)
+    date_hierarchy = "created_at"
+    ordering = ("-created_at",)
+
+    @admin.display(description="Content Preview")
+    def content_preview(self, obj):
+        text = strip_tags(str(obj.content)).strip()
+        return f"{text[:80]}..." if len(text) > 80 else (text or "-")
 
 
 @admin.register(Genre)

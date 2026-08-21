@@ -555,3 +555,57 @@ class StoryView(TimeStampModel):
 
     def __str__(self):
         return f"View of {self.story} from {self.ip_address} at {self.created_at}"
+
+
+def published_blog_q(prefix=""):
+    """Mirrors published_story_q() — is_published True AND (publish_at unset
+    OR publish_at already passed)."""
+    field = f"{prefix}__" if prefix else ""
+    return models.Q(**{f"{field}is_published": True}) & (
+        models.Q(**{f"{field}publish_at__isnull": True})
+        | models.Q(**{f"{field}publish_at__lte": timezone.now()})
+    )
+
+
+class BlogQuerySet(models.QuerySet):
+    def published(self):
+        return self.filter(published_blog_q())
+
+
+class Blog(TimeStampModel):
+    title = models.CharField(max_length=255)
+    slug = models.SlugField(max_length=256, unique=True)
+    excerpt = models.CharField(
+        max_length=300, blank=True, null=True,
+        help_text="Short summary shown on the blog list page and used as the SEO meta description if set.",
+    )
+    content = CKEditor5Field('Text', config_name='extends')
+    cover_image_file = VersatileImageField(upload_to="blog_covers/", blank=True, null=True)
+    author_name = models.CharField(max_length=150, blank=True, null=True)
+    linked_story = models.ForeignKey(
+        Story,
+        on_delete=models.SET_NULL,
+        blank=True,
+        null=True,
+        related_name="blog_posts",
+        help_text="Optional — shows a 'Read the full story' link on the published post.",
+    )
+    is_published = models.BooleanField(default=True)
+    publish_at = models.DateTimeField(
+        blank=True,
+        null=True,
+        help_text=(
+            "Optional: hide this post from public listings until this moment, "
+            "even while is_published is True. Leave blank to publish immediately."
+        ),
+    )
+
+    objects = BlogQuerySet.as_manager()
+
+    class Meta:
+        ordering = ["-created_at"]
+        verbose_name = "Blog Post"
+        verbose_name_plural = "Blog Posts"
+
+    def __str__(self):
+        return self.title

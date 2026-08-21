@@ -1,4 +1,4 @@
-from datetime import date, datetime, timezone as datetime_timezone
+from datetime import date, datetime, timedelta, timezone as datetime_timezone
 from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -7,6 +7,7 @@ from django.core.files.uploadedfile import SimpleUploadedFile
 from django.http import QueryDict
 from django.test import RequestFactory, SimpleTestCase, TestCase, TransactionTestCase
 from django.urls import reverse
+from django.utils import timezone
 from ebooklib import epub
 from rest_framework.exceptions import ValidationError
 from rest_framework.test import APITestCase
@@ -19,7 +20,7 @@ from apps.story.ai_generation import GenerationError, _GenerationOutput, generat
 from apps.story.ai_generation_jobs import _concatenated_chapter_text, run_generate_field
 from apps.story.epub_import import EpubParseError, extract_chapters
 from apps.story.epub_import_jobs import run_epub_import
-from apps.story.models import Audio, Author, Chapter, EpubImportJob, Genre, PromptSettings, Story
+from apps.story.models import Audio, Author, Blog, Chapter, EpubImportJob, Genre, PromptSettings, Story
 from apps.story.serializers import AudioAdminSerializer, StoryAdminSerializer, SubmissionSerializer
 from apps.story import reading_time
 from apps.users.models import User
@@ -379,8 +380,9 @@ class ScheduledPublishingTests(SimpleTestCase):
         model_save.assert_called_once()
 
     @patch("core.urls.Author.objects.all")
+    @patch("core.urls.Blog.objects.published")
     @patch("core.urls.Story.objects.published")
-    def test_sitemap_uses_scheduled_publication_gate(self, published, authors_all):
+    def test_sitemap_uses_scheduled_publication_gate(self, published, blogs_published, authors_all):
         chapter = SimpleNamespace(slug="chapter-one")
         story = SimpleNamespace(
             slug="visible-story",
@@ -392,6 +394,7 @@ class ScheduledPublishingTests(SimpleTestCase):
             queryset.exclude.return_value.prefetch_related.return_value.only.return_value.iterator.return_value
         ) = iter([story])
         published.return_value = queryset
+        blogs_published.return_value.only.return_value.iterator.return_value = iter([])
         authors_all.return_value.only.return_value.iterator.return_value = iter([])
 
         response = sitemap(RequestFactory().get("/api/sitemap.xml"))
@@ -402,6 +405,263 @@ class ScheduledPublishingTests(SimpleTestCase):
         self.assertIn("<lastmod>2026-08-02</lastmod>", xml)
         published.assert_called_once_with()
         queryset.exclude.assert_called_once_with(story_type="Summary")
+
+
+class BlogModelTests(TestCase):
+    def test_published_excludes_unpublished_and_future_scheduled(self):
+        Blog.objects.create(title="Live", slug="live", content="<p>x</p>")
+        Blog.objects.create(title="Draft", slug="draft", content="<p>x</p>", is_published=False)
+        Blog.objects.create(
+            title="Future", slug="future", content="<p>x</p>",
+            publish_at=timezone.now() + timedelta(days=1),
+        )
+        Blog.objects.create(
+            title="Past", slug="past", content="<p>x</p>",
+            publish_at=timezone.now() - timedelta(days=1),
+        )
+
+        published_slugs = set(Blog.objects.published().values_list("slug", flat=True))
+
+        self.assertEqual(published_slugs, {"live", "past"})
+
+    def test_linked_story_survives_but_nulls_when_story_deleted(self):
+        story = Story.objects.create(title="Book", slug="book")
+        blog = Blog.objects.create(title="Post", slug="post", content="<p>x</p>", linked_story=story)
+
+        story.delete()
+        blog.refresh_from_db()
+
+        self.assertIsNone(blog.linked_story)
+
+    def test_sitemap_includes_only_published_blog_posts(self):
+        Blog.objects.create(title="Live Post", slug="live-post", content="<p>x</p>")
+        Blog.objects.create(title="Draft Post", slug="draft-post", content="<p>x</p>", is_published=False)
+        Blog.objects.create(
+            title="Scheduled Post", slug="scheduled-post", content="<p>x</p>",
+            publish_at=timezone.now() + timedelta(days=1),
+        )
+
+        response = sitemap(RequestFactory().get("/api/sitemap.xml"))
+
+        self.assertContains(response, "/blog/live-post")
+        self.assertNotContains(response, "/blog/draft-post")
+        self.assertNotContains(response, "/blog/scheduled-post")
+
+
+class BlogAdminApiTests(APITestCase):
+    def _make_superuser(self):
+        return User.objects.create(
+            email="blogadmin@example.com", username="blogadmin", is_superuser=True, is_staff=True, is_active=True
+        )
+
+    def test_create_generates_unique_slug_from_title(self):
+        self.client.force_authenticate(user=self._make_superuser())
+        Blog.objects.create(title="Existing", slug="my-post", content="<p>x</p>")
+
+        response = self.client.post(
+            "/api/admin/blog/", {"title": "My Post", "content": "<p>New content</p>"}, format="json"
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["slug"], "my-post-2")
+
+    def test_update_preserves_explicit_slug(self):
+        self.client.force_authenticate(user=self._make_superuser())
+        blog = Blog.objects.create(title="Title", slug="original-slug", content="<p>x</p>")
+
+        response = self.client.patch(
+            f"/api/admin/blog/{blog.id}/", {"slug": "custom-slug"}, format="json"
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["slug"], "custom-slug")
+
+    def test_create_with_cover_image_and_linked_story(self):
+        self.client.force_authenticate(user=self._make_superuser())
+        story = Story.objects.create(title="Linked Book", slug="linked-book")
+        # VersatileImageField validates the upload is a real decodable image
+        # (unlike a direct .create() call, which bypasses field validation) —
+        # a real minimal JPEG is needed here, not placeholder bytes.
+        from PIL import Image
+
+        image_buffer = BytesIO()
+        Image.new("RGB", (10, 10), color="red").save(image_buffer, format="JPEG")
+        image = SimpleUploadedFile("cover.jpg", image_buffer.getvalue(), content_type="image/jpeg")
+
+        response = self.client.post(
+            "/api/admin/blog/",
+            {
+                "title": "A Post",
+                "content": "<p>Body</p>",
+                "excerpt": "Short teaser",
+                "author_name": "Jane Doe",
+                "linked_story": story.id,
+                "cover_image_file": image,
+            },
+            format="multipart",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["linked_story"], story.id)
+        self.assertEqual(response.data["linked_story_detail"]["slug"], "linked-book")
+        self.assertTrue(response.data["cover_image_url"])
+
+    def test_copy_cover_from_story(self):
+        self.client.force_authenticate(user=self._make_superuser())
+        from PIL import Image
+
+        image_buffer = BytesIO()
+        Image.new("RGB", (10, 10), color="blue").save(image_buffer, format="JPEG")
+        story = Story.objects.create(
+            title="Story With Cover", slug="story-with-cover",
+            cover_image_file=SimpleUploadedFile("story-cover.jpg", image_buffer.getvalue(), content_type="image/jpeg"),
+        )
+
+        response = self.client.post(
+            "/api/admin/blog/",
+            {"title": "Post", "content": "<p>x</p>", "copy_cover_from_story": story.id},
+            format="multipart",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertTrue(response.data["cover_image_url"])
+        blog = Blog.objects.get(pk=response.data["id"])
+        self.assertTrue(blog.cover_image_file)
+        # Independent copy, not a reference to the story's own file.
+        self.assertNotEqual(blog.cover_image_file.name, story.cover_image_file.name)
+
+    def test_copy_cover_from_story_with_no_cover_is_a_no_op(self):
+        self.client.force_authenticate(user=self._make_superuser())
+        story = Story.objects.create(title="No Cover Story", slug="no-cover-story")
+
+        response = self.client.post(
+            "/api/admin/blog/",
+            {"title": "Post", "content": "<p>x</p>", "copy_cover_from_story": story.id},
+            format="multipart",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertFalse(response.data["cover_image_url"])
+
+    def test_remove_cover_image_file(self):
+        self.client.force_authenticate(user=self._make_superuser())
+        image = SimpleUploadedFile("cover.jpg", b"fake-image-bytes", content_type="image/jpeg")
+        blog = Blog.objects.create(title="Post", slug="post", content="<p>x</p>", cover_image_file=image)
+
+        response = self.client.patch(
+            f"/api/admin/blog/{blog.id}/", {"remove_cover_image_file": "true"}, format="multipart"
+        )
+
+        self.assertEqual(response.status_code, 200)
+        blog.refresh_from_db()
+        self.assertFalse(blog.cover_image_file)
+
+    def test_clearing_publish_at_via_multipart_empty_string(self):
+        self.client.force_authenticate(user=self._make_superuser())
+        blog = Blog.objects.create(
+            title="Post", slug="post", content="<p>x</p>", publish_at=timezone.now() + timedelta(days=1)
+        )
+
+        response = self.client.patch(f"/api/admin/blog/{blog.id}/", {"publish_at": ""}, format="multipart")
+
+        self.assertEqual(response.status_code, 200)
+        blog.refresh_from_db()
+        self.assertIsNone(blog.publish_at)
+
+    def test_delete(self):
+        self.client.force_authenticate(user=self._make_superuser())
+        blog = Blog.objects.create(title="Post", slug="post", content="<p>x</p>")
+
+        response = self.client.delete(f"/api/admin/blog/{blog.id}/")
+
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(Blog.objects.filter(pk=blog.id).exists())
+
+    def test_gated_to_superusers(self):
+        regular_user = User.objects.create(
+            email="regularblog@example.com", username="regularblog", is_superuser=False, is_active=True
+        )
+        self.client.force_authenticate(user=regular_user)
+
+        response = self.client.get("/api/admin/blog/")
+
+        self.assertEqual(response.status_code, 403)
+
+
+class BlogPublicApiTests(APITestCase):
+    def test_list_only_returns_published_posts(self):
+        Blog.objects.create(title="Live", slug="live", content="<p>x</p>")
+        Blog.objects.create(title="Draft", slug="draft", content="<p>x</p>", is_published=False)
+
+        response = self.client.get("/api/blog/")
+
+        self.assertEqual(response.status_code, 200)
+        slugs = [item["slug"] for item in response.data["results"]]
+        self.assertEqual(slugs, ["live"])
+
+    def test_search_filters_by_title_and_excerpt(self):
+        Blog.objects.create(title="Dragons and Magic", slug="dragons", content="<p>x</p>")
+        Blog.objects.create(title="Unrelated", slug="unrelated", content="<p>x</p>", excerpt="mentions dragons too")
+        Blog.objects.create(title="Something Else", slug="else", content="<p>x</p>")
+
+        response = self.client.get("/api/blog/?search=dragons")
+
+        slugs = {item["slug"] for item in response.data["results"]}
+        self.assertEqual(slugs, {"dragons", "unrelated"})
+
+    def test_sort_oldest_reorders(self):
+        first = Blog.objects.create(title="First", slug="first", content="<p>x</p>")
+        Blog.objects.create(title="Second", slug="second", content="<p>x</p>")
+
+        response = self.client.get("/api/blog/?sort=oldest")
+
+        self.assertEqual(response.data["results"][0]["slug"], first.slug)
+
+    def test_linked_to_story_filter(self):
+        story = Story.objects.create(title="Book", slug="book")
+        Blog.objects.create(title="Linked", slug="linked", content="<p>x</p>", linked_story=story)
+        Blog.objects.create(title="General", slug="general", content="<p>x</p>")
+
+        linked_response = self.client.get("/api/blog/?linked_to_story=true")
+        general_response = self.client.get("/api/blog/?linked_to_story=false")
+
+        self.assertEqual([i["slug"] for i in linked_response.data["results"]], ["linked"])
+        self.assertEqual([i["slug"] for i in general_response.data["results"]], ["general"])
+
+    def test_linked_story_slug_filter_scopes_to_one_story(self):
+        story_a = Story.objects.create(title="Book A", slug="book-a")
+        story_b = Story.objects.create(title="Book B", slug="book-b")
+        Blog.objects.create(title="For A", slug="for-a", content="<p>x</p>", linked_story=story_a)
+        Blog.objects.create(title="For B", slug="for-b", content="<p>x</p>", linked_story=story_b)
+        Blog.objects.create(title="Unlinked", slug="unlinked", content="<p>x</p>")
+
+        response = self.client.get("/api/blog/?linked_story=book-a")
+
+        self.assertEqual([i["slug"] for i in response.data["results"]], ["for-a"])
+
+    def test_detail_404s_for_unpublished_slug(self):
+        Blog.objects.create(title="Draft", slug="draft", content="<p>x</p>", is_published=False)
+
+        response = self.client.get("/api/blog/draft/")
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_detail_includes_linked_story_summary(self):
+        story = Story.objects.create(title="Book Title", slug="book-title")
+        Blog.objects.create(title="Post", slug="post", content="<p>x</p>", linked_story=story)
+
+        response = self.client.get("/api/blog/post/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["linked_story"]["slug"], "book-title")
+        self.assertEqual(response.data["linked_story"]["title"], "Book Title")
+
+    def test_detail_linked_story_null_when_absent(self):
+        Blog.objects.create(title="Post", slug="post", content="<p>x</p>")
+
+        response = self.client.get("/api/blog/post/")
+
+        self.assertIsNone(response.data["linked_story"])
 
 
 class PublicAuthorApiTests(APITestCase):
