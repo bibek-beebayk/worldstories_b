@@ -656,6 +656,13 @@ class BlogPublicApiTests(APITestCase):
         self.assertEqual(response.data["linked_story"]["slug"], "book-title")
         self.assertEqual(response.data["linked_story"]["title"], "Book Title")
 
+    def test_detail_includes_updated_at_for_date_modified(self):
+        Blog.objects.create(title="Post", slug="post", content="<p>x</p>")
+
+        response = self.client.get("/api/blog/post/")
+
+        self.assertTrue(response.data["updated_at"])
+
     def test_detail_linked_story_null_when_absent(self):
         Blog.objects.create(title="Post", slug="post", content="<p>x</p>")
 
