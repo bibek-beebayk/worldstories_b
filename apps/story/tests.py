@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.http import QueryDict
-from django.test import RequestFactory, SimpleTestCase, TestCase, TransactionTestCase
+from django.test import RequestFactory, SimpleTestCase, TestCase, TransactionTestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 from ebooklib import epub
@@ -16,6 +16,7 @@ from storages.backends.s3 import S3Storage
 import anthropic
 
 from apps.story.api import StoryViewSet, open_s3_audio_stream
+from core.libs.throttling import TrustedInternalOrAnonRateThrottle
 from apps.story.ai_generation import GenerationError, _GenerationOutput, _to_plain_text, generate
 from apps.story.ai_generation_jobs import _concatenated_chapter_text, run_generate_blog_excerpt, run_generate_field
 from apps.story.epub_import import EpubParseError, extract_chapters
@@ -1847,3 +1848,53 @@ class GenerateBlogExcerptApiTests(APITestCase):
         response = self.client.post(f"/api/admin/blog/{blog.id}/generate-excerpt/")
 
         self.assertEqual(response.status_code, 403)
+
+
+class TrustedInternalOrAnonRateThrottleTests(SimpleTestCase):
+    def _make_request(self, key=None):
+        factory = RequestFactory()
+        headers = {"HTTP_X_INTERNAL_SSR_KEY": key} if key is not None else {}
+        return factory.get("/api/blog/", **headers)
+
+    @override_settings(SSR_INTERNAL_API_KEY="test-secret")
+    def test_correct_key_bypasses_throttling_entirely(self):
+        throttle = TrustedInternalOrAnonRateThrottle()
+        request = self._make_request(key="test-secret")
+
+        # Real AnonRateThrottle history would reject well before 1000 calls
+        # on the default rate — bypass holds regardless.
+        for _ in range(1000):
+            self.assertTrue(throttle.allow_request(request, None))
+
+    @override_settings(SSR_INTERNAL_API_KEY="test-secret")
+    def test_wrong_key_falls_through_to_normal_anon_throttling(self):
+        throttle = TrustedInternalOrAnonRateThrottle()
+        request = self._make_request(key="wrong-secret")
+
+        with patch("rest_framework.throttling.AnonRateThrottle.allow_request", return_value="sentinel") as mock_super:
+            result = throttle.allow_request(request, None)
+
+        mock_super.assert_called_once_with(request, None)
+        self.assertEqual(result, "sentinel")
+
+    @override_settings(SSR_INTERNAL_API_KEY="")
+    def test_no_configured_secret_never_bypasses(self):
+        throttle = TrustedInternalOrAnonRateThrottle()
+        request = self._make_request(key="anything")
+
+        with patch("rest_framework.throttling.AnonRateThrottle.allow_request", return_value="sentinel") as mock_super:
+            result = throttle.allow_request(request, None)
+
+        mock_super.assert_called_once_with(request, None)
+        self.assertEqual(result, "sentinel")
+
+    @override_settings(SSR_INTERNAL_API_KEY="test-secret")
+    def test_missing_header_falls_through(self):
+        throttle = TrustedInternalOrAnonRateThrottle()
+        request = self._make_request()
+
+        with patch("rest_framework.throttling.AnonRateThrottle.allow_request", return_value="sentinel") as mock_super:
+            result = throttle.allow_request(request, None)
+
+        mock_super.assert_called_once_with(request, None)
+        self.assertEqual(result, "sentinel")

@@ -172,7 +172,7 @@ REST_FRAMEWORK = {
     "DEFAULT_PAGINATION_CLASS": "core.libs.pagination.PageNumberPagination",
     "PAGE_SIZE": 20,
     "DEFAULT_THROTTLE_CLASSES": [
-        "rest_framework.throttling.AnonRateThrottle",
+        "core.libs.throttling.TrustedInternalOrAnonRateThrottle",
         "rest_framework.throttling.UserRateThrottle",
     ],
     "DEFAULT_THROTTLE_RATES": {
@@ -221,6 +221,14 @@ GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 # Retrospective generation (apps/story/ai_generation.py). Never accept/store
 # a key from end users; this is operator-owned infra like GOOGLE_CLIENT_ID.
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+
+# Shared secret the frontend's SSR loaders send on every server-side data
+# fetch (see apps/story/throttling.py) so those calls don't get counted
+# against the public AnonRateThrottle bucket. Loader fetches run on the
+# Node host, not in the visitor's browser, so without this every visitor's
+# page load would appear to Django as coming from the same IP and share one
+# throttle bucket. Must match the frontend's own SSR_INTERNAL_API_KEY.
+SSR_INTERNAL_API_KEY = os.environ.get("SSR_INTERNAL_API_KEY", "")
 
 # Email (Google Workspace / SMTP)
 EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
