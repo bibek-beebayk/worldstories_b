@@ -12,7 +12,7 @@ from apps.stats.models import AnalyticsEvent, AudioReadingProgress, ChapterReadi
 from apps.users.models import User
 
 from .api import IsSuperUser
-from .models import Favorite, Genre, Review, Story, StoryView, Submission, published_story_q
+from .models import Blog, Favorite, Genre, Review, Story, StoryView, Submission, published_blog_q, published_story_q
 
 ALLOWED_RANGE_DAYS = (7, 30, 90, 365)
 DEFAULT_RANGE_DAYS = 30
@@ -89,6 +89,18 @@ class AdminAnalyticsContentAPIView(APIView):
             .order_by("site_published_date")
         )
 
+        # Blog has no site_published_date-style field — its own BlogSerializer
+        # already treats created_at as the effective "published at" moment
+        # (published_at = source="created_at"), so this mirrors that.
+        blog_publishing_over_time = (
+            Blog.objects.filter(published_blog_q(), created_at__gte=cutoff)
+            .annotate(day=TruncDate("created_at"))
+            .values("day")
+            .annotate(count=Count("id"))
+            .order_by("day")
+        )
+        blog_posts_count = Blog.objects.published().count()
+
         return Response(
             {
                 "range_days": days,
@@ -115,6 +127,10 @@ class AdminAnalyticsContentAPIView(APIView):
                 "publishing_over_time": [
                     {"day": row["site_published_date"], "count": row["count"]} for row in publishing_over_time
                 ],
+                "blog_publishing_over_time": [
+                    {"day": row["day"], "count": row["count"]} for row in blog_publishing_over_time
+                ],
+                "blog_posts_count": blog_posts_count,
             }
         )
 
@@ -402,6 +418,16 @@ class AdminAnalyticsAudienceAPIView(APIView):
         listening_seconds = sessions.filter(
             event_type=AnalyticsEvent.EVENT_LISTENING_SESSION
         ).aggregate(total=Sum("duration_seconds"))["total"] or 0
+        # Additive breakdowns, not carve-outs — reading_seconds above already
+        # sums every reading_session regardless of content (blog and quick
+        # read reads were never excluded from it), same as it already did for
+        # quick read (a Story) before blog tracking existed.
+        blog_reading_seconds = sessions.filter(
+            event_type=AnalyticsEvent.EVENT_READING_SESSION, blog_id__isnull=False
+        ).aggregate(total=Sum("duration_seconds"))["total"] or 0
+        quick_read_reading_seconds = sessions.filter(
+            event_type=AnalyticsEvent.EVENT_READING_SESSION, metadata__format="quick_read"
+        ).aggregate(total=Sum("duration_seconds"))["total"] or 0
         total_session_count = sessions.count()
 
         reader_days = {}
@@ -442,6 +468,15 @@ class AdminAnalyticsAudienceAPIView(APIView):
             .annotate(count=Count("id"))
             .order_by("-count")
         )
+        # Only starts getting populated once AdSpace.tsx sends content_type
+        # in metadata — existing/historical rows show up with a null key,
+        # same "unattributed" handling as download_types/completion_types.
+        ad_impressions_by_content_type = list(
+            events.filter(event_type=AnalyticsEvent.EVENT_AD_IMPRESSION)
+            .values("metadata__content_type")
+            .annotate(count=Count("id"))
+            .order_by("-count")
+        )
         top_downloads = list(
             events.filter(event_type=AnalyticsEvent.EVENT_DOWNLOAD, story_id__isnull=False)
             .values("story_id", "story__title", "story__slug")
@@ -451,6 +486,12 @@ class AdminAnalyticsAudienceAPIView(APIView):
         top_listened = list(
             events.filter(event_type=AnalyticsEvent.EVENT_LISTENING_SESSION, story_id__isnull=False)
             .values("story_id", "story__title", "story__slug")
+            .annotate(duration_seconds=Sum("duration_seconds"), sessions=Count("id"))
+            .order_by("-duration_seconds")[:10]
+        )
+        top_blogs_read = list(
+            events.filter(event_type=AnalyticsEvent.EVENT_READING_SESSION, blog_id__isnull=False)
+            .values("blog_id", "blog__title", "blog__slug")
             .annotate(duration_seconds=Sum("duration_seconds"), sessions=Count("id"))
             .order_by("-duration_seconds")[:10]
         )
@@ -486,6 +527,8 @@ class AdminAnalyticsAudienceAPIView(APIView):
                     else 0,
                     "reading_minutes": round(reading_seconds / 60, 1),
                     "listening_minutes": round(listening_seconds / 60, 1),
+                    "blog_reading_minutes": round(blog_reading_seconds / 60, 1),
+                    "quick_read_reading_minutes": round(quick_read_reading_seconds / 60, 1),
                     "avg_session_minutes": round(
                         (reading_seconds + listening_seconds) / total_session_count / 60, 1
                     )
@@ -517,6 +560,13 @@ class AdminAnalyticsAudienceAPIView(APIView):
                     }
                     for row in completion_types
                 ],
+                "ad_impressions_by_content_type": [
+                    {
+                        "content_type": row["metadata__content_type"] or "unknown",
+                        "count": row["count"],
+                    }
+                    for row in ad_impressions_by_content_type
+                ],
                 "top_downloads": [
                     {
                         "story_id": row["story_id"],
@@ -536,6 +586,16 @@ class AdminAnalyticsAudienceAPIView(APIView):
                         "minutes": round((row["duration_seconds"] or 0) / 60, 1),
                     }
                     for row in top_listened
+                ],
+                "top_blogs_read": [
+                    {
+                        "blog_id": row["blog_id"],
+                        "title": row["blog__title"],
+                        "slug": row["blog__slug"],
+                        "sessions": row["sessions"],
+                        "minutes": round((row["duration_seconds"] or 0) / 60, 1),
+                    }
+                    for row in top_blogs_read
                 ],
             }
         )

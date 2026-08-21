@@ -16,8 +16,8 @@ from storages.backends.s3 import S3Storage
 import anthropic
 
 from apps.story.api import StoryViewSet, open_s3_audio_stream
-from apps.story.ai_generation import GenerationError, _GenerationOutput, generate
-from apps.story.ai_generation_jobs import _concatenated_chapter_text, run_generate_field
+from apps.story.ai_generation import GenerationError, _GenerationOutput, _to_plain_text, generate
+from apps.story.ai_generation_jobs import _concatenated_chapter_text, run_generate_blog_excerpt, run_generate_field
 from apps.story.epub_import import EpubParseError, extract_chapters
 from apps.story.epub_import_jobs import run_epub_import
 from apps.story.models import Audio, Author, Blog, Chapter, EpubImportJob, Genre, PromptSettings, Story
@@ -1479,7 +1479,7 @@ class RunGenerateFieldTests(TransactionTestCase):
         story = self._make_story()
         with patch("apps.story.ai_generation_jobs.generate") as mock_generate:
             mock_generate.return_value = MagicMock(
-                html="<p>Generated summary.</p>", source="content", confident=True, confidence_note=""
+                content="<p>Generated summary.</p>", source="content", confident=True, confidence_note=""
             )
             run_generate_field(story.id, "summary", ["title", "author", "content"])
 
@@ -1501,9 +1501,9 @@ class RunGenerateFieldTests(TransactionTestCase):
         prompt_settings.save()
 
         with patch("apps.story.ai_generation_jobs.generate") as mock_generate:
-            mock_generate.return_value = MagicMock(html="<p>S.</p>", source="content", confident=True, confidence_note="")
+            mock_generate.return_value = MagicMock(content="<p>S.</p>", source="content", confident=True, confidence_note="")
             run_generate_field(story.id, "summary", ["title", "author", "content"])
-            mock_generate.return_value = MagicMock(html="<p>R.</p>", source="content", confident=True, confidence_note="")
+            mock_generate.return_value = MagicMock(content="<p>R.</p>", source="content", confident=True, confidence_note="")
             run_generate_field(story.id, "retrospective", ["title", "author", "content"])
 
         summary_call_kwargs = mock_generate.call_args_list[0].kwargs
@@ -1547,10 +1547,10 @@ class RunGenerateFieldTests(TransactionTestCase):
     def test_concurrent_summary_and_retrospective_runs_dont_clobber_each_other(self):
         story = self._make_story()
         with patch("apps.story.ai_generation_jobs.generate") as mock_generate:
-            mock_generate.return_value = MagicMock(html="<p>Summary.</p>", source="content", confident=True, confidence_note="")
+            mock_generate.return_value = MagicMock(content="<p>Summary.</p>", source="content", confident=True, confidence_note="")
             run_generate_field(story.id, "summary", ["title", "author", "content"])
 
-            mock_generate.return_value = MagicMock(html="<p>Retrospective.</p>", source="metadata", confident=False, confidence_note="unsure")
+            mock_generate.return_value = MagicMock(content="<p>Retrospective.</p>", source="metadata", confident=False, confidence_note="unsure")
             run_generate_field(story.id, "retrospective", ["title", "author"])
 
         story.refresh_from_db()
@@ -1729,5 +1729,121 @@ class PromptSettingsApiTests(APITestCase):
         self.client.force_authenticate(user=regular_user)
 
         response = self.client.get("/api/admin/prompt-settings/")
+
+        self.assertEqual(response.status_code, 403)
+
+
+class BlogExcerptPlainTextTests(SimpleTestCase):
+    def test_strips_markdown_and_unescapes_entities(self):
+        result = _to_plain_text("A great **story** about dragons & magic.")
+
+        self.assertEqual(result, "A great story about dragons & magic.")
+
+    def test_truncates_at_word_boundary_with_ellipsis(self):
+        result = _to_plain_text("word " * 100)
+
+        self.assertLessEqual(len(result), 300)
+        self.assertTrue(result.endswith("…"))
+        self.assertNotIn("  ", result)
+
+    def test_strips_surrounding_quotes(self):
+        result = _to_plain_text('"Quoted excerpt here"')
+
+        self.assertEqual(result, "Quoted excerpt here")
+
+
+class RunGenerateBlogExcerptTests(TransactionTestCase):
+    def _make_blog(self):
+        return Blog.objects.create(
+            title="A Blog Post", slug="a-blog-post", content="<p>Some post content.</p>", author_name="Jane"
+        )
+
+    def test_success_path_updates_excerpt_and_status(self):
+        blog = self._make_blog()
+        with patch("apps.story.ai_generation_jobs.generate") as mock_generate:
+            mock_generate.return_value = MagicMock(
+                content="A punchy SEO excerpt.", source="content", confident=True, confidence_note=""
+            )
+            run_generate_blog_excerpt(blog.id)
+
+        blog.refresh_from_db()
+        self.assertEqual(blog.excerpt, "A punchy SEO excerpt.")
+        self.assertEqual(blog.excerpt_status, Blog.GEN_STATUS_COMPLETED)
+        self.assertEqual(blog.excerpt_source, "content")
+        self.assertTrue(blog.excerpt_confident)
+        self.assertIsNone(blog.excerpt_error)
+
+    def test_always_grounds_in_blog_content_and_renders_as_text(self):
+        blog = self._make_blog()
+        with patch("apps.story.ai_generation_jobs.generate") as mock_generate:
+            mock_generate.return_value = MagicMock(
+                content="Plain excerpt.", source="content", confident=True, confidence_note=""
+            )
+            run_generate_blog_excerpt(blog.id)
+
+        call_kwargs = mock_generate.call_args.kwargs
+        self.assertEqual(call_kwargs["render_as"], "text")
+        self.assertEqual(call_kwargs["action"], "excerpt")
+        self.assertEqual(call_kwargs["input_fields"], ["title", "author", "content"])
+        self.assertIn("Some post content.", call_kwargs["content_text"])
+
+    def test_failure_path_marks_failed_and_leaves_excerpt_untouched(self):
+        blog = self._make_blog()
+        blog.excerpt = "Hand-written excerpt."
+        blog.save(update_fields=["excerpt"])
+
+        with patch("apps.story.ai_generation_jobs.generate", side_effect=GenerationError("boom")):
+            run_generate_blog_excerpt(blog.id)
+
+        blog.refresh_from_db()
+        self.assertEqual(blog.excerpt_status, Blog.GEN_STATUS_FAILED)
+        self.assertEqual(blog.excerpt_error, "boom")
+        self.assertEqual(blog.excerpt, "Hand-written excerpt.")
+
+    def test_uses_prompt_settings_excerpt_model_and_instructions(self):
+        blog = self._make_blog()
+        prompt_settings = PromptSettings.get_solo()
+        prompt_settings.excerpt_model = "claude-opus-5"
+        prompt_settings.excerpt_instructions = "Custom excerpt instructions."
+        prompt_settings.save()
+
+        with patch("apps.story.ai_generation_jobs.generate") as mock_generate:
+            mock_generate.return_value = MagicMock(content="x", source="content", confident=True, confidence_note="")
+            run_generate_blog_excerpt(blog.id)
+
+        call_kwargs = mock_generate.call_args.kwargs
+        self.assertEqual(call_kwargs["model"], "claude-opus-5")
+        self.assertEqual(call_kwargs["instructions"], "Custom excerpt instructions.")
+
+
+class GenerateBlogExcerptApiTests(APITestCase):
+    def _make_superuser(self):
+        return User.objects.create(
+            email="admin5@example.com", username="admin5", is_superuser=True, is_staff=True, is_active=True
+        )
+
+    def _make_blog(self):
+        return Blog.objects.create(title="A Blog Post", slug="a-blog-post", content="<p>x</p>")
+
+    def test_returns_202_immediately_without_waiting_on_processing(self):
+        blog = self._make_blog()
+        self.client.force_authenticate(user=self._make_superuser())
+
+        with patch("apps.story.api.ai_generation_executor") as mock_executor:
+            with self.captureOnCommitCallbacks(execute=True):
+                response = self.client.post(f"/api/admin/blog/{blog.id}/generate-excerpt/")
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.data["excerpt_status"], Blog.GEN_STATUS_PENDING)
+        mock_executor.submit.assert_called_once_with(run_generate_blog_excerpt, blog.id)
+
+    def test_gated_to_superusers(self):
+        blog = self._make_blog()
+        regular_user = User.objects.create(
+            email="regular4@example.com", username="regular4", is_superuser=False, is_active=True
+        )
+        self.client.force_authenticate(user=regular_user)
+
+        response = self.client.post(f"/api/admin/blog/{blog.id}/generate-excerpt/")
 
         self.assertEqual(response.status_code, 403)

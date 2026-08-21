@@ -879,6 +879,7 @@ class PromptSettingsSerializer(serializers.ModelSerializer):
         fields = [
             "summary_instructions", "summary_model",
             "retrospective_instructions", "retrospective_model",
+            "excerpt_instructions", "excerpt_model",
         ]
 
 
@@ -1014,12 +1015,17 @@ class BlogAdminSerializer(serializers.ModelSerializer):
     class Meta:
         model = Blog
         fields = [
-            "id", "title", "slug", "excerpt", "content", "cover_image_file",
+            "id", "title", "slug", "excerpt",
+            "excerpt_status", "excerpt_source", "excerpt_confident", "excerpt_confidence_note", "excerpt_error",
+            "content", "cover_image_file",
             "remove_cover_image_file", "copy_cover_from_story", "cover_image_url", "author_name",
             "linked_story", "linked_story_detail", "is_published", "publish_at",
             "created_at", "updated_at",
         ]
-        read_only_fields = ["created_at", "updated_at"]
+        read_only_fields = [
+            "created_at", "updated_at",
+            "excerpt_status", "excerpt_source", "excerpt_confident", "excerpt_confidence_note", "excerpt_error",
+        ]
         extra_kwargs = {"slug": {"required": False}}
 
 

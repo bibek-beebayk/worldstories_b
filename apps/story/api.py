@@ -41,7 +41,11 @@ from .models import (
     LANGUAGE_CHOICES,
 )
 from .epub_import_jobs import executor as epub_import_executor, run_epub_import
-from .ai_generation_jobs import executor as ai_generation_executor, run_generate_field
+from .ai_generation_jobs import (
+    executor as ai_generation_executor,
+    run_generate_blog_excerpt,
+    run_generate_field,
+)
 from .serializers import (
     GenreSerializer,
     CategorySerializer,
@@ -681,6 +685,14 @@ class BlogAdminViewSet(ModelViewSet):
     pagination_class = BlogPagination
     filter_backends = [SearchFilter]
     search_fields = ["title", "slug", "excerpt"]
+
+    @action(detail=True, methods=["post"], url_path="generate-excerpt")
+    def generate_excerpt(self, request, pk=None):
+        blog = self.get_object()
+        Blog.objects.filter(pk=blog.pk).update(excerpt_status=Blog.GEN_STATUS_PENDING)
+        blog.refresh_from_db()
+        transaction.on_commit(lambda: ai_generation_executor.submit(run_generate_blog_excerpt, blog.id))
+        return Response(self.get_serializer(blog).data, status=status.HTTP_202_ACCEPTED)
 
 
 class ChapterAdminViewSet(ModelViewSet):

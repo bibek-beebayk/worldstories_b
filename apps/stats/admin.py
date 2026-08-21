@@ -8,6 +8,7 @@ class AnalyticsEventAdmin(admin.ModelAdmin):
     list_display = (
         "event_type",
         "story",
+        "blog",
         "user",
         "visitor_id",
         "duration_seconds",
@@ -19,6 +20,8 @@ class AnalyticsEventAdmin(admin.ModelAdmin):
         "session_id",
         "story__title",
         "story__slug",
+        "blog__title",
+        "blog__slug",
         "user__email",
     )
     readonly_fields = (
@@ -28,13 +31,14 @@ class AnalyticsEventAdmin(admin.ModelAdmin):
         "visitor_id",
         "session_id",
         "story",
+        "blog",
         "duration_seconds",
         "value",
         "metadata",
         "created_at",
     )
     date_hierarchy = "created_at"
-    list_select_related = ("story", "user")
+    list_select_related = ("story", "blog", "user")
 
     def has_add_permission(self, request):
         return False

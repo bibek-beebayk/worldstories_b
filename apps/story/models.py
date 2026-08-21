@@ -389,6 +389,18 @@ class PromptSettings(SingletonModel):
         help_text="Instructions for the 'Generate Retrospective' admin action.",
     )
     retrospective_model = models.CharField(max_length=32, choices=MODEL_CHOICES, default="claude-sonnet-5")
+    excerpt_instructions = models.TextField(
+        default=(
+            "Write a compelling, SEO-optimized excerpt (roughly 140-160 characters, "
+            "never more than 300) for this blog post. It doubles as the page's meta "
+            "description and the teaser shown on the blog list page, so make it "
+            "concrete and specific — include the post's actual subject/keywords "
+            "rather than generic phrasing — and write it as a single line of plain "
+            "text with no markdown, no HTML, and no surrounding quote marks."
+        ),
+        help_text="Instructions for the 'Generate Excerpt' admin action on blog posts.",
+    )
+    excerpt_model = models.CharField(max_length=32, choices=MODEL_CHOICES, default="claude-sonnet-5")
 
     class Meta:
         verbose_name = "AI Generation Prompt Settings"
@@ -573,12 +585,37 @@ class BlogQuerySet(models.QuerySet):
 
 
 class Blog(TimeStampModel):
+    # Status/source tracking for Claude-generated excerpt text — same
+    # transparency-flag meaning as Story's summary/retrospective fields (see
+    # Story's own GEN_STATUS_CHOICES/GEN_SOURCE_CHOICES comment).
+    GEN_STATUS_PENDING = "pending"
+    GEN_STATUS_PROCESSING = "processing"
+    GEN_STATUS_COMPLETED = "completed"
+    GEN_STATUS_FAILED = "failed"
+    GEN_STATUS_CHOICES = [
+        (GEN_STATUS_PENDING, "Pending"),
+        (GEN_STATUS_PROCESSING, "Processing"),
+        (GEN_STATUS_COMPLETED, "Completed"),
+        (GEN_STATUS_FAILED, "Failed"),
+    ]
+    GEN_SOURCE_METADATA = "metadata"
+    GEN_SOURCE_CONTENT = "content"
+    GEN_SOURCE_CHOICES = [
+        (GEN_SOURCE_METADATA, "Metadata only (title/author)"),
+        (GEN_SOURCE_CONTENT, "Full post content"),
+    ]
+
     title = models.CharField(max_length=255)
     slug = models.SlugField(max_length=256, unique=True)
     excerpt = models.CharField(
         max_length=300, blank=True, null=True,
         help_text="Short summary shown on the blog list page and used as the SEO meta description if set.",
     )
+    excerpt_status = models.CharField(max_length=16, choices=GEN_STATUS_CHOICES, blank=True, null=True)
+    excerpt_source = models.CharField(max_length=16, choices=GEN_SOURCE_CHOICES, blank=True, null=True)
+    excerpt_confident = models.BooleanField(blank=True, null=True)
+    excerpt_confidence_note = models.TextField(blank=True, null=True)
+    excerpt_error = models.TextField(blank=True, null=True)
     content = CKEditor5Field('Text', config_name='extends')
     cover_image_file = VersatileImageField(upload_to="blog_covers/", blank=True, null=True)
     author_name = models.CharField(max_length=150, blank=True, null=True)

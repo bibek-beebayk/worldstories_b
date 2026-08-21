@@ -5,7 +5,9 @@ strings (title, author name, concatenated chapter text) so it's directly
 unit-testable and reusable from both a live request and a background thread
 (see ai_generation_jobs.py for the DB-touching side of the pipeline).
 """
+import html
 import logging
+import re
 from dataclasses import dataclass
 from typing import Literal, Optional
 
@@ -33,7 +35,7 @@ class _GenerationOutput(BaseModel):
 
 @dataclass
 class GenerationResult:
-    html: str
+    content: str
     source: Literal["metadata", "content"]
     confident: bool
     confidence_note: str
@@ -83,6 +85,28 @@ def _to_html(raw_text: str) -> str:
     return nh3.clean(html, tags=ALLOWED_TAGS, attributes=ALLOWED_ATTRIBUTES, link_rel=None)
 
 
+# Blog.excerpt is a plain CharField(300), not rich text — used for the excerpt
+# action instead of _to_html. Strips any markdown/HTML the model might still
+# produce despite plain-text instructions, then hard-truncates to fit the
+# field regardless of what the model actually wrote (a safety net, not the
+# primary length control — that's PromptSettings.excerpt_instructions' job).
+EXCERPT_MAX_CHARS = 300
+
+
+def _to_plain_text(raw_text: str, max_length: int = EXCERPT_MAX_CHARS) -> str:
+    # nh3 HTML-entity-escapes its output (it's meant to be re-embedded as
+    # HTML) — unescape afterward since this is going into a plain-text field,
+    # not markup, and a literal "&amp;" would otherwise show up verbatim.
+    text = nh3.clean(raw_text, tags=set(), attributes={})
+    text = html.unescape(text)
+    text = re.sub(r"[#*_`]+", "", text)  # strip common markdown emphasis/heading punctuation
+    text = re.sub(r"\s+", " ", text).strip().strip('"\'')
+    if len(text) > max_length:
+        truncated = text[: max_length - 1].rsplit(" ", 1)[0]
+        text = f"{truncated}…"
+    return text
+
+
 def _call_once(
     instructions: str,
     action: str,
@@ -90,6 +114,7 @@ def _call_once(
     author_name: Optional[str],
     content_text: Optional[str],
     model: str,
+    render_as: Literal["html", "text"] = "html",
 ) -> GenerationResult:
     """Single Anthropic API call + parse. Raises GenerationError on API
     failure or an invalid/empty response — callers own retry/fallback."""
@@ -120,8 +145,9 @@ def _call_once(
         raise GenerationError("Response was empty or failed schema validation.")
 
     source = "content" if content_text is not None else "metadata"
+    rendered = _to_plain_text(data.text) if render_as == "text" else _to_html(data.text)
     return GenerationResult(
-        html=_to_html(data.text),
+        content=rendered,
         source=source,
         confident=data.confident,
         confidence_note=data.confidence_note,
@@ -136,6 +162,7 @@ def generate(
     input_fields: list,
     content_text: Optional[str],
     model: str = MODEL_ID,
+    render_as: Literal["html", "text"] = "html",
 ) -> GenerationResult:
     """Orchestrates: no auto-retry on low confidence — a confident=False
     result is returned as-is, once; one same-mode retry on hard failure
@@ -145,12 +172,14 @@ def generate(
     left to fall back to). Raises GenerationError only if every attempt
     failed. `model` is admin-selected per action (PromptSettings.summary_model
     / retrospective_model), defaulting to MODEL_ID only for direct/test calls.
+    `render_as` picks HTML (rich-text fields like summary/retrospective) or
+    plain text (e.g. Blog.excerpt, a CharField) for the final output.
     """
     requested_content_text = content_text if "content" in input_fields else None
     errors = []
     for attempt in range(2):  # same-mode: try, then one retry
         try:
-            return _call_once(instructions, action, title, author_name, requested_content_text, model)
+            return _call_once(instructions, action, title, author_name, requested_content_text, model, render_as)
         except GenerationError as exc:
             errors.append(str(exc))
             logger.warning(
@@ -165,7 +194,7 @@ def generate(
         # once, since we have chapter text available to fall back to.
         logger.info("ai_generation falling back from metadata to content mode after repeated hard failures.")
         try:
-            return _call_once(instructions, action, title, author_name, content_text, model)
+            return _call_once(instructions, action, title, author_name, content_text, model, render_as)
         except GenerationError as exc:
             errors.append(str(exc))
 

@@ -2,7 +2,7 @@ from django.conf import settings
 from django.db import models
 import uuid
 
-from apps.story.models import Story, Chapter, Audio
+from apps.story.models import Story, Chapter, Audio, Blog
 
 
 class ReadingProgress(models.Model):
@@ -185,6 +185,13 @@ class AnalyticsEvent(models.Model):
         blank=True,
         related_name="analytics_events",
     )
+    blog = models.ForeignKey(
+        Blog,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="analytics_events",
+    )
     duration_seconds = models.FloatField(default=0)
     value = models.FloatField(default=0)
     metadata = models.JSONField(default=dict, blank=True)
@@ -196,6 +203,7 @@ class AnalyticsEvent(models.Model):
             models.Index(fields=["visitor_id", "created_at"], name="stats_visitor_created_idx"),
             models.Index(fields=["user", "created_at"], name="stats_user_created_idx"),
             models.Index(fields=["story", "event_type"], name="stats_story_event_idx"),
+            models.Index(fields=["blog", "event_type"], name="stats_blog_event_idx"),
         ]
         ordering = ["-created_at"]
 

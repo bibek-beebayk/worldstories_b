@@ -2,7 +2,7 @@ import json
 
 from rest_framework import serializers
 
-from apps.story.models import Chapter, Audio, Story
+from apps.story.models import Chapter, Audio, Story, Blog
 from apps.stats.models import AnalyticsEvent, ReadingProgress, AudioReadingProgress, FileReadingProgress
 
 
@@ -146,6 +146,7 @@ class AnalyticsEventWriteSerializer(serializers.Serializer):
     visitor_id = serializers.CharField(max_length=64)
     session_id = serializers.CharField(max_length=64, required=False, allow_blank=True)
     story_slug = serializers.SlugField(required=False, allow_blank=True)
+    blog_slug = serializers.SlugField(required=False, allow_blank=True)
     duration_seconds = serializers.FloatField(required=False, min_value=0, max_value=86400)
     value = serializers.FloatField(required=False)
     metadata = serializers.JSONField(required=False)
@@ -163,11 +164,16 @@ class AnalyticsEventWriteSerializer(serializers.Serializer):
         story = None
         if story_slug:
             story = Story.objects.published().filter(slug=story_slug).first()
+        blog_slug = validated_data.pop("blog_slug", "")
+        blog = None
+        if blog_slug:
+            blog = Blog.objects.published().filter(slug=blog_slug).first()
         event, _ = AnalyticsEvent.objects.get_or_create(
             event_id=validated_data.pop("event_id"),
             defaults={
                 **validated_data,
                 "story": story,
+                "blog": blog,
                 "user": request.user if request.user.is_authenticated else None,
             },
         )
