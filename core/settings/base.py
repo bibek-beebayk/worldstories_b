@@ -171,13 +171,14 @@ REST_FRAMEWORK = {
     ],
     "DEFAULT_PAGINATION_CLASS": "core.libs.pagination.PageNumberPagination",
     "PAGE_SIZE": 20,
-    "DEFAULT_THROTTLE_CLASSES": [
-        "core.libs.throttling.TrustedInternalOrAnonRateThrottle",
-        "rest_framework.throttling.UserRateThrottle",
-    ],
+    # General anon/user throttling removed — it was rate-limiting every
+    # visitor off one shared bucket in production (SSR-originated requests
+    # all share one IP identity server-side, so the whole site's traffic
+    # counted against a single anon quota). The narrower login/admin-login
+    # brute-force throttle below is untouched — it's applied directly via
+    # ScopedRateThrottle in apps/users/api.py, not through this list.
+    "DEFAULT_THROTTLE_CLASSES": [],
     "DEFAULT_THROTTLE_RATES": {
-        "anon": "100/min",
-        "user": "300/min",
         # Tighter, IP-keyed limit applied only to the login/admin-login
         # actions via ScopedRateThrottle — see apps/users/api.py.
         "login": "5/min",
