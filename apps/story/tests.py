@@ -22,7 +22,7 @@ from apps.story.ai_generation_jobs import _concatenated_chapter_text, run_genera
 from apps.story.epub_import import EpubParseError, extract_chapters
 from apps.story.excerpts import _excerpt_from_text
 from apps.story.epub_import_jobs import run_epub_import
-from apps.story.models import Audio, Author, Blog, Chapter, EpubImportJob, Genre, PromptSettings, Story
+from apps.story.models import Audio, Author, Blog, Chapter, EpubImportJob, Favorite, Genre, PromptSettings, Story
 from apps.story.serializers import AudioAdminSerializer, StoryAdminSerializer, SubmissionSerializer
 from apps.story import reading_time
 from apps.users.models import User
@@ -671,6 +671,52 @@ class BlogPublicApiTests(APITestCase):
         response = self.client.get("/api/blog/post/")
 
         self.assertIsNone(response.data["linked_story"])
+
+
+class BecauseFinishedApiTests(APITestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(
+            email="finisher@example.com", username="finisher", password="test-password"
+        )
+        self.genre = Genre.objects.create(name="Mystery")
+        self.other_genre = Genre.objects.create(name="Romance")
+
+        self.finished_story = Story.objects.create(
+            title="The Finished Book", slug="the-finished-book", is_published=True
+        )
+        self.finished_story.genres.add(self.genre)
+
+        self.same_genre_story = Story.objects.create(
+            title="Another Mystery", slug="another-mystery", is_published=True
+        )
+        self.same_genre_story.genres.add(self.genre)
+
+        self.favorited_same_genre_story = Story.objects.create(
+            title="Already Read Mystery", slug="already-read-mystery", is_published=True
+        )
+        self.favorited_same_genre_story.genres.add(self.genre)
+
+        self.unrelated_story = Story.objects.create(
+            title="Unrelated Romance", slug="unrelated-romance", is_published=True
+        )
+        self.unrelated_story.genres.add(self.other_genre)
+
+    def test_requires_authentication(self):
+        response = self.client.get(reverse("story-because-finished", args=[self.finished_story.slug]))
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_recommends_stories_anchored_to_the_finished_story(self):
+        Favorite.objects.create(story=self.favorited_same_genre_story, user=self.user)
+        self.client.force_authenticate(self.user)
+
+        response = self.client.get(reverse("story-because-finished", args=[self.finished_story.slug]))
+
+        self.assertEqual(response.status_code, 200)
+        slugs = [story["slug"] for story in response.data]
+        self.assertIn(self.same_genre_story.slug, slugs)
+        self.assertNotIn(self.finished_story.slug, slugs)
+        self.assertNotIn(self.favorited_same_genre_story.slug, slugs)
 
 
 class PublicAuthorApiTests(APITestCase):

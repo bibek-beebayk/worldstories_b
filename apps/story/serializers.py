@@ -230,6 +230,51 @@ class AudioListSerializer(serializers.ModelSerializer):
         fields = ["id", "title", "slug", "order"]
 
 
+def similar_stories_candidates(story):
+    """Shared 'similar to `story`' candidate query — genre/author/
+    story_type/language overlap, excluding its own translation group. Used
+    by StoryDetailSerializer.get_similar_stories (generic, no
+    personalization) and apps.users.recommendations.recommend_because_finished
+    (personalized, re-ranked toward a specific user's taste)."""
+    genre_ids = list(story.genres.values_list("id", flat=True))
+    matching = Q(story_type=story.story_type) | Q(language=story.language)
+    if genre_ids:
+        matching |= Q(genres__id__in=genre_ids)
+    if story.author_id:
+        matching |= Q(author_id=story.author_id)
+
+    candidates = Story.objects.published().select_related("author").filter(matching).exclude(
+        translation_group=story.translation_group
+    )
+    candidates = with_preferred_translation_only(candidates).annotate(
+        shared_genres=Count(
+            "genres",
+            filter=Q(genres__id__in=genre_ids),
+            distinct=True,
+        ),
+        same_author=Case(
+            *(
+                [When(author_id=story.author_id, then=Value(1))]
+                if story.author_id
+                else []
+            ),
+            default=Value(0),
+            output_field=IntegerField(),
+        ),
+        same_story_type=Case(
+            When(story_type=story.story_type, then=Value(1)),
+            default=Value(0),
+            output_field=IntegerField(),
+        ),
+        same_language=Case(
+            When(language=story.language, then=Value(1)),
+            default=Value(0),
+            output_field=IntegerField(),
+        ),
+    )
+    return candidates, genre_ids
+
+
 class StoryDetailSerializer(serializers.ModelSerializer):
     cover_image = serializers.SerializerMethodField()
     pdf_file = serializers.SerializerMethodField()
@@ -295,42 +340,8 @@ class StoryDetailSerializer(serializers.ModelSerializer):
         ]
 
     def get_similar_stories(self, obj):
-        genre_ids = list(obj.genres.values_list("id", flat=True))
-        matching = Q(story_type=obj.story_type) | Q(language=obj.language)
-        if genre_ids:
-            matching |= Q(genres__id__in=genre_ids)
-        if obj.author_id:
-            matching |= Q(author_id=obj.author_id)
-
-        candidates = Story.objects.published().select_related("author").filter(matching).exclude(
-            translation_group=obj.translation_group
-        )
-        candidates = with_preferred_translation_only(candidates).annotate(
-            shared_genres=Count(
-                "genres",
-                filter=Q(genres__id__in=genre_ids),
-                distinct=True,
-            ),
-            same_author=Case(
-                *(
-                    [When(author_id=obj.author_id, then=Value(1))]
-                    if obj.author_id
-                    else []
-                ),
-                default=Value(0),
-                output_field=IntegerField(),
-            ),
-            same_story_type=Case(
-                When(story_type=obj.story_type, then=Value(1)),
-                default=Value(0),
-                output_field=IntegerField(),
-            ),
-            same_language=Case(
-                When(language=obj.language, then=Value(1)),
-                default=Value(0),
-                output_field=IntegerField(),
-            ),
-        ).order_by(
+        candidates, _ = similar_stories_candidates(obj)
+        candidates = candidates.order_by(
             "-shared_genres",
             "-same_author",
             "-same_story_type",

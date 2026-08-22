@@ -26,6 +26,7 @@ from collections import Counter
 from django.db.models import Count, Q
 
 from apps.story.models import Favorite, Genre, Review, Story
+from apps.story.serializers import similar_stories_candidates
 from apps.stats.models import (
     AudioReadingProgress,
     ChapterReadingProgress,
@@ -49,6 +50,7 @@ SUFFICIENT_DATA_THRESHOLD = 3
 MAX_SIMILAR_USERS = 20
 
 RECOMMENDATION_LIMIT = 12
+BECAUSE_FINISHED_LIMIT = 8
 
 # Heuristic weights for blending the two warm-path signals — a matching
 # genre counts for more than one similar user having read something, but
@@ -191,3 +193,40 @@ def recommend_stories_for(user, limit=RECOMMENDATION_LIMIT):
     return _blended_recommendations(
         user, preferred_genre_ids, engaged_story_ids, exclude_q, limit
     )
+
+
+def recommend_because_finished(user, story, limit=BECAUSE_FINISHED_LIMIT):
+    """"Because you finished X" — get_similar_stories's candidate pool for
+    `story`, re-ranked toward this user's own taste (preferred_genres +
+    genres of what they've engaged with) and excluding anything they've
+    already engaged with. Always primarily ordered by shared_genres (match
+    with X itself) so the rail stays recognizably anchored to X; the user's
+    own taste only breaks ties among similarly-matched candidates, unlike
+    recommend_stories_for's collaborative signal, which has no guaranteed
+    relationship to X and would risk drowning out the anchor."""
+    candidates, _ = similar_stories_candidates(story)
+    candidates = candidates.exclude(_already_engaged_q(user))
+
+    preferred_genre_ids = set(user.preferred_genres.values_list("id", flat=True))
+    engaged_story_ids = {
+        story_id for _uid, story_id in _engagement_pairs(user_ids=[user.pk])
+    }
+    implicit_genre_ids = set(
+        Genre.objects.filter(stories__id__in=engaged_story_ids).values_list("id", flat=True)
+    )
+    user_genre_ids = preferred_genre_ids | implicit_genre_ids
+
+    return candidates.annotate(
+        user_genre_match=Count(
+            "genres", filter=Q(genres__id__in=user_genre_ids), distinct=True
+        ),
+    ).order_by(
+        "-shared_genres",
+        "-user_genre_match",
+        "-same_author",
+        "-same_story_type",
+        "-same_language",
+        "-rating",
+        "-views",
+        "-id",
+    )[:limit]

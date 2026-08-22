@@ -21,6 +21,7 @@ from rest_framework.filters import SearchFilter
 from apps.story.filters import StoryFilter
 from apps.stats.models import ReadingProgress, AudioReadingProgress
 from apps.users.models import User
+from apps.users.recommendations import recommend_because_finished
 from .models import (
     Genre,
     Category,
@@ -245,6 +246,8 @@ class StoryViewSet(ReadOnlyModelViewSet):
             if self.action == "reviews" and self.request.method == "GET":
                 return []
             return [IsAuthenticated()]
+        if self.action == "because_finished":
+            return [IsAuthenticated()]
         return super().get_permissions()
 
     def _update_story_rating(self, story):
@@ -403,6 +406,16 @@ class StoryViewSet(ReadOnlyModelViewSet):
 
         Favorite.objects.filter(story=story, user=request.user).delete()
         return Response(self._favorite_payload(story, request.user), status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["get"], url_path="because-finished")
+    def because_finished(self, request, slug=None):
+        """Personalized "Because you finished X" rail, seeded by this
+        story. Distinct from similar_stories (generic, no personalization)
+        — see apps.users.recommendations.recommend_because_finished."""
+        story = self.get_object()
+        stories = recommend_because_finished(request.user, story)
+        serializer = StoryListSerializer(stories, many=True, context={"request": request})
+        return Response(serializer.data)
 
     @action(detail=True, methods=["get"], url_path="pdf-stream")
     def pdf_stream(self, request, slug=None):
