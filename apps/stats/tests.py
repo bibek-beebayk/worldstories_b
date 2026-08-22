@@ -42,6 +42,24 @@ class AnalyticsEventApiTests(APITestCase):
         self.assertIsNone(event.user)
         self.assertEqual(event.story, self.story)
 
+    def test_referral_source_metadata_round_trips_untouched(self):
+        event_id = str(uuid4())
+
+        response = self.client.post(
+            reverse("analytics-events"),
+            {
+                "event_id": event_id,
+                "event_type": AnalyticsEvent.EVENT_VISIT,
+                "visitor_id": "share-click-visitor",
+                "metadata": {"path": "/story/tracked-story", "referral_source": "facebook"},
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        event = AnalyticsEvent.objects.get(event_id=event_id)
+        self.assertEqual(event.metadata.get("referral_source"), "facebook")
+
     def test_authenticated_event_uses_the_request_user(self):
         user = User.objects.create_user(
             email="reader@example.com", username="reader", password="test-password"
@@ -134,6 +152,7 @@ class AdminAudienceAnalyticsApiTests(APITestCase):
             event_type=AnalyticsEvent.EVENT_VISIT,
             visitor_id="returning-browser",
             session_id="session-one",
+            metadata={"referral_source": "facebook"},
         )
         AnalyticsEvent.objects.filter(pk=first_visit.pk).update(
             created_at=timezone.now() - timedelta(days=1)
@@ -142,6 +161,15 @@ class AdminAudienceAnalyticsApiTests(APITestCase):
             event_type=AnalyticsEvent.EVENT_VISIT,
             visitor_id="returning-browser",
             session_id="session-two",
+            metadata={"referral_source": "twitter"},
+        )
+        # Same visitor_id/day as session-two — a repeat identity, so it's a
+        # no-op for visitor/returning-visitor counts — added purely to
+        # exercise the "direct" fallback for a visit with no referral_source.
+        AnalyticsEvent.objects.create(
+            event_type=AnalyticsEvent.EVENT_VISIT,
+            visitor_id="returning-browser",
+            session_id="session-two-direct",
         )
         AnalyticsEvent.objects.create(
             event_type=AnalyticsEvent.EVENT_AD_IMPRESSION,
@@ -233,6 +261,10 @@ class AdminAudienceAnalyticsApiTests(APITestCase):
         content_types = {row["content_type"]: row["count"] for row in response.data["ad_impressions_by_content_type"]}
         self.assertEqual(content_types.get("blog"), 1)
         self.assertEqual(content_types.get("unknown"), 1)
+        referral_sources = {row["referral_source"]: row["count"] for row in response.data["referral_sources"]}
+        self.assertEqual(referral_sources.get("facebook"), 1)
+        self.assertEqual(referral_sources.get("twitter"), 1)
+        self.assertEqual(referral_sources.get("direct"), 1)
 
     def test_non_superuser_is_forbidden(self):
         self.client.force_authenticate(self.reader)

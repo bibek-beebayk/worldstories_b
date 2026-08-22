@@ -477,6 +477,12 @@ class AdminAnalyticsAudienceAPIView(APIView):
             .annotate(count=Count("id"))
             .order_by("-count")
         )
+        referral_sources = list(
+            events.filter(event_type=AnalyticsEvent.EVENT_VISIT)
+            .values("metadata__referral_source")
+            .annotate(count=Count("id"))
+            .order_by("-count")
+        )
         top_downloads = list(
             events.filter(event_type=AnalyticsEvent.EVENT_DOWNLOAD, story_id__isnull=False)
             .values("story_id", "story__title", "story__slug")
@@ -566,6 +572,13 @@ class AdminAnalyticsAudienceAPIView(APIView):
                         "count": row["count"],
                     }
                     for row in ad_impressions_by_content_type
+                ],
+                "referral_sources": [
+                    {
+                        "referral_source": row["metadata__referral_source"] or "direct",
+                        "count": row["count"],
+                    }
+                    for row in referral_sources
                 ],
                 "top_downloads": [
                     {
