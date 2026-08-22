@@ -6,7 +6,7 @@ from django.urls import reverse
 from django.utils import timezone
 from rest_framework.test import APITestCase
 
-from apps.story.models import Blog, Story
+from apps.story.models import Audio, Blog, Story
 from apps.users.models import User
 
 from .models import AnalyticsEvent
@@ -290,6 +290,27 @@ class AdminContentAnalyticsApiTests(APITestCase):
             title="Draft", slug="draft-post", content="<p>x</p>", is_published=False
         )
 
+        self.plain_story = Story.objects.create(
+            title="Plain Story", slug="plain-story", is_published=True
+        )
+        self.audiobook_story = Story.objects.create(
+            title="Audiobook Story", slug="audiobook-story", is_published=True
+        )
+        Audio.objects.create(
+            story=self.audiobook_story,
+            title="Chapter 1",
+            slug="chapter-1",
+            order=1,
+            audio_file="story_audios/fake.mp3",
+        )
+        Story.objects.create(
+            title="Quick Read Story",
+            slug="quick-read-story",
+            is_published=True,
+            summary="<p>A summary</p>",
+        )
+        Story.objects.create(title="Unpublished Story", slug="unpublished-story", is_published=False)
+
     def test_superuser_receives_blog_content_analytics(self):
         self.client.force_authenticate(self.admin)
 
@@ -298,3 +319,6 @@ class AdminContentAnalyticsApiTests(APITestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data["blog_posts_count"], 2)
         self.assertGreaterEqual(sum(row["count"] for row in response.data["blog_publishing_over_time"]), 2)
+        self.assertEqual(response.data["stories_count"], 3)
+        self.assertEqual(response.data["audiobooks_count"], 1)
+        self.assertEqual(response.data["quick_read_count"], 1)

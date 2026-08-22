@@ -100,6 +100,14 @@ class AdminAnalyticsContentAPIView(APIView):
             .order_by("day")
         )
         blog_posts_count = Blog.objects.published().count()
+        stories_count = Story.objects.published().count()
+        # Same "has_audio"/"has_summary" semantics as StoryFilter (filters.py)
+        # — a story counts as an audiobook/Quick Read if it has narration
+        # audio / a summary, matching how those are surfaced to readers.
+        audiobooks_count = Story.objects.published().filter(audios__isnull=False).distinct().count()
+        quick_read_count = (
+            Story.objects.published().exclude(Q(summary__isnull=True) | Q(summary__exact="")).count()
+        )
 
         return Response(
             {
@@ -131,6 +139,9 @@ class AdminAnalyticsContentAPIView(APIView):
                     {"day": row["day"], "count": row["count"]} for row in blog_publishing_over_time
                 ],
                 "blog_posts_count": blog_posts_count,
+                "stories_count": stories_count,
+                "audiobooks_count": audiobooks_count,
+                "quick_read_count": quick_read_count,
             }
         )
 
