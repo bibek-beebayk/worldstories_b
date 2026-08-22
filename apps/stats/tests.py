@@ -1,7 +1,8 @@
-from datetime import timedelta
+from datetime import date, timedelta
 from uuid import uuid4
 
 from django.core.cache import cache
+from django.test import SimpleTestCase
 from django.urls import reverse
 from django.utils import timezone
 from rest_framework.test import APITestCase
@@ -10,6 +11,7 @@ from apps.story.models import Audio, Blog, Story
 from apps.users.models import User
 
 from .models import AnalyticsEvent
+from .streaks import compute_streak
 
 
 class AnalyticsEventApiTests(APITestCase):
@@ -322,3 +324,44 @@ class AdminContentAnalyticsApiTests(APITestCase):
         self.assertEqual(response.data["stories_count"], 3)
         self.assertEqual(response.data["audiobooks_count"], 1)
         self.assertEqual(response.data["quick_read_count"], 1)
+
+
+class ComputeStreakTests(SimpleTestCase):
+    def test_empty_activity_is_zero_zero(self):
+        self.assertEqual(compute_streak(set(), date(2026, 8, 22)), (0, 0))
+
+    def test_activity_today_only(self):
+        today = date(2026, 8, 22)
+        self.assertEqual(compute_streak({today}, today), (1, 1))
+
+    def test_activity_yesterday_only_is_still_alive(self):
+        today = date(2026, 8, 22)
+        yesterday = today - timedelta(days=1)
+        self.assertEqual(compute_streak({yesterday}, today), (1, 1))
+
+    def test_activity_two_days_ago_is_broken_but_longest_recorded(self):
+        today = date(2026, 8, 22)
+        two_days_ago = today - timedelta(days=2)
+        self.assertEqual(compute_streak({two_days_ago}, today), (0, 1))
+
+    def test_consecutive_run_ending_today(self):
+        today = date(2026, 8, 22)
+        run = {today - timedelta(days=offset) for offset in range(5)}
+        self.assertEqual(compute_streak(run, today), (5, 5))
+
+    def test_consecutive_run_ending_yesterday_is_still_alive(self):
+        today = date(2026, 8, 22)
+        run = {today - timedelta(days=offset) for offset in range(1, 6)}
+        self.assertEqual(compute_streak(run, today), (5, 5))
+
+    def test_longest_and_current_are_independent(self):
+        today = date(2026, 8, 22)
+        # A 5-day run last month, then a gap, then a 2-day run ending yesterday.
+        old_run = {date(2026, 7, 1) + timedelta(days=offset) for offset in range(5)}
+        recent_run = {today - timedelta(days=offset) for offset in range(1, 3)}
+        activity_dates = old_run | recent_run
+
+        current_streak, longest_streak = compute_streak(activity_dates, today)
+
+        self.assertEqual(current_streak, 2)
+        self.assertEqual(longest_streak, 5)

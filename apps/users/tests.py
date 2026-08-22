@@ -1,13 +1,16 @@
+from datetime import timedelta
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.core.cache import cache
 from django.test import override_settings
 from django.urls import reverse
+from django.utils import timezone
 from rest_framework.test import APITestCase
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from apps.stats.models import (
+    AnalyticsEvent,
     AudioReadingProgress,
     ChapterReadingProgress,
     FileReadingProgress,
@@ -180,6 +183,58 @@ class ProfileInsightsApiTests(APITestCase):
         self.assertEqual(response.data["genres"], [{"name": "Fantasy", "value": 1}])
         self.assertEqual(response.data["activity"][-1]["reading"], 2)
         self.assertEqual(response.data["activity"][-1]["listening"], 1)
+
+
+class ReadingStreakApiTests(APITestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(
+            email="streaker@example.com",
+            username="streaker",
+            password="test-password",
+        )
+
+    def _create_event_on(self, day_offset, event_type=AnalyticsEvent.EVENT_READING_SESSION):
+        event = AnalyticsEvent.objects.create(
+            event_type=event_type,
+            user=self.user,
+            visitor_id="streaker-browser",
+        )
+        AnalyticsEvent.objects.filter(pk=event.pk).update(
+            created_at=timezone.now() - timedelta(days=day_offset)
+        )
+        return event
+
+    def test_reading_streak_requires_authentication(self):
+        response = self.client.get(reverse("auth-reading-streak"))
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_reading_streak_computes_from_analytics_events(self):
+        # A 3-day consecutive run ending yesterday (today has no activity
+        # yet, so the streak should still read as alive), plus an older,
+        # disconnected listening-session day that only affects longest_streak
+        # if it were part of a longer run — here it's isolated, so it
+        # shouldn't change either number.
+        self._create_event_on(3)
+        self._create_event_on(2)
+        self._create_event_on(1, event_type=AnalyticsEvent.EVENT_LISTENING_SESSION)
+        self._create_event_on(10)
+        self.client.force_authenticate(self.user)
+
+        response = self.client.get(reverse("auth-reading-streak"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["current_streak"], 3)
+        self.assertEqual(response.data["longest_streak"], 3)
+
+    def test_reading_streak_is_zero_with_no_activity(self):
+        self.client.force_authenticate(self.user)
+
+        response = self.client.get(reverse("auth-reading-streak"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["current_streak"], 0)
+        self.assertEqual(response.data["longest_streak"], 0)
 
 
 class UserAdminApiTests(APITestCase):

@@ -23,11 +23,13 @@ from apps.story.api import IsSuperUser
 from apps.story.models import Favorite, Review, Story
 from apps.story.serializers import StoryListSerializer
 from apps.stats.models import (
+    AnalyticsEvent,
     ReadingProgress,
     ChapterReadingProgress,
     AudioReadingProgress,
     FileReadingProgress,
 )
+from apps.stats.streaks import compute_streak
 from .serializers import (
     RegisterSerializer,
     LoginSerializer,
@@ -87,6 +89,7 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
             "library_reviews",
             "library_recommendations",
             "profile_insights",
+            "reading_streak",
             "check_username",
         }:
             from rest_framework.permissions import IsAuthenticated
@@ -452,6 +455,21 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
                 "genres": genres,
             }
         )
+
+    @action(detail=False, methods=["get"], url_path="reading-streak")
+    def reading_streak(self, request):
+        """Consecutive-day reading/listening streak. Derived from
+        AnalyticsEvent (an append-only per-session log with a real
+        created_at) rather than the ReadingProgress family (which only
+        remembers the last day touched, not every day — see
+        apps/stats/streaks.py)."""
+        created_ats = AnalyticsEvent.objects.filter(
+            user=request.user,
+            event_type__in=[AnalyticsEvent.EVENT_READING_SESSION, AnalyticsEvent.EVENT_LISTENING_SESSION],
+        ).values_list("created_at", flat=True)
+        activity_dates = {timezone.localtime(created_at).date() for created_at in created_ats}
+        current_streak, longest_streak = compute_streak(activity_dates, timezone.localdate())
+        return Response({"current_streak": current_streak, "longest_streak": longest_streak})
 
     @action(detail=False, methods=["get"], url_path="library/continue-reading")
     def library_continue_reading(self, request):
