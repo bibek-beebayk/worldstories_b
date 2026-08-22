@@ -176,6 +176,7 @@ class ContinueReadingItemSerializer(serializers.Serializer):
     chapter_progress = serializers.FloatField()
     overall_progress = serializers.FloatField()
     updated_at = serializers.DateTimeField()
+    excerpt = serializers.CharField(allow_blank=True)
 
 
 class ContinueListeningItemSerializer(serializers.Serializer):

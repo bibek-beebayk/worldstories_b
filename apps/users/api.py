@@ -30,6 +30,7 @@ from apps.stats.models import (
     FileReadingProgress,
 )
 from apps.stats.streaks import compute_streak
+from apps.story.excerpts import excerpt_at_progress
 from .serializers import (
     RegisterSerializer,
     LoginSerializer,
@@ -507,6 +508,7 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
                     "chapter_progress": max(0.0, min(1.0, item.progress)),
                     "overall_progress": round(overall_progress, 4),
                     "updated_at": item.updated_at,
+                    "excerpt": excerpt_at_progress(item.chapter, item.progress) if item.chapter else "",
                 }
             )
 

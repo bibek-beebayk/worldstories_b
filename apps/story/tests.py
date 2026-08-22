@@ -20,6 +20,7 @@ from core.libs.throttling import TrustedInternalOrAnonRateThrottle
 from apps.story.ai_generation import GenerationError, _GenerationOutput, _to_plain_text, generate
 from apps.story.ai_generation_jobs import _concatenated_chapter_text, run_generate_blog_excerpt, run_generate_field
 from apps.story.epub_import import EpubParseError, extract_chapters
+from apps.story.excerpts import _excerpt_from_text
 from apps.story.epub_import_jobs import run_epub_import
 from apps.story.models import Audio, Author, Blog, Chapter, EpubImportJob, Genre, PromptSettings, Story
 from apps.story.serializers import AudioAdminSerializer, StoryAdminSerializer, SubmissionSerializer
@@ -1898,3 +1899,55 @@ class TrustedInternalOrAnonRateThrottleTests(SimpleTestCase):
 
         mock_super.assert_called_once_with(request, None)
         self.assertEqual(result, "sentinel")
+
+
+class ExcerptFromTextTests(SimpleTestCase):
+    LONG_TEXT = (
+        "Alice was beginning to get very tired of sitting by her sister on the "
+        "bank, and of having nothing to do: once or twice she had peeped into "
+        "the book her sister was reading, but it had no pictures or "
+        "conversations in it, and what is the use of a book, thought Alice, "
+        "without pictures or conversations."
+    )
+
+    def test_empty_text_returns_empty_string(self):
+        self.assertEqual(_excerpt_from_text("", 0.5), "")
+
+    def test_progress_zero_starts_at_beginning_with_no_leading_ellipsis(self):
+        excerpt = _excerpt_from_text(self.LONG_TEXT, 0.0)
+
+        self.assertTrue(excerpt.startswith("Alice was beginning"))
+        self.assertFalse(excerpt.startswith("…"))
+
+    def test_progress_midway_starts_mid_text_with_leading_ellipsis(self):
+        excerpt = _excerpt_from_text(self.LONG_TEXT, 0.5)
+
+        self.assertTrue(excerpt.startswith("…"))
+        self.assertNotEqual(excerpt, _excerpt_from_text(self.LONG_TEXT, 0.0))
+
+    def test_short_text_returns_whole_text_with_no_ellipses(self):
+        short_text = "One two three four five."
+
+        excerpt = _excerpt_from_text(short_text, 0.0)
+
+        self.assertEqual(excerpt, "One two three four five.")
+
+    def test_progress_at_end_falls_back_to_tail_words(self):
+        excerpt = _excerpt_from_text(self.LONG_TEXT, 1.0)
+
+        self.assertTrue(excerpt.startswith("…"))
+        self.assertTrue(excerpt.endswith("conversations."))
+
+    def test_snippet_reaching_end_of_text_has_no_trailing_ellipsis(self):
+        words = " ".join(f"word{i}" for i in range(25))
+
+        excerpt = _excerpt_from_text(words, 0.5, word_count=30)
+
+        self.assertFalse(excerpt.endswith("…"))
+
+    def test_snippet_not_reaching_end_of_text_has_trailing_ellipsis(self):
+        words = " ".join(f"word{i}" for i in range(100))
+
+        excerpt = _excerpt_from_text(words, 0.0, word_count=10)
+
+        self.assertTrue(excerpt.endswith("…"))

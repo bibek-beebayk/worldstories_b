@@ -237,6 +237,44 @@ class ReadingStreakApiTests(APITestCase):
         self.assertEqual(response.data["longest_streak"], 0)
 
 
+class LibraryContinueReadingApiTests(APITestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(
+            email="reader2@example.com", username="reader2", password="test-password"
+        )
+        self.story = Story.objects.create(
+            title="A Read Book", slug="a-read-book-continue", is_published=True
+        )
+        self.chapter = Chapter.objects.create(
+            story=self.story,
+            title="Chapter One",
+            slug="chapter-one",
+            order=1,
+            content=(
+                "<p>Alice was beginning to get very tired of sitting by her sister "
+                "on the bank, and of having nothing to do: once or twice she had "
+                "peeped into the book her sister was reading, but it had no "
+                "pictures or conversations in it.</p>"
+            ),
+        )
+        ReadingProgress.objects.create(
+            user=self.user, story=self.story, chapter=self.chapter, progress=0.5
+        )
+        ChapterReadingProgress.objects.create(
+            user=self.user, story=self.story, chapter=self.chapter, progress=0.5
+        )
+
+    def test_continue_reading_includes_a_real_excerpt(self):
+        self.client.force_authenticate(self.user)
+
+        response = self.client.get(reverse("auth-library-continue-reading"))
+
+        self.assertEqual(response.status_code, 200)
+        item = response.data["results"][0]
+        self.assertTrue(item["excerpt"])
+        self.assertNotIn("<p>", item["excerpt"])
+
+
 class UserAdminApiTests(APITestCase):
     def setUp(self):
         self.superuser = User.objects.create_user(
