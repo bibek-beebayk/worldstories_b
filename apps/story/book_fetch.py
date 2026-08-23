@@ -10,7 +10,7 @@ from typing import List, Optional
 
 import anthropic
 from django.conf import settings
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError as PydanticValidationError
 
 logger = logging.getLogger(__name__)
 
@@ -95,10 +95,18 @@ def _build_user_message(existing_titles_csv: str, count: int) -> str:
 
 
 def _max_tokens_for(count: int) -> int:
-    """~1000 tokens/record covers a full multi-field book record (including
-    an 80-100 word synopsis) with headroom; capped well under the point
-    where a single non-streaming call would risk truncating."""
-    return min(16_000, 1_500 + count * 1_000)
+    """Generous per-record budget — a full multi-field record (80-100 word
+    synopsis, three link fields, genres/categories, etc.) runs meaningfully
+    higher than plain text alone once JSON structure/escaping is counted, and
+    a response that runs out of budget mid-record comes back as truncated,
+    invalid JSON (caught as BookFetchError below) rather than a clean error,
+    so this errs generous. Capped at 20,000 — anthropic's Python SDK requires
+    streaming above ~21,333 tokens for claude-sonnet-5 (no per-model
+    non-streaming cap is registered for it, only the sliding time-based one:
+    see anthropic._base_client.BaseClient._calculate_nonstreaming_timeout),
+    so this stays comfortably under that without switching this call to
+    streaming."""
+    return min(20_000, 3_000 + count * 1_500)
 
 
 def fetch_books(existing_titles_csv: str, count: int, instructions: str, model: str = MODEL_ID) -> List[_BookRecord]:
@@ -126,6 +134,15 @@ def fetch_books(existing_titles_csv: str, count: int, instructions: str, model: 
         raise BookFetchError(f"Anthropic API error ({exc.status_code}): {exc}") from exc
     except anthropic.APIConnectionError as exc:
         raise BookFetchError(f"Network error calling Anthropic: {exc}") from exc
+    except PydanticValidationError as exc:
+        # The SDK's own messages.parse() raises this directly (not wrapped
+        # in an anthropic.* exception) when the response text isn't valid
+        # JSON for the schema — in practice this means the response was cut
+        # off mid-generation because it hit max_tokens before finishing.
+        # Requesting fewer books at once is the actionable fix.
+        raise BookFetchError(
+            f"Claude's response was truncated or malformed (try a smaller count): {exc}"
+        ) from exc
 
     data = response.parsed_output
     if data is None or not data.books:

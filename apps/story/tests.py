@@ -14,6 +14,7 @@ from rest_framework.test import APITestCase
 from storages.backends.s3 import S3Storage
 
 import anthropic
+from pydantic import ValidationError as PydanticValidationError
 
 from apps.story.api import StoryViewSet, open_s3_audio_stream
 from apps.story.ai_generation import GenerationError, _GenerationOutput, _to_plain_text, generate
@@ -2309,9 +2310,17 @@ class BookFetchPromptLogicTests(SimpleTestCase):
                 fetch_books("title,author\n", 5, "instructions")
 
     def test_max_tokens_scales_with_count_but_stays_capped(self):
-        self.assertEqual(_max_tokens_for(1), 2_500)
-        self.assertEqual(_max_tokens_for(14), 15_500)
-        self.assertEqual(_max_tokens_for(100), 16_000)
+        self.assertEqual(_max_tokens_for(1), 4_500)
+        self.assertEqual(_max_tokens_for(14), 20_000)
+        self.assertEqual(_max_tokens_for(100), 20_000)
+
+    def test_truncated_json_response_raises_book_fetch_error(self):
+        with patch("apps.story.book_fetch._client") as mock_client:
+            mock_client.return_value.messages.parse.side_effect = PydanticValidationError.from_exception_data(
+                "_BookFetchOutput", []
+            )
+            with self.assertRaises(BookFetchError):
+                fetch_books("title,author\n", 5, "instructions")
 
 
 class RunBookFetchTests(TransactionTestCase):
