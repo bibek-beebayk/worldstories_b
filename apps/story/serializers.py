@@ -20,6 +20,7 @@ from .models import (
     EpubImportJob,
     PromptSettings,
     Blog,
+    StoryQueue,
     published_story_q,
     with_preferred_translation_only,
 )
@@ -665,6 +666,7 @@ class StoryAdminSerializer(serializers.ModelSerializer):
             "retrospective_error",
             "story_type",
             "language",
+            "country",
             "translations",
             "author",
             "submitted_by",
@@ -1184,3 +1186,54 @@ class SubmissionAdminSerializer(serializers.ModelSerializer):
             return None
         request = self.context.get("request")
         return request.build_absolute_uri(obj.epub_file.url) if request else obj.epub_file.url
+
+
+class StoryQueueSerializer(serializers.ModelSerializer):
+    genres = serializers.PrimaryKeyRelatedField(queryset=Genre.objects.all(), many=True, required=False)
+    categories = serializers.PrimaryKeyRelatedField(queryset=Category.objects.all(), many=True, required=False)
+    published_date_label = serializers.SerializerMethodField(read_only=True)
+
+    class Meta:
+        model = StoryQueue
+        fields = [
+            "id",
+            "title",
+            "author_name",
+            "about",
+            "story_type",
+            "country",
+            "genres",
+            "categories",
+            "original_published_year",
+            "original_published_month",
+            "original_published_day",
+            "published_date_label",
+            "epub_link",
+            "pdf_link",
+            "cover_image_link",
+            "is_added",
+            "added_story",
+            "created_at",
+        ]
+        read_only_fields = ["is_added", "added_story", "created_at"]
+
+    def get_published_date_label(self, obj):
+        return obj.published_date_display()
+
+    def validate(self, attrs):
+        # Same "only meaningful in combination" rule as StoryAdminSerializer
+        # — a day without a month, or a month without a year, can't be
+        # formatted into anything sensible.
+        year = attrs.get("original_published_year", getattr(self.instance, "original_published_year", None))
+        month = attrs.get("original_published_month", getattr(self.instance, "original_published_month", None))
+        day = attrs.get("original_published_day", getattr(self.instance, "original_published_day", None))
+        if month and not year:
+            raise serializers.ValidationError({"original_published_month": "Requires the year to also be set."})
+        if day and not month:
+            raise serializers.ValidationError({"original_published_day": "Requires the month to also be set."})
+        if year and month and day:
+            try:
+                date(year, month, day)
+            except ValueError:
+                raise serializers.ValidationError({"original_published_day": "Not a valid date."})
+        return attrs

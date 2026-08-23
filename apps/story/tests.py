@@ -21,7 +21,19 @@ from apps.story.ai_generation_jobs import _concatenated_chapter_text, run_genera
 from apps.story.epub_import import EpubParseError, extract_chapters
 from apps.story.excerpts import _excerpt_from_text
 from apps.story.epub_import_jobs import run_epub_import
-from apps.story.models import Audio, Author, Blog, Chapter, EpubImportJob, Favorite, Genre, PromptSettings, Story
+from apps.story.models import (
+    Audio,
+    Author,
+    Blog,
+    Category,
+    Chapter,
+    EpubImportJob,
+    Favorite,
+    Genre,
+    PromptSettings,
+    Story,
+    StoryQueue,
+)
 from apps.story.serializers import AudioAdminSerializer, StoryAdminSerializer, SubmissionSerializer
 from apps.story import reading_time
 from apps.users.models import User
@@ -989,6 +1001,281 @@ class StoryAdminMultipartValidationTests(TestCase):
         self.assertTrue(serializer.is_valid(), serializer.errors)
         self.assertIsNone(serializer.validated_data["site_published_date"])
         self.assertIs(serializer.validated_data["pdf_file"], upload)
+
+
+class StoryAdminListFilterTests(APITestCase):
+    def setUp(self):
+        self.admin = User.objects.create_user(
+            email="storyreport-admin@example.com",
+            username="storyreport-admin",
+            password="test-password",
+            is_superuser=True,
+            is_staff=True,
+        )
+        self.client.force_authenticate(self.admin)
+
+        self.published_completed_with_summary = Story.objects.create(
+            title="Published Completed With Summary",
+            slug="published-completed-with-summary",
+            is_published=True,
+            is_completed=True,
+            summary="<p>A summary.</p>",
+        )
+        self.draft_ongoing_no_summary = Story.objects.create(
+            title="Draft Ongoing No Summary",
+            slug="draft-ongoing-no-summary",
+            is_published=False,
+            is_completed=False,
+        )
+
+    def test_filters_by_publication_status(self):
+        response = self.client.get(reverse("admin-story-list"), {"is_published": "true"})
+
+        slugs = [story["slug"] for story in response.data["results"]]
+        self.assertIn(self.published_completed_with_summary.slug, slugs)
+        self.assertNotIn(self.draft_ongoing_no_summary.slug, slugs)
+
+    def test_filters_by_completion_status(self):
+        response = self.client.get(reverse("admin-story-list"), {"is_completed": "false"})
+
+        slugs = [story["slug"] for story in response.data["results"]]
+        self.assertIn(self.draft_ongoing_no_summary.slug, slugs)
+        self.assertNotIn(self.published_completed_with_summary.slug, slugs)
+
+    def test_filters_by_summary_presence(self):
+        response = self.client.get(reverse("admin-story-list"), {"has_summary": "true"})
+
+        slugs = [story["slug"] for story in response.data["results"]]
+        self.assertIn(self.published_completed_with_summary.slug, slugs)
+        self.assertNotIn(self.draft_ongoing_no_summary.slug, slugs)
+
+    def test_filters_combine(self):
+        response = self.client.get(
+            reverse("admin-story-list"), {"is_published": "true", "has_summary": "false"}
+        )
+
+        self.assertEqual(response.data["results"], [])
+
+    def test_requires_superuser(self):
+        regular_user = User.objects.create_user(
+            email="storyreport-regular@example.com", username="storyreport-regular", password="x"
+        )
+        self.client.force_authenticate(regular_user)
+
+        response = self.client.get(reverse("admin-story-list"))
+
+        self.assertEqual(response.status_code, 403)
+
+
+class StoryQueueApiTests(APITestCase):
+    def setUp(self):
+        self.admin = User.objects.create_user(
+            email="queue-admin@example.com",
+            username="queue-admin",
+            password="test-password",
+            is_superuser=True,
+            is_staff=True,
+        )
+        self.client.force_authenticate(self.admin)
+
+    def test_requires_superuser(self):
+        regular_user = User.objects.create_user(
+            email="queue-regular@example.com", username="queue-regular", password="x"
+        )
+        self.client.force_authenticate(regular_user)
+
+        response = self.client.get(reverse("admin-story-queue-list"))
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_starts_empty_and_can_be_added_to(self):
+        list_response = self.client.get(reverse("admin-story-queue-list"))
+        self.assertEqual(list_response.status_code, 200)
+        self.assertEqual(list_response.data["results"], [])
+
+        create_response = self.client.post(
+            reverse("admin-story-queue-list"),
+            {"title": "The Wind-Up Bird", "author_name": "Haruki Murakami"},
+        )
+
+        self.assertEqual(create_response.status_code, 201)
+        self.assertEqual(create_response.data["is_added"], False)
+        self.assertIsNone(create_response.data["added_story"])
+
+    def test_filters_by_is_added(self):
+        StoryQueue.objects.create(title="Not Added", author_name="Someone")
+        added_story = Story.objects.create(title="Added Story", slug="added-story")
+        StoryQueue.objects.create(
+            title="Already Added", author_name="Someone Else", is_added=True, added_story=added_story
+        )
+
+        response = self.client.get(reverse("admin-story-queue-list"), {"is_added": "true"})
+
+        titles = [item["title"] for item in response.data["results"]]
+        self.assertEqual(titles, ["Already Added"])
+
+    def test_published_date_label_formats_whichever_parts_are_known(self):
+        year_only = StoryQueue.objects.create(
+            title="Year Only", author_name="Someone", original_published_year=1920
+        )
+        full_date = StoryQueue.objects.create(
+            title="Full Date",
+            author_name="Someone",
+            original_published_year=2002,
+            original_published_month=9,
+            original_published_day=12,
+        )
+
+        response = self.client.get(reverse("admin-story-queue-list"))
+
+        labels = {item["title"]: item["published_date_label"] for item in response.data["results"]}
+        self.assertEqual(labels["Year Only"], "1920")
+        self.assertEqual(labels["Full Date"], "September 12, 2002")
+
+    def test_add_action_creates_a_draft_story_and_flips_is_added(self):
+        queue_item = StoryQueue.objects.create(title="Kafka on the Shore", author_name="Haruki Murakami")
+
+        response = self.client.post(reverse("admin-story-queue-add", args=[queue_item.id]))
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["is_added"], True)
+        self.assertIsNotNone(response.data["added_story"])
+
+        queue_item.refresh_from_db()
+        self.assertTrue(queue_item.is_added)
+        self.assertIsNotNone(queue_item.added_story)
+        self.assertEqual(queue_item.added_story.title, "Kafka on the Shore")
+        self.assertEqual(queue_item.added_story.author.name, "Haruki Murakami")
+        self.assertFalse(queue_item.added_story.is_published)
+        self.assertTrue(queue_item.added_story.slug)
+
+    def test_add_action_carries_extended_fields_onto_the_new_story(self):
+        genre = Genre.objects.create(name="Magical Realism")
+        category = Category.objects.create(name="Classic Literature")
+        queue_item = StoryQueue.objects.create(
+            title="Kafka on the Shore",
+            author_name="Haruki Murakami",
+            about="A boy runs away from home.",
+            story_type="Novel",
+            country="JP",
+            original_published_year=2002,
+            original_published_month=9,
+            original_published_day=12,
+            cover_image_link="https://example.com/cover.jpg",
+            epub_link="https://example.com/book.epub",
+            pdf_link="https://example.com/book.pdf",
+        )
+        queue_item.genres.add(genre)
+        queue_item.categories.add(category)
+
+        response = self.client.post(reverse("admin-story-queue-add", args=[queue_item.id]))
+
+        self.assertEqual(response.status_code, 201)
+        queue_item.refresh_from_db()
+        story = queue_item.added_story
+        self.assertEqual(story.about, "A boy runs away from home.")
+        self.assertEqual(story.story_type, "Novel")
+        self.assertEqual(story.country, "JP")
+        self.assertEqual(story.original_published_year, 2002)
+        self.assertEqual(story.original_published_month, 9)
+        self.assertEqual(story.original_published_day, 12)
+        self.assertEqual(story.cover_image, "https://example.com/cover.jpg")
+        self.assertEqual(list(story.genres.values_list("id", flat=True)), [genre.id])
+        self.assertEqual(list(story.categories.values_list("id", flat=True)), [category.id])
+
+    def test_queue_item_rejects_a_month_without_a_year(self):
+        response = self.client.post(
+            reverse("admin-story-queue-list"),
+            {"title": "Untitled", "author_name": "Someone", "original_published_month": 5},
+        )
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_add_action_reuses_an_existing_author_by_name(self):
+        author = Author.objects.create(name="Haruki Murakami")
+        queue_item = StoryQueue.objects.create(title="Norwegian Wood", author_name="Haruki Murakami")
+
+        self.client.post(reverse("admin-story-queue-add", args=[queue_item.id]))
+
+        queue_item.refresh_from_db()
+        self.assertEqual(queue_item.added_story.author_id, author.id)
+        self.assertEqual(Author.objects.filter(name="Haruki Murakami").count(), 1)
+
+    def test_add_action_rejects_an_already_added_item(self):
+        story = Story.objects.create(title="Already Added", slug="already-added")
+        queue_item = StoryQueue.objects.create(
+            title="Already Added", author_name="Someone", is_added=True, added_story=story
+        )
+
+        response = self.client.post(reverse("admin-story-queue-add", args=[queue_item.id]))
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_queue_item_can_be_created_without_an_author(self):
+        response = self.client.post(reverse("admin-story-queue-list"), {"title": "Anonymous Tale"})
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["author_name"], "")
+
+    def test_add_action_creates_a_story_with_no_author_when_queue_item_has_none(self):
+        queue_item = StoryQueue.objects.create(title="Anonymous Tale")
+
+        response = self.client.post(reverse("admin-story-queue-add", args=[queue_item.id]))
+
+        self.assertEqual(response.status_code, 201)
+        queue_item.refresh_from_db()
+        self.assertIsNone(queue_item.added_story.author)
+
+    def test_check_title_finds_a_matching_published_story_case_insensitively(self):
+        Story.objects.create(title="Kafka on the Shore", slug="kafka-on-the-shore", is_published=True)
+
+        response = self.client.get(reverse("admin-story-queue-check-title"), {"title": "kafka ON the shore"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data["story_matches"]), 1)
+        self.assertEqual(response.data["story_matches"][0]["slug"], "kafka-on-the-shore")
+        self.assertTrue(response.data["story_matches"][0]["is_published"])
+        self.assertEqual(response.data["queue_matches"], [])
+
+    def test_check_title_finds_a_not_yet_added_queue_entry(self):
+        StoryQueue.objects.create(title="Norwegian Wood", author_name="Haruki Murakami")
+
+        response = self.client.get(reverse("admin-story-queue-check-title"), {"title": "Norwegian Wood"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["story_matches"], [])
+        self.assertEqual(len(response.data["queue_matches"]), 1)
+        self.assertEqual(response.data["queue_matches"][0]["author_name"], "Haruki Murakami")
+
+    def test_check_title_ignores_an_already_added_queue_entry(self):
+        story = Story.objects.create(title="Already Added", slug="already-added")
+        StoryQueue.objects.create(title="Already Added", is_added=True, added_story=story)
+
+        response = self.client.get(reverse("admin-story-queue-check-title"), {"title": "Already Added"})
+
+        # The Story-side match is enough to flag it; the queue entry that
+        # produced it shouldn't also show up as a separate "in queue" hit.
+        self.assertEqual(len(response.data["story_matches"]), 1)
+        self.assertEqual(response.data["queue_matches"], [])
+
+    def test_check_title_returns_nothing_for_a_blank_or_unmatched_title(self):
+        response = self.client.get(reverse("admin-story-queue-check-title"), {"title": "   "})
+        self.assertEqual(response.data, {"story_matches": [], "queue_matches": []})
+
+        response = self.client.get(reverse("admin-story-queue-check-title"), {"title": "No Such Title"})
+        self.assertEqual(response.data, {"story_matches": [], "queue_matches": []})
+
+    def test_check_title_matches_by_prefix_while_still_typing(self):
+        Story.objects.create(title="Kafka on the Shore", slug="kafka-on-the-shore")
+        StoryQueue.objects.create(title="Kafka and the Trial", author_name="Franz Kafka")
+        # Shouldn't match a title that merely contains the prefix elsewhere.
+        Story.objects.create(title="A Tribute to Kafka", slug="a-tribute-to-kafka")
+
+        response = self.client.get(reverse("admin-story-queue-check-title"), {"title": "kaf"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([m["title"] for m in response.data["story_matches"]], ["Kafka on the Shore"])
+        self.assertEqual([m["title"] for m in response.data["queue_matches"]], ["Kafka and the Trial"])
 
 
 class SubmissionFileUploadValidationTests(SimpleTestCase):

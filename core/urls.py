@@ -29,6 +29,7 @@ router.register("admin/authors", story_api.AuthorAdminViewSet, basename="admin-a
 router.register("admin/categories", story_api.CategoryAdminViewSet, basename="admin-category")
 router.register("admin/users", users_api.UserAdminViewSet, basename="admin-user")
 router.register("admin/blog", story_api.BlogAdminViewSet, basename="admin-blog")
+router.register("admin/story-queue", story_api.StoryQueueViewSet, basename="admin-story-queue")
 router.register("auth", users_api.AuthenticationViewSet, basename="auth")
 
 

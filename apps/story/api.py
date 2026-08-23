@@ -36,6 +36,7 @@ from .models import (
     EpubImportJob,
     PromptSettings,
     Blog,
+    StoryQueue,
     with_preferred_translation_only,
     published_story_q,
     STORY_TYPE_CHOICES,
@@ -72,6 +73,7 @@ from .serializers import (
     PromptSettingsSerializer,
     BlogSerializer,
     BlogAdminSerializer,
+    StoryQueueSerializer,
 )
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -591,6 +593,34 @@ class StoryAdminViewSet(ModelViewSet):
     filter_backends = [SearchFilter]
     search_fields = ["title", "slug", "about"]
 
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        params = self.request.query_params
+
+        is_published = params.get("is_published")
+        if is_published in {"true", "false"}:
+            queryset = queryset.filter(is_published=is_published == "true")
+
+        is_completed = params.get("is_completed")
+        if is_completed in {"true", "false"}:
+            queryset = queryset.filter(is_completed=is_completed == "true")
+
+        has_summary = params.get("has_summary")
+        if has_summary in {"true", "false"}:
+            no_summary = Q(summary__isnull=True) | Q(summary__exact="")
+            queryset = queryset.filter(no_summary) if has_summary == "false" else queryset.exclude(no_summary)
+
+        has_retrospective = params.get("has_retrospective")
+        if has_retrospective in {"true", "false"}:
+            no_retrospective = Q(retrospective__isnull=True) | Q(retrospective__exact="")
+            queryset = (
+                queryset.filter(no_retrospective)
+                if has_retrospective == "false"
+                else queryset.exclude(no_retrospective)
+            )
+
+        return queryset
+
     @action(detail=True, methods=["post"], url_path="link-translation")
     def link_translation(self, request, pk=None):
         story = self.get_object()
@@ -688,6 +718,93 @@ class StoryAdminViewSet(ModelViewSet):
             lambda: ai_generation_executor.submit(run_generate_field, story.id, action, input_fields)
         )
         return Response(self.get_serializer(story).data, status=status.HTTP_202_ACCEPTED)
+
+
+class StoryQueueViewSet(ModelViewSet):
+    """A backlog of title/author ideas an admin plans to eventually publish
+    as real stories — see StoryQueue's docstring. list/create/destroy are
+    the plain CRUD for managing the backlog itself; the "add" action is the
+    one meaningful custom behavior: turning one entry into a real, draft
+    Story."""
+
+    queryset = StoryQueue.objects.select_related("added_story").prefetch_related("genres", "categories").all()
+    serializer_class = StoryQueueSerializer
+    permission_classes = [IsSuperUser]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        is_added = self.request.query_params.get("is_added")
+        if is_added in {"true", "false"}:
+            queryset = queryset.filter(is_added=is_added == "true")
+        return queryset
+
+    @action(detail=False, methods=["get"], url_path="check-title")
+    def check_title(self, request):
+        """Live title suggestions/duplicate check as the admin types into the
+        "Add to Queue" form. Prefix-matches case-insensitively against both
+        Story (any status) and StoryQueue entries not yet added — an
+        already-added queue entry is a duplicate of the Story it produced,
+        which the Story-side check already catches. Prefix (not exact)
+        matching so results appear progressively while typing, same as the
+        genre/category suggestion lists elsewhere in this form."""
+        title = request.query_params.get("title", "").strip()
+        if not title:
+            return Response({"story_matches": [], "queue_matches": []})
+
+        story_matches = [
+            {"id": story.id, "title": story.title, "slug": story.slug, "is_published": story.is_published}
+            for story in Story.objects.filter(title__istartswith=title).only(
+                "id", "title", "slug", "is_published"
+            )[:8]
+        ]
+        queue_matches = [
+            {"id": item.id, "title": item.title, "author_name": item.author_name}
+            for item in StoryQueue.objects.filter(title__istartswith=title, is_added=False).only(
+                "id", "title", "author_name"
+            )[:8]
+        ]
+        return Response({"story_matches": story_matches, "queue_matches": queue_matches})
+
+    @action(detail=True, methods=["post"], url_path="add", url_name="add")
+    def add_to_stories(self, request, pk=None):
+        queue_item = self.get_object()
+        if queue_item.is_added:
+            return Response(
+                {"detail": "This queue item has already been added."}, status=status.HTTP_400_BAD_REQUEST
+            )
+
+        story_data = {
+            "title": queue_item.title,
+            "is_published": False,
+            "about": queue_item.about or "",
+            "genres": [genre.id for genre in queue_item.genres.all()],
+            "categories": [category.id for category in queue_item.categories.all()],
+            "original_published_year": queue_item.original_published_year,
+            "original_published_month": queue_item.original_published_month,
+            "original_published_day": queue_item.original_published_day,
+        }
+        if queue_item.author_name:
+            author, _ = Author.objects.get_or_create(name=queue_item.author_name)
+            story_data["author"] = author.id
+        if queue_item.story_type:
+            story_data["story_type"] = queue_item.story_type
+        if queue_item.country:
+            story_data["country"] = queue_item.country
+        # cover_image is a plain URLField on Story (not an upload), so the
+        # public-domain reference link copies straight across. epub_link/
+        # pdf_link are intentionally NOT copied — see StoryQueue's docstring.
+        if queue_item.cover_image_link:
+            story_data["cover_image"] = queue_item.cover_image_link
+
+        story_serializer = StoryAdminSerializer(data=story_data, context={"request": request})
+        story_serializer.is_valid(raise_exception=True)
+        story = story_serializer.save()
+
+        queue_item.is_added = True
+        queue_item.added_story = story
+        queue_item.save(update_fields=["is_added", "added_story"])
+
+        return Response(StoryQueueSerializer(queue_item).data, status=status.HTTP_201_CREATED)
 
 
 class BlogAdminViewSet(ModelViewSet):
