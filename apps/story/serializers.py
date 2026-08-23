@@ -18,6 +18,7 @@ from .models import (
     Review,
     Submission,
     EpubImportJob,
+    BookFetchJob,
     PromptSettings,
     Blog,
     StoryQueue,
@@ -886,6 +887,16 @@ class EpubImportJobSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
 
+class BookFetchJobSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = BookFetchJob
+        fields = [
+            "id", "requested_count", "created_count", "skipped_count", "status", "error_message",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = fields
+
+
 class PromptSettingsSerializer(serializers.ModelSerializer):
     class Meta:
         model = PromptSettings
@@ -893,6 +904,7 @@ class PromptSettingsSerializer(serializers.ModelSerializer):
             "summary_instructions", "summary_model",
             "retrospective_instructions", "retrospective_model",
             "excerpt_instructions", "excerpt_model",
+            "book_fetch_instructions", "book_fetch_model",
         ]
 
 
@@ -1202,6 +1214,7 @@ class StoryQueueSerializer(serializers.ModelSerializer):
             "about",
             "story_type",
             "country",
+            "language",
             "genres",
             "categories",
             "original_published_year",

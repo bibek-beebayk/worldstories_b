@@ -18,6 +18,16 @@ import anthropic
 from apps.story.api import StoryViewSet, open_s3_audio_stream
 from apps.story.ai_generation import GenerationError, _GenerationOutput, _to_plain_text, generate
 from apps.story.ai_generation_jobs import _concatenated_chapter_text, run_generate_blog_excerpt, run_generate_field
+from apps.story.book_fetch import (
+    DEFAULT_BOOK_FETCH_COUNT,
+    MAX_BOOK_FETCH_COUNT,
+    BookFetchError,
+    _BookFetchOutput,
+    _BookRecord,
+    _max_tokens_for,
+    fetch_books,
+)
+from apps.story.book_fetch_jobs import run_book_fetch
 from apps.story.epub_import import EpubParseError, extract_chapters
 from apps.story.excerpts import _excerpt_from_text
 from apps.story.epub_import_jobs import run_epub_import
@@ -25,6 +35,7 @@ from apps.story.models import (
     Audio,
     Author,
     Blog,
+    BookFetchJob,
     Category,
     Chapter,
     EpubImportJob,
@@ -1158,6 +1169,7 @@ class StoryQueueApiTests(APITestCase):
             about="A boy runs away from home.",
             story_type="Novel",
             country="JP",
+            language="ja",
             original_published_year=2002,
             original_published_month=9,
             original_published_day=12,
@@ -1176,6 +1188,7 @@ class StoryQueueApiTests(APITestCase):
         self.assertEqual(story.about, "A boy runs away from home.")
         self.assertEqual(story.story_type, "Novel")
         self.assertEqual(story.country, "JP")
+        self.assertEqual(story.language, "ja")
         self.assertEqual(story.original_published_year, 2002)
         self.assertEqual(story.original_published_month, 9)
         self.assertEqual(story.original_published_day, 12)
@@ -2233,3 +2246,284 @@ class ExcerptFromTextTests(SimpleTestCase):
         excerpt = _excerpt_from_text(words, 0.0, word_count=10)
 
         self.assertTrue(excerpt.endswith("…"))
+
+
+def _book_record(**overrides):
+    fields = dict(
+        title="A Public Domain Book",
+        author_name="Some Author",
+        about="A short synopsis.",
+        story_type="Novel",
+        country="Japan",
+        language="Japanese",
+        genres=["Adventure"],
+        categories=["Classic Literature"],
+        original_published_year=1900,
+        original_published_month=None,
+        original_published_day=None,
+        epub_link="",
+        pdf_link="",
+        cover_image_link="",
+    )
+    fields.update(overrides)
+    return _BookRecord(**fields)
+
+
+def _mock_book_fetch_response(records):
+    resp = MagicMock()
+    resp.parsed_output = _BookFetchOutput(books=records)
+    return resp
+
+
+class BookFetchPromptLogicTests(SimpleTestCase):
+    """book_fetch.py is pure (no DB) — exercises the API-call/parse logic
+    against a mocked anthropic.Anthropic client."""
+
+    def test_successful_call_returns_the_parsed_books(self):
+        with patch("apps.story.book_fetch._client") as mock_client:
+            mock_client.return_value.messages.parse.return_value = _mock_book_fetch_response(
+                [_book_record(title="Book One"), _book_record(title="Book Two")]
+            )
+            books = fetch_books("title,author\n", 2, "instructions")
+
+        self.assertEqual([b.title for b in books], ["Book One", "Book Two"])
+        mock_client.return_value.messages.parse.assert_called_once()
+        call_kwargs = mock_client.return_value.messages.parse.call_args.kwargs
+        self.assertEqual(call_kwargs["output_format"], _BookFetchOutput)
+
+    def test_api_errors_all_map_to_book_fetch_error(self):
+        for exc in (
+            anthropic.NotFoundError(message="nf", response=MagicMock(), body=None),
+            anthropic.RateLimitError(message="rl", response=MagicMock(), body=None),
+            anthropic.APIConnectionError(request=MagicMock()),
+        ):
+            with patch("apps.story.book_fetch._client") as mock_client:
+                mock_client.return_value.messages.parse.side_effect = exc
+                with self.assertRaises(BookFetchError):
+                    fetch_books("title,author\n", 5, "instructions")
+
+    def test_empty_books_list_raises_book_fetch_error(self):
+        with patch("apps.story.book_fetch._client") as mock_client:
+            mock_client.return_value.messages.parse.return_value = _mock_book_fetch_response([])
+            with self.assertRaises(BookFetchError):
+                fetch_books("title,author\n", 5, "instructions")
+
+    def test_max_tokens_scales_with_count_but_stays_capped(self):
+        self.assertEqual(_max_tokens_for(1), 2_500)
+        self.assertEqual(_max_tokens_for(14), 15_500)
+        self.assertEqual(_max_tokens_for(100), 16_000)
+
+
+class RunBookFetchTests(TransactionTestCase):
+    """Uses TransactionTestCase (not TestCase) because run_book_fetch calls
+    transaction.atomic() and connections.close_all() itself, same reasoning
+    as RunEpubImportTests."""
+
+    def test_success_path_creates_queue_rows_and_marks_job_completed(self):
+        job = BookFetchJob.objects.create(requested_count=2)
+        records = [_book_record(title="Book One"), _book_record(title="Book Two")]
+
+        with patch("apps.story.book_fetch_jobs.fetch_books", return_value=records):
+            run_book_fetch(job.id)
+
+        job.refresh_from_db()
+        self.assertEqual(job.status, BookFetchJob.STATUS_COMPLETED)
+        self.assertEqual(job.created_count, 2)
+        self.assertEqual(job.skipped_count, 0)
+        self.assertEqual(StoryQueue.objects.count(), 2)
+        created = StoryQueue.objects.get(title="Book One")
+        self.assertEqual(created.country, "JP")
+        self.assertEqual(created.language, "ja")
+        self.assertEqual(created.story_type, "Novel")
+        self.assertEqual(list(created.genres.values_list("name", flat=True)), ["Adventure"])
+        self.assertEqual(list(created.categories.values_list("name", flat=True)), ["Classic Literature"])
+
+    def test_skips_a_record_matching_an_existing_story_by_title_and_author(self):
+        Story.objects.create(
+            title="Already Here", slug="already-here", author=Author.objects.create(name="Some Author")
+        )
+        job = BookFetchJob.objects.create(requested_count=1)
+        records = [_book_record(title="Already Here", author_name="Some Author")]
+
+        with patch("apps.story.book_fetch_jobs.fetch_books", return_value=records):
+            run_book_fetch(job.id)
+
+        job.refresh_from_db()
+        self.assertEqual(job.created_count, 0)
+        self.assertEqual(job.skipped_count, 1)
+        self.assertEqual(StoryQueue.objects.count(), 0)
+
+    def test_does_not_skip_same_title_different_author(self):
+        # Dedup key is (title, author) together, not title alone — a
+        # different author writing a same-titled book is not a duplicate.
+        Story.objects.create(
+            title="Emma", slug="emma-1", author=Author.objects.create(name="Jane Austen")
+        )
+        job = BookFetchJob.objects.create(requested_count=1)
+        records = [_book_record(title="Emma", author_name="Someone Else")]
+
+        with patch("apps.story.book_fetch_jobs.fetch_books", return_value=records):
+            run_book_fetch(job.id)
+
+        job.refresh_from_db()
+        self.assertEqual(job.created_count, 1)
+        self.assertEqual(job.skipped_count, 0)
+
+    def test_skips_a_record_matching_a_not_yet_added_queue_entry(self):
+        StoryQueue.objects.create(title="In The Queue", author_name="Queue Author")
+        job = BookFetchJob.objects.create(requested_count=1)
+        records = [_book_record(title="In The Queue", author_name="Queue Author")]
+
+        with patch("apps.story.book_fetch_jobs.fetch_books", return_value=records):
+            run_book_fetch(job.id)
+
+        job.refresh_from_db()
+        self.assertEqual(job.created_count, 0)
+        self.assertEqual(job.skipped_count, 1)
+
+    def test_within_batch_duplicate_keeps_only_the_first(self):
+        job = BookFetchJob.objects.create(requested_count=2)
+        records = [
+            _book_record(title="Same Book", author_name="Same Author", about="First."),
+            _book_record(title="same book", author_name="same author", about="Second."),
+        ]
+
+        with patch("apps.story.book_fetch_jobs.fetch_books", return_value=records):
+            run_book_fetch(job.id)
+
+        job.refresh_from_db()
+        self.assertEqual(job.created_count, 1)
+        self.assertEqual(job.skipped_count, 1)
+        self.assertEqual(StoryQueue.objects.get().about, "First.")
+
+    def test_genre_and_category_names_resolve_case_insensitively_or_create(self):
+        existing_genre = Genre.objects.create(name="Adventure")
+        job = BookFetchJob.objects.create(requested_count=1)
+        records = [_book_record(genres=["adventure", "Mystery"], categories=["New Category"])]
+
+        with patch("apps.story.book_fetch_jobs.fetch_books", return_value=records):
+            run_book_fetch(job.id)
+
+        created = StoryQueue.objects.get()
+        self.assertEqual(list(created.genres.values_list("id", flat=True)), [existing_genre.id, Genre.objects.get(name="Mystery").id])
+        self.assertEqual(Category.objects.filter(name="New Category").count(), 1)
+
+    def test_invalid_story_type_country_and_language_save_as_blank(self):
+        job = BookFetchJob.objects.create(requested_count=1)
+        records = [
+            _book_record(
+                story_type="Not A Real Type", country="Not A Real Country", language="Not A Real Language"
+            )
+        ]
+
+        with patch("apps.story.book_fetch_jobs.fetch_books", return_value=records):
+            run_book_fetch(job.id)
+
+        created = StoryQueue.objects.get()
+        self.assertEqual(created.story_type, "")
+        self.assertEqual(created.country, "")
+        self.assertEqual(created.language, "")
+
+    def test_invalid_published_date_parts_are_sanitized(self):
+        job = BookFetchJob.objects.create(requested_count=1)
+        records = [
+            _book_record(original_published_year=1900, original_published_month=13, original_published_day=5)
+        ]
+
+        with patch("apps.story.book_fetch_jobs.fetch_books", return_value=records):
+            run_book_fetch(job.id)
+
+        created = StoryQueue.objects.get()
+        self.assertEqual(created.original_published_year, 1900)
+        self.assertIsNone(created.original_published_month)
+        self.assertIsNone(created.original_published_day)
+
+    def test_non_url_link_fields_save_as_blank(self):
+        job = BookFetchJob.objects.create(requested_count=1)
+        records = [_book_record(epub_link="not a url", pdf_link="https://example.com/book.pdf")]
+
+        with patch("apps.story.book_fetch_jobs.fetch_books", return_value=records):
+            run_book_fetch(job.id)
+
+        created = StoryQueue.objects.get()
+        self.assertEqual(created.epub_link, "")
+        self.assertEqual(created.pdf_link, "https://example.com/book.pdf")
+
+    def test_book_fetch_error_marks_job_failed(self):
+        job = BookFetchJob.objects.create(requested_count=1)
+
+        with patch("apps.story.book_fetch_jobs.fetch_books", side_effect=BookFetchError("boom")):
+            run_book_fetch(job.id)
+
+        job.refresh_from_db()
+        self.assertEqual(job.status, BookFetchJob.STATUS_FAILED)
+        self.assertEqual(job.error_message, "boom")
+        self.assertEqual(StoryQueue.objects.count(), 0)
+
+    def test_unexpected_exception_marks_job_failed_with_generic_message(self):
+        job = BookFetchJob.objects.create(requested_count=1)
+
+        with patch("apps.story.book_fetch_jobs.fetch_books", side_effect=RuntimeError("kaboom")):
+            run_book_fetch(job.id)
+
+        job.refresh_from_db()
+        self.assertEqual(job.status, BookFetchJob.STATUS_FAILED)
+        self.assertEqual(job.error_message, "Unexpected internal error.")
+
+
+class FetchBooksApiTests(APITestCase):
+    def _make_superuser(self):
+        return User.objects.create(
+            email="admin@example.com", username="admin", is_superuser=True, is_staff=True, is_active=True
+        )
+
+    def test_fetch_books_returns_202_immediately_without_waiting_on_processing(self):
+        self.client.force_authenticate(user=self._make_superuser())
+
+        with patch("apps.story.api.book_fetch_executor") as mock_executor:
+            with self.captureOnCommitCallbacks(execute=True):
+                response = self.client.post("/api/admin/story-queue/fetch-books/", {"count": 5}, format="json")
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.data["status"], BookFetchJob.STATUS_PENDING)
+        self.assertEqual(response.data["requested_count"], 5)
+        mock_executor.submit.assert_called_once()
+        self.assertEqual(BookFetchJob.objects.count(), 1)
+
+    def test_omitted_count_defaults(self):
+        self.client.force_authenticate(user=self._make_superuser())
+
+        with patch("apps.story.api.book_fetch_executor"):
+            with self.captureOnCommitCallbacks(execute=True):
+                response = self.client.post("/api/admin/story-queue/fetch-books/", {}, format="json")
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.data["requested_count"], DEFAULT_BOOK_FETCH_COUNT)
+
+    def test_count_out_of_range_or_non_integer_returns_400(self):
+        self.client.force_authenticate(user=self._make_superuser())
+
+        for bad_count in (0, MAX_BOOK_FETCH_COUNT + 1, "not-a-number"):
+            response = self.client.post("/api/admin/story-queue/fetch-books/", {"count": bad_count}, format="json")
+            self.assertEqual(response.status_code, 400)
+
+        self.assertEqual(BookFetchJob.objects.count(), 0)
+
+    def test_non_superuser_is_forbidden(self):
+        regular_user = User.objects.create(email="user@example.com", username="user", is_active=True)
+        self.client.force_authenticate(user=regular_user)
+
+        response = self.client.post("/api/admin/story-queue/fetch-books/", {"count": 5}, format="json")
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_status_endpoint_returns_the_job_or_404(self):
+        self.client.force_authenticate(user=self._make_superuser())
+        job = BookFetchJob.objects.create(requested_count=3, status=BookFetchJob.STATUS_COMPLETED, created_count=2)
+
+        response = self.client.get(f"/api/admin/story-queue/fetch-books/{job.id}/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["created_count"], 2)
+
+        missing_response = self.client.get("/api/admin/story-queue/fetch-books/999999/")
+        self.assertEqual(missing_response.status_code, 404)

@@ -34,6 +34,7 @@ from .models import (
     Submission,
     StoryView,
     EpubImportJob,
+    BookFetchJob,
     PromptSettings,
     Blog,
     StoryQueue,
@@ -43,6 +44,8 @@ from .models import (
     LANGUAGE_CHOICES,
 )
 from .epub_import_jobs import executor as epub_import_executor, run_epub_import
+from .book_fetch import DEFAULT_BOOK_FETCH_COUNT, MAX_BOOK_FETCH_COUNT
+from .book_fetch_jobs import executor as book_fetch_executor, run_book_fetch
 from .ai_generation_jobs import (
     executor as ai_generation_executor,
     run_generate_blog_excerpt,
@@ -70,6 +73,7 @@ from .serializers import (
     AudioAdminSerializer,
     SubmissionAdminSerializer,
     EpubImportJobSerializer,
+    BookFetchJobSerializer,
     PromptSettingsSerializer,
     BlogSerializer,
     BlogAdminSerializer,
@@ -765,6 +769,35 @@ class StoryQueueViewSet(ModelViewSet):
         ]
         return Response({"story_matches": story_matches, "queue_matches": queue_matches})
 
+    @action(detail=False, methods=["post"], url_path="fetch-books")
+    def fetch_books(self, request):
+        """Kicks off the "Fetch Book Data" AI action: asks Claude for
+        `count` public-domain books not already in Story/StoryQueue, then
+        creates new StoryQueue rows from whatever survives dedup. See
+        book_fetch.py (prompt/API call) and book_fetch_jobs.py (DB-touching
+        worker) — same async-job shape as import_epub/EpubImportJob."""
+        try:
+            count = int(request.data.get("count", DEFAULT_BOOK_FETCH_COUNT))
+        except (TypeError, ValueError):
+            return Response({"detail": "count must be an integer."}, status=status.HTTP_400_BAD_REQUEST)
+        if not (1 <= count <= MAX_BOOK_FETCH_COUNT):
+            return Response(
+                {"detail": f"count must be between 1 and {MAX_BOOK_FETCH_COUNT}."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        job = BookFetchJob.objects.create(requested_count=count, status=BookFetchJob.STATUS_PENDING)
+        transaction.on_commit(lambda: book_fetch_executor.submit(run_book_fetch, job.id))
+        return Response(BookFetchJobSerializer(job).data, status=status.HTTP_202_ACCEPTED)
+
+    @action(detail=False, methods=["get"], url_path=r"fetch-books/(?P<job_id>\d+)")
+    def fetch_books_status(self, request, job_id=None):
+        try:
+            job = BookFetchJob.objects.get(pk=job_id)
+        except BookFetchJob.DoesNotExist:
+            return Response({"detail": "Fetch job not found."}, status=status.HTTP_404_NOT_FOUND)
+        return Response(BookFetchJobSerializer(job).data)
+
     @action(detail=True, methods=["post"], url_path="add", url_name="add")
     def add_to_stories(self, request, pk=None):
         queue_item = self.get_object()
@@ -790,6 +823,8 @@ class StoryQueueViewSet(ModelViewSet):
             story_data["story_type"] = queue_item.story_type
         if queue_item.country:
             story_data["country"] = queue_item.country
+        if queue_item.language:
+            story_data["language"] = queue_item.language
         # cover_image is a plain URLField on Story (not an upload), so the
         # public-domain reference link copies straight across. epub_link/
         # pdf_link are intentionally NOT copied — see StoryQueue's docstring.

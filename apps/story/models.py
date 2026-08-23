@@ -423,6 +423,7 @@ class StoryQueue(models.Model):
     about = models.TextField(blank=True, null=True)
     story_type = models.CharField(max_length=50, choices=STORY_TYPE_CHOICES, blank=True)
     country = models.CharField(max_length=2, choices=COUNTRY_CHOICES, blank=True)
+    language = models.CharField(max_length=10, choices=LANGUAGE_CHOICES, blank=True)
     genres = models.ManyToManyField(Genre, blank=True, related_name="queue_items")
     categories = models.ManyToManyField(Category, blank=True, related_name="queue_items")
     original_published_year = models.PositiveSmallIntegerField(blank=True, null=True)
@@ -477,6 +478,37 @@ class EpubImportJob(TimeStampModel):
         return f"{self.story.title} - epub import ({self.status})"
 
 
+class BookFetchJob(TimeStampModel):
+    """Tracks one "Fetch Book Data" Story Queue admin action — asking Claude
+    to suggest requested_count public-domain books not already in Story/
+    StoryQueue, then creating new StoryQueue rows from whatever survives
+    dedup (see apps/story/book_fetch_jobs.py). Not tied to a single Story
+    (unlike EpubImportJob) — this is a queue-wide, one-off operation."""
+
+    STATUS_PENDING = "pending"
+    STATUS_PROCESSING = "processing"
+    STATUS_COMPLETED = "completed"
+    STATUS_FAILED = "failed"
+    STATUS_CHOICES = [
+        (STATUS_PENDING, "Pending"),
+        (STATUS_PROCESSING, "Processing"),
+        (STATUS_COMPLETED, "Completed"),
+        (STATUS_FAILED, "Failed"),
+    ]
+
+    requested_count = models.PositiveSmallIntegerField()
+    created_count = models.PositiveSmallIntegerField(default=0)
+    skipped_count = models.PositiveSmallIntegerField(default=0)
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES, default=STATUS_PENDING)
+    error_message = models.TextField(blank=True, null=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"Book fetch ({self.status}) — requested {self.requested_count}"
+
+
 class PromptSettings(SingletonModel):
     """Admin-tunable instructions for Claude-generated Summary/Retrospective
     text (apps/story/ai_generation.py). Deliberately holds only the
@@ -525,6 +557,27 @@ class PromptSettings(SingletonModel):
         help_text="Instructions for the 'Generate Excerpt' admin action on blog posts.",
     )
     excerpt_model = models.CharField(max_length=32, choices=MODEL_CHOICES, default="claude-sonnet-5")
+    book_fetch_instructions = models.TextField(
+        default=(
+            "You are helping curate a public-domain literature library. Suggest real, "
+            "existing books that are firmly in the public domain (originally published "
+            "before 1929, or otherwise clearly public domain in the United States) and "
+            "are not already in the provided list of existing titles. Prefer "
+            "well-regarded public-domain classics and lesser-known but genuinely "
+            "worthwhile works, spread across a range of countries, languages of origin, "
+            "and story types — avoid suggesting only the handful of most obvious famous "
+            "titles. Write each book's synopsis as a short, SEO-friendly teaser for "
+            "readers browsing a library site, without spoiling the ending. Only fill in "
+            "a cover image, epub, or PDF link if you are confident it is a genuine, "
+            "currently-working, public-domain source (e.g. a Project Gutenberg, "
+            "Wikimedia Commons, or Internet Archive URL for that exact edition) — leave "
+            "any of those blank rather than guess or fabricate a URL. Leave any other "
+            "field blank if you don't have good information for it, rather than "
+            "guessing."
+        ),
+        help_text="Instructions for the 'Fetch Book Data' Story Queue admin action.",
+    )
+    book_fetch_model = models.CharField(max_length=32, choices=MODEL_CHOICES, default="claude-sonnet-5")
 
     class Meta:
         verbose_name = "AI Generation Prompt Settings"
