@@ -657,7 +657,16 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
 
     @action(detail=False, methods=["get"], url_path="library/recommendations")
     def library_recommendations(self, request):
-        stories = recommend_stories_for(request.user)
+        require_summary = request.query_params.get("quick_read") == "true"
+        exclude_slug = request.query_params.get("exclude")
+        exclude_story_id = (
+            Story.objects.filter(slug=exclude_slug).values_list("id", flat=True).first()
+            if exclude_slug
+            else None
+        )
+        stories = recommend_stories_for(
+            request.user, require_summary=require_summary, exclude_story_id=exclude_story_id
+        )
         serializer = StoryListSerializer(stories, many=True, context={"request": request})
         return Response(serializer.data)
 

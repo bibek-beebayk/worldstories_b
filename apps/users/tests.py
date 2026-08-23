@@ -475,6 +475,51 @@ class PreferredGenresRecommendationApiTests(APITestCase):
         self.assertEqual(titles, [fresh.title])
 
 
+class QuickReadRecommendationApiTests(APITestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(
+            email="quickreader@example.com", username="quickreader", password="x"
+        )
+        self.fantasy = Genre.objects.create(name="Fantasy")
+        self.user.preferred_genres.set([self.fantasy])
+
+    def _story(self, title, slug, summary=""):
+        story = Story.objects.create(title=title, slug=slug, is_published=True, summary=summary)
+        story.genres.set([self.fantasy])
+        return story
+
+    def test_quick_read_only_includes_stories_with_a_summary(self):
+        with_summary = self._story("Has Summary", "has-summary", summary="<p>A quick summary.</p>")
+        self._story("No Summary", "no-summary")
+        self.client.force_authenticate(self.user)
+
+        response = self.client.get(reverse("auth-library-recommendations"), {"quick_read": "true"})
+
+        titles = [story["title"] for story in response.data]
+        self.assertEqual(titles, [with_summary.title])
+
+    def test_quick_read_excludes_the_currently_viewed_story(self):
+        current = self._story("Currently Viewing", "currently-viewing", summary="<p>x</p>")
+        other = self._story("Another Quick Read", "another-quick-read", summary="<p>y</p>")
+        self.client.force_authenticate(self.user)
+
+        response = self.client.get(
+            reverse("auth-library-recommendations"), {"quick_read": "true", "exclude": current.slug}
+        )
+
+        titles = [story["title"] for story in response.data]
+        self.assertEqual(titles, [other.title])
+
+    def test_without_quick_read_param_includes_stories_regardless_of_summary(self):
+        self._story("Has Summary", "has-summary", summary="<p>x</p>")
+        self._story("No Summary", "no-summary")
+        self.client.force_authenticate(self.user)
+
+        response = self.client.get(reverse("auth-library-recommendations"))
+
+        self.assertEqual(len(response.data), 2)
+
+
 class BlendedRecommendationApiTests(APITestCase):
     """Covers the warm path: once a user has crossed SUFFICIENT_DATA_THRESHOLD
     engaged stories, recommendations should also draw on implicit genre

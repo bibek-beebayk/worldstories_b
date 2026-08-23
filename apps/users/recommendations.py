@@ -104,14 +104,21 @@ def _already_engaged_q(user):
     )
 
 
-def _genre_only_recommendations(genre_ids, exclude_q, limit):
+def _apply_optional_filters(queryset, require_summary, exclude_story_id):
+    if require_summary:
+        queryset = queryset.exclude(Q(summary__isnull=True) | Q(summary__exact=""))
+    if exclude_story_id is not None:
+        queryset = queryset.exclude(id=exclude_story_id)
+    return queryset
+
+
+def _genre_only_recommendations(genre_ids, exclude_q, limit, require_summary=False, exclude_story_id=None):
     if not genre_ids:
         return Story.objects.none()
+    candidates = Story.objects.published().filter(genres__id__in=genre_ids).exclude(exclude_q)
+    candidates = _apply_optional_filters(candidates, require_summary, exclude_story_id)
     return (
-        Story.objects.published()
-        .filter(genres__id__in=genre_ids)
-        .exclude(exclude_q)
-        .annotate(
+        candidates.annotate(
             matching_genres=Count("genres", filter=Q(genres__id__in=genre_ids), distinct=True)
         )
         .select_related("author")
@@ -121,7 +128,9 @@ def _genre_only_recommendations(genre_ids, exclude_q, limit):
     )
 
 
-def _blended_recommendations(user, preferred_genre_ids, engaged_story_ids, exclude_q, limit):
+def _blended_recommendations(
+    user, preferred_genre_ids, engaged_story_ids, exclude_q, limit, require_summary=False, exclude_story_id=None
+):
     implicit_genre_ids = set(
         Genre.objects.filter(stories__id__in=engaged_story_ids).values_list("id", flat=True)
     )
@@ -154,11 +163,10 @@ def _blended_recommendations(user, preferred_genre_ids, engaged_story_ids, exclu
     if not candidate_ids:
         return Story.objects.none()
 
+    candidates = Story.objects.published().filter(id__in=candidate_ids).exclude(exclude_q)
+    candidates = _apply_optional_filters(candidates, require_summary, exclude_story_id)
     candidates = (
-        Story.objects.published()
-        .filter(id__in=candidate_ids)
-        .exclude(exclude_q)
-        .annotate(
+        candidates.annotate(
             matching_genres=Count(
                 "genres", filter=Q(genres__id__in=genre_affinity_ids), distinct=True
             )
@@ -180,7 +188,13 @@ def _blended_recommendations(user, preferred_genre_ids, engaged_story_ids, exclu
     return sorted(candidates, key=score, reverse=True)[:limit]
 
 
-def recommend_stories_for(user, limit=RECOMMENDATION_LIMIT):
+def recommend_stories_for(user, limit=RECOMMENDATION_LIMIT, require_summary=False, exclude_story_id=None):
+    """`require_summary` restricts candidates to stories with a summary
+    (i.e. Quick-Read-eligible) — used for the personalized "Recommended
+    Quick Reads" list on the Quick Read page. `exclude_story_id` additionally
+    excludes one specific story (the one currently being viewed) from its
+    own recommendations. Both default to off, so the homepage's existing
+    "Recommended for You" call is unaffected."""
     preferred_genre_ids = set(user.preferred_genres.values_list("id", flat=True))
     engaged_story_ids = {
         story_id for _uid, story_id in _engagement_pairs(user_ids=[user.pk])
@@ -188,10 +202,12 @@ def recommend_stories_for(user, limit=RECOMMENDATION_LIMIT):
     exclude_q = _already_engaged_q(user)
 
     if len(engaged_story_ids) < SUFFICIENT_DATA_THRESHOLD:
-        return _genre_only_recommendations(preferred_genre_ids, exclude_q, limit)
+        return _genre_only_recommendations(
+            preferred_genre_ids, exclude_q, limit, require_summary, exclude_story_id
+        )
 
     return _blended_recommendations(
-        user, preferred_genre_ids, engaged_story_ids, exclude_q, limit
+        user, preferred_genre_ids, engaged_story_ids, exclude_q, limit, require_summary, exclude_story_id
     )
 
 
