@@ -19,7 +19,7 @@ import anthropic
 import openpyxl
 from pydantic import ValidationError as PydanticValidationError
 
-from apps.story.api import StoryViewSet, open_s3_audio_stream
+from apps.story.api import StoryMapAPIView, StoryViewSet, open_s3_audio_stream
 from apps.story.ai_generation import GenerationError, _GenerationOutput, _to_plain_text, generate
 from apps.story.ai_generation_jobs import _concatenated_chapter_text, run_generate_blog_excerpt, run_generate_field
 from apps.story.book_fetch import (
@@ -387,6 +387,31 @@ class AudioStreamRangeTests(SimpleTestCase):
         audio_file.open.assert_not_called()
 
 
+class StoryMapDataTests(SimpleTestCase):
+    @patch("apps.story.api.Story.objects.published")
+    def test_story_map_groups_only_published_stories_with_countries(self, published):
+        grouped = [
+            {"country": "JP", "stories_count": 3},
+            {"country": "NP", "stories_count": 1},
+        ]
+        published.return_value.exclude.return_value.values.return_value.annotate.return_value.order_by.return_value = grouped
+
+        response = StoryMapAPIView().get(RequestFactory().get("/api/story-map/"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["total_stories"], 4)
+        self.assertEqual(response.data["countries_count"], 2)
+        self.assertEqual(response.data["max_stories_count"], 3)
+        self.assertEqual(
+            response.data["countries"],
+            [
+                {"code": "JP", "name": "Japan", "stories_count": 3},
+                {"code": "NP", "name": "Nepal", "stories_count": 1},
+            ],
+        )
+        published.return_value.exclude.assert_called_once_with(country="")
+
+
 class ScheduledPublishingTests(SimpleTestCase):
     @patch("apps.story.api.Story.objects.published")
     def test_public_queryset_is_built_for_each_request(self, published):
@@ -437,6 +462,7 @@ class ScheduledPublishingTests(SimpleTestCase):
 
         self.assertContains(response, "/story/visible-story")
         self.assertContains(response, "/read/visible-story/chapter-one")
+        self.assertContains(response, "/story-map")
         self.assertIn("<lastmod>2026-08-02</lastmod>", xml)
         published.assert_called_once_with()
         queryset.exclude.assert_called_once_with(story_type="Summary")

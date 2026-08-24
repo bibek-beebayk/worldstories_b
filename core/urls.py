@@ -43,6 +43,7 @@ def sitemap(request):
             "/",
             "/library",
             "/discover",
+            "/story-map",
             "/audiobooks",
             "/authors",
             "/contest",
@@ -111,6 +112,7 @@ urlpatterns = [
     path("api/trending/", story_api.TrendingDataAPIView.as_view(), name="trending-data"),
     path("api/originals/", story_api.OriginalsDataAPIView.as_view(), name="originals-data"),
     path("api/discover/", story_api.DiscoverDataAPIView.as_view(), name="discover-data"),
+    path("api/story-map/", story_api.StoryMapAPIView.as_view(), name="story-map-data"),
     path(
         "api/analytics/events/",
         stats_views.AnalyticsEventCreateAPIView.as_view(),

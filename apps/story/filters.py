@@ -8,6 +8,7 @@ class StoryFilter(filters.FilterSet):
     categories = filters.CharFilter(method="filter_categories", label="Categories")
     language = filters.CharFilter(method="filter_language", label="Language")
     story_type = filters.CharFilter(method="filter_story_type", label="Story type")
+    country = filters.CharFilter(method="filter_country", label="Country")
     has_audio = filters.CharFilter(method="filter_has_audio", label="Has audio")
     has_summary = filters.CharFilter(method="filter_has_summary", label="Has summary")
     sort = filters.CharFilter(method="filter_sort", label="Sort")
@@ -37,6 +38,11 @@ class StoryFilter(filters.FilterSet):
         if not value or value.lower() == "all":
             return queryset
         return queryset.filter(story_type=value)
+
+    def filter_country(self, queryset, name, value):
+        if not value or value.lower() == "all":
+            return queryset
+        return queryset.filter(country=value.upper())
 
     def filter_has_audio(self, queryset, name, value):
         if value.lower() == "true":
@@ -80,4 +86,4 @@ class StoryFilter(filters.FilterSet):
 
     class Meta:
         model = Story
-        fields = ["status", "genres", "categories", "language", "story_type", "has_audio", "has_summary", "sort", "q"]
+        fields = ["status", "genres", "categories", "language", "story_type", "country", "has_audio", "has_summary", "sort", "q"]

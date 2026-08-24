@@ -42,6 +42,7 @@ from .models import (
     published_story_q,
     STORY_TYPE_CHOICES,
     LANGUAGE_CHOICES,
+    COUNTRY_CHOICES,
 )
 from .epub_import_jobs import executor as epub_import_executor, run_epub_import
 from .book_fetch import DEFAULT_BOOK_FETCH_COUNT, MAX_BOOK_FETCH_COUNT
@@ -1327,6 +1328,7 @@ class DiscoverDataAPIView(APIView):
             favorites_total=Count("favorites", distinct=True),
             reviews_total=Count("reviews", distinct=True),
         )
+
         story_type_counts = {
             item["story_type"]: item["stories_count"]
             for item in Story.objects.published()
@@ -1415,6 +1417,39 @@ class DiscoverDataAPIView(APIView):
                     many=True,
                     context={"request": request},
                 ).data,
+            }
+        )
+
+
+class StoryMapAPIView(APIView):
+    """Published story totals grouped by ISO 3166-1 alpha-2 country code."""
+
+    def get(self, request):
+        country_names = dict(COUNTRY_CHOICES)
+        grouped_counts = list(
+            Story.objects.published()
+            .exclude(country="")
+            .values("country")
+            .annotate(stories_count=Count("id"))
+            .order_by("-stories_count", "country")
+        )
+        countries = [
+            {
+                "code": item["country"],
+                "name": country_names.get(item["country"], item["country"]),
+                "stories_count": item["stories_count"],
+            }
+            for item in grouped_counts
+        ]
+        return Response(
+            {
+                "countries": countries,
+                "total_stories": sum(item["stories_count"] for item in countries),
+                "countries_count": len(countries),
+                "max_stories_count": max(
+                    (item["stories_count"] for item in countries),
+                    default=0,
+                ),
             }
         )
 
