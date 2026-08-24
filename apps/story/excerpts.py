@@ -53,3 +53,19 @@ def excerpt_at_progress(chapter, progress: float) -> str:
     reader never populates it), so progress is the most reliable position
     signal we have."""
     return _excerpt_from_text(_plain_text_for_chapter(chapter), progress)
+
+
+def excerpt_at_query(chapter, query: str) -> str:
+    """Short plain-text snippet from a chapter's content, centered on the
+    first occurrence of `query` — used by site search to show why a chapter
+    matched. Reuses the same word-boundary/word-count/ellipsis slicing as
+    excerpt_at_progress by converting the match's character offset into a
+    progress fraction. Falls back to the start of the chapter if `query`
+    isn't actually in the content (e.g. it matched the chapter title
+    instead, not the body text)."""
+    text = _plain_text_for_chapter(chapter)
+    if not text:
+        return ""
+    match_offset = text.lower().find(query.lower()) if query else -1
+    progress = match_offset / len(text) if match_offset >= 0 else 0.0
+    return _excerpt_from_text(text, progress)

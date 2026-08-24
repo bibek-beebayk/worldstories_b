@@ -27,6 +27,7 @@ from .models import (
 )
 from . import reading_time
 from .audio_processing import normalize_uploaded_audio
+from .excerpts import excerpt_at_query
 
 CARD_COVER_SIZE = "480x640"
 LARGE_COVER_SIZE = "900x1200"
@@ -186,6 +187,27 @@ class FeaturedStorySerializer(StoryListSerializer):
 
     class Meta(StoryListSerializer.Meta):
         fields = StoryListSerializer.Meta.fields + ["about"]
+
+
+class ChapterSearchResultSerializer(serializers.Serializer):
+    """One chapter search hit — a lightweight, purpose-built shape (not the
+    full ChapterSerializer, which is for the reader/admin and carries the
+    entire chapter body). context["query"] (the search term) is required
+    for the excerpt to be centered on the actual match."""
+
+    story_slug = serializers.CharField(source="story.slug")
+    story_title = serializers.CharField(source="story.title")
+    story_cover_image = serializers.SerializerMethodField()
+    chapter_slug = serializers.CharField(source="slug")
+    chapter_title = serializers.CharField(source="title")
+    excerpt = serializers.SerializerMethodField()
+
+    def get_story_cover_image(self, obj):
+        request = self.context.get("request")
+        return get_cover_image_url(obj.story.cover_image_file, obj.story.cover_image, request, size=CARD_COVER_SIZE)
+
+    def get_excerpt(self, obj):
+        return excerpt_at_query(obj, self.context.get("query", ""))
 
 
 class AuthorDetailSerializer(AuthorSerializer):

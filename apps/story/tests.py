@@ -888,6 +888,42 @@ class PublicAuthorApiTests(APITestCase):
         self.assertIn("published-book", slugs)
         self.assertNotIn("draft-book", slugs)
 
+    def test_search_finds_a_chapter_by_title(self):
+        published = Story.objects.get(slug="published-book")
+        Chapter.objects.create(story=published, title="A Storm at Sea", slug="a-storm-at-sea", content="<p>Calm waters.</p>", order=1)
+
+        response = self.client.get(reverse("search-data"), {"q": "Storm"})
+
+        self.assertEqual(response.status_code, 200)
+        results = response.data["chapters"]["results"]
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["chapter_title"], "A Storm at Sea")
+        self.assertEqual(results[0]["chapter_slug"], "a-storm-at-sea")
+        self.assertEqual(results[0]["story_slug"], "published-book")
+
+    def test_search_finds_a_chapter_by_content_and_centers_the_excerpt(self):
+        published = Story.objects.get(slug="published-book")
+        words_before = " ".join(f"word{i}" for i in range(40))
+        Chapter.objects.create(
+            story=published, title="Chapter One", slug="chapter-one",
+            content=f"<p>{words_before} a rare golden compass appeared suddenly.</p>", order=1,
+        )
+
+        response = self.client.get(reverse("search-data"), {"q": "golden compass"})
+
+        results = response.data["chapters"]["results"]
+        self.assertEqual(len(results), 1)
+        self.assertIn("golden compass", results[0]["excerpt"])
+        self.assertNotIn("word0 word1", results[0]["excerpt"])  # excerpt is centered on the match, not the start
+
+    def test_chapter_search_does_not_include_chapters_from_drafts(self):
+        draft = Story.objects.get(slug="draft-book")
+        Chapter.objects.create(story=draft, title="Secret Chapter", slug="secret-chapter", content="hidden", order=1)
+
+        response = self.client.get(reverse("search-data"), {"q": "Secret"})
+
+        self.assertEqual(response.data["chapters"]["results"], [])
+
     def test_discover_only_returns_genres_with_public_titles(self):
         public_genre = Genre.objects.create(name="Public Genre")
         empty_genre = Genre.objects.create(name="Draft Only Genre")

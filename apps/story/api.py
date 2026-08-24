@@ -64,6 +64,7 @@ from .serializers import (
     AdminAuthorSerializer,
     StoryListSerializer,
     FeaturedStorySerializer,
+    ChapterSearchResultSerializer,
     StoryDetailSerializer,
     ChapterSerializer,
     AudioSerializer,
@@ -186,6 +187,11 @@ class AuthorPagination(PageNumberPagination):
 class SearchAuthorPagination(PageNumberPagination):
     page_size = 12
     page_query_param = "author_page"
+
+
+class SearchChapterPagination(PageNumberPagination):
+    page_size = 12
+    page_query_param = "chapter_page"
 
 
 class BlogPagination(PageNumberPagination):
@@ -1582,6 +1588,7 @@ class SearchStoryAPIView(APIView):
 
         stories = Story.objects.none()
         authors = Author.objects.none()
+        chapters = Chapter.objects.none()
 
         if q:
             stories = (
@@ -1608,6 +1615,12 @@ class SearchStoryAPIView(APIView):
                 )
                 .order_by("name", "id")
             )
+            chapters = (
+                Chapter.objects.filter(published_story_q("story"))
+                .filter(Q(title__icontains=q) | Q(content__icontains=q))
+                .select_related("story", "story__author")
+                .order_by("story__title", "order")
+            )
 
         if language and language.lower() != "all":
             stories = stories.filter(language=language)
@@ -1631,9 +1644,16 @@ class SearchStoryAPIView(APIView):
             author_page, many=True, context={"request": request}
         ).data
 
+        chapter_paginator = SearchChapterPagination()
+        chapter_page = chapter_paginator.paginate_queryset(chapters, request, view=self)
+        chapter_data = ChapterSearchResultSerializer(
+            chapter_page, many=True, context={"request": request, "query": q}
+        ).data
+
         return Response(
             {
                 "titles": story_paginator.get_response_data(story_data),
                 "authors": author_paginator.get_response_data(author_data),
+                "chapters": chapter_paginator.get_response_data(chapter_data),
             }
         )
