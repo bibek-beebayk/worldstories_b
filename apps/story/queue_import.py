@@ -28,6 +28,8 @@ from .queue_records import (
     resolve_story_type,
     sanitize_published_date,
     sanitize_url,
+    validate_country_code,
+    validate_language_code,
 )
 
 MAX_IMPORT_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
@@ -249,8 +251,13 @@ def confirm_import(records_data: List[dict]) -> Tuple[int, int]:
                 author_name=record.author_name.strip(),
                 about=record.about.strip() or None,
                 story_type=resolve_story_type(record.story_type),
-                country=resolve_country(record.country),
-                language=resolve_language(record.language),
+                # country/language arrive here already resolved to codes by
+                # build_preview's _record_to_preview_dict — validate, don't
+                # re-resolve (resolve_country/resolve_language expect a raw
+                # name, and running them again on an already-resolved code
+                # silently produces "" — see queue_records.py).
+                country=validate_country_code(record.country),
+                language=validate_language_code(record.language),
                 original_published_year=year,
                 original_published_month=month,
                 original_published_day=day,

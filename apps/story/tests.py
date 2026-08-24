@@ -2750,6 +2750,33 @@ class ImportApiTests(APITestCase):
         self.assertEqual(list(created.genres.values_list("name", flat=True)), ["New Genre"])
         self.assertEqual(Genre.objects.filter(name="New Genre").count(), 1)
 
+    def test_import_confirm_preserves_country_and_language_from_preview(self):
+        # Regression test: build_preview resolves country/language name ->
+        # code for display; confirm_import must NOT re-resolve that already-
+        # resolved code (see queue_records.validate_country_code) or it
+        # silently comes back blank.
+        self.client.force_authenticate(user=self._make_superuser())
+        upload = _csv_upload(
+            [["title", "country", "language"], ["A Book", "Japan", "Japanese"]]
+        )
+        preview_response = self.client.post(
+            "/api/admin/story-queue/import-preview/", {"file": upload}, format="multipart"
+        )
+        self.assertEqual(preview_response.data["to_add"][0]["country"], "JP")
+        self.assertEqual(preview_response.data["to_add"][0]["language"], "ja")
+
+        response = self.client.post(
+            "/api/admin/story-queue/import-confirm/",
+            {"records": preview_response.data["to_add"]},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["created_count"], 1)
+        created = StoryQueue.objects.get(title="A Book")
+        self.assertEqual(created.country, "JP")
+        self.assertEqual(created.language, "ja")
+
     def test_import_confirm_rejects_empty_records(self):
         self.client.force_authenticate(user=self._make_superuser())
 

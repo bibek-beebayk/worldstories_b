@@ -16,6 +16,8 @@ from .models import COUNTRY_CHOICES, Category, Genre, LANGUAGE_CHOICES, STORY_TY
 _STORY_TYPE_VALUES = {value for value, _ in STORY_TYPE_CHOICES}
 _COUNTRY_NAME_TO_CODE = {name.lower(): code for code, name in COUNTRY_CHOICES}
 _LANGUAGE_NAME_TO_CODE = {name.lower(): code for code, name in LANGUAGE_CHOICES}
+_COUNTRY_CODES = {code for code, _ in COUNTRY_CHOICES}
+_LANGUAGE_CODES = {code for code, _ in LANGUAGE_CHOICES}
 _url_validator = URLValidator()
 
 DuplicateReason = str  # "already_a_story" | "already_in_queue" | "duplicate_in_file" | "missing_title"
@@ -59,11 +61,32 @@ def resolve_story_type(raw: str) -> str:
 
 
 def resolve_country(raw: str) -> str:
+    """raw is a full country NAME (e.g. from Claude or an import spreadsheet
+    cell) — resolves it to a COUNTRY_CHOICES code. NOT idempotent: calling
+    this again on its own output (already a code, not a name) won't match
+    anything and returns "". See validate_country_code for that case."""
     return _COUNTRY_NAME_TO_CODE.get(raw.strip().lower(), "")
 
 
 def resolve_language(raw: str) -> str:
+    """Same as resolve_country but for LANGUAGE_CHOICES — see its docstring."""
     return _LANGUAGE_NAME_TO_CODE.get(raw.strip().lower(), "")
+
+
+def validate_country_code(code: str) -> str:
+    """Confirms an already-resolved country CODE (e.g. a previewed import
+    record's country field, which build_preview already ran through
+    resolve_country once) is still a real COUNTRY_CHOICES value — passes it
+    through unchanged if so, else "". Deliberately does NOT do name->code
+    lookup like resolve_country; running that a second time on a code
+    instead of a name silently produces "" (this was a real bug: confirm_import
+    used to call resolve_country again on preview's already-resolved code)."""
+    return code if code in _COUNTRY_CODES else ""
+
+
+def validate_language_code(code: str) -> str:
+    """Same as validate_country_code but for LANGUAGE_CHOICES."""
+    return code if code in _LANGUAGE_CODES else ""
 
 
 def resolve_genres(names: List[str], create_missing: bool = True) -> List[Genre]:
