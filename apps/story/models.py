@@ -42,6 +42,7 @@ STORY_TYPE_CHOICES = [
     ("Non Fiction", "Non Fiction"),
     ("Religious Text", "Religious Text"),
     ("Summary", "Summary"),
+    ("Collection", "Collection"),
 ]
 
 LANGUAGE_CHOICES = [

@@ -21,7 +21,7 @@ DEFAULT_BOOK_FETCH_COUNT = 10
 # exceed what a single non-streaming response can reliably return.
 MAX_BOOK_FETCH_COUNT = 14
 
-_STORY_TYPES = ["Short Story", "Novel", "Novella", "Poetry", "Non Fiction", "Religious Text", "Summary"]
+_STORY_TYPES = ["Short Story", "Novel", "Novella", "Poetry", "Non Fiction", "Religious Text", "Summary", "Collection"]
 
 
 class _BookRecord(BaseModel):
