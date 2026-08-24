@@ -46,6 +46,8 @@ from .models import (
 from .epub_import_jobs import executor as epub_import_executor, run_epub_import
 from .book_fetch import DEFAULT_BOOK_FETCH_COUNT, MAX_BOOK_FETCH_COUNT
 from .book_fetch_jobs import executor as book_fetch_executor, run_book_fetch
+from .queue_import import MAX_IMPORT_ROWS, ImportFileError, build_preview, confirm_import
+from .story_export import build_story_export_csv
 from .ai_generation_jobs import (
     executor as ai_generation_executor,
     run_generate_blog_excerpt,
@@ -625,6 +627,19 @@ class StoryAdminViewSet(ModelViewSet):
 
         return queryset
 
+    @action(detail=False, methods=["get"], url_path="export")
+    def export(self, request):
+        """CSV export for the Story Report page — Story rows only (never
+        StoryQueue), respecting whatever report filters/search are currently
+        applied (same query params as the list endpoint), unpaginated. Same
+        column schema queue_import.py expects, so the file can be re-imported
+        elsewhere unchanged."""
+        queryset = self.filter_queryset(self.get_queryset())
+        csv_text = build_story_export_csv(queryset, request)
+        response = HttpResponse(csv_text, content_type="text/csv")
+        response["Content-Disposition"] = 'attachment; filename="stories-export.csv"'
+        return response
+
     @action(detail=True, methods=["post"], url_path="link-translation")
     def link_translation(self, request, pk=None):
         story = self.get_object()
@@ -797,6 +812,37 @@ class StoryQueueViewSet(ModelViewSet):
         except BookFetchJob.DoesNotExist:
             return Response({"detail": "Fetch job not found."}, status=status.HTTP_404_NOT_FOUND)
         return Response(BookFetchJobSerializer(job).data)
+
+    @action(detail=False, methods=["post"], url_path="import-preview")
+    def import_preview(self, request):
+        """Parses+dedupes an uploaded CSV/Excel file and returns what would
+        be added/skipped/rejected — writes nothing to the DB. See
+        queue_import.build_preview."""
+        uploaded_file = request.FILES.get("file")
+        if not uploaded_file:
+            return Response({"detail": "Upload a CSV or Excel (.xlsx) file."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            return Response(build_preview(uploaded_file))
+        except ImportFileError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=["post"], url_path="import-confirm")
+    def import_confirm(self, request):
+        """Creates StoryQueue rows for the admin-reviewed subset of an
+        import-preview's "to_add" list. Re-dedupes defensively against the
+        current DB state before writing. See queue_import.confirm_import."""
+        records = request.data.get("records")
+        if not isinstance(records, list) or not records:
+            return Response({"detail": "No records to import."}, status=status.HTTP_400_BAD_REQUEST)
+        if len(records) > MAX_IMPORT_ROWS:
+            return Response(
+                {"detail": f"Too many records — max {MAX_IMPORT_ROWS} per import."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        created_count, skipped_count = confirm_import(records)
+        return Response(
+            {"created_count": created_count, "skipped_count": skipped_count}, status=status.HTTP_201_CREATED
+        )
 
     @action(detail=True, methods=["post"], url_path="add", url_name="add")
     def add_to_stories(self, request, pk=None):

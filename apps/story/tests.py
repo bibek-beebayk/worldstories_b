@@ -1,3 +1,5 @@
+import csv
+import io
 from datetime import date, datetime, timedelta, timezone as datetime_timezone
 from io import BytesIO
 from types import SimpleNamespace
@@ -14,6 +16,7 @@ from rest_framework.test import APITestCase
 from storages.backends.s3 import S3Storage
 
 import anthropic
+import openpyxl
 from pydantic import ValidationError as PydanticValidationError
 
 from apps.story.api import StoryViewSet, open_s3_audio_stream
@@ -29,6 +32,13 @@ from apps.story.book_fetch import (
     fetch_books,
 )
 from apps.story.book_fetch_jobs import run_book_fetch
+from apps.story.queue_import import (
+    MAX_IMPORT_ROWS,
+    ImportFileError,
+    build_preview,
+    confirm_import,
+    parse_uploaded_file,
+)
 from apps.story.epub_import import EpubParseError, extract_chapters
 from apps.story.excerpts import _excerpt_from_text
 from apps.story.epub_import_jobs import run_epub_import
@@ -2536,3 +2546,329 @@ class FetchBooksApiTests(APITestCase):
 
         missing_response = self.client.get("/api/admin/story-queue/fetch-books/999999/")
         self.assertEqual(missing_response.status_code, 404)
+
+
+def _csv_upload(rows, filename="books.csv"):
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerows(rows)
+    return SimpleUploadedFile(filename, buf.getvalue().encode("utf-8"), content_type="text/csv")
+
+
+def _xlsx_upload(rows, filename="books.xlsx"):
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    for row in rows:
+        sheet.append(row)
+    buf = BytesIO()
+    workbook.save(buf)
+    return SimpleUploadedFile(
+        filename, buf.getvalue(), content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+
+class QueueImportFileParsingTests(SimpleTestCase):
+    def test_csv_headers_are_aliased_and_normalized(self):
+        upload = _csv_upload([["Title", "Author", "Year"], ["A Book", "An Author", "1900"]])
+
+        rows = parse_uploaded_file(upload)
+
+        self.assertEqual(rows, [{"title": "A Book", "author_name": "An Author", "original_published_year": "1900"}])
+
+    def test_xlsx_parses_rows(self):
+        upload = _xlsx_upload([["title", "author_name"], ["XLSX Book", "XLSX Author"]])
+
+        rows = parse_uploaded_file(upload)
+
+        self.assertEqual(rows, [{"title": "XLSX Book", "author_name": "XLSX Author"}])
+
+    def test_blank_rows_are_skipped(self):
+        upload = _csv_upload([["title", "author_name"], ["", ""], ["A Book", "An Author"]])
+
+        rows = parse_uploaded_file(upload)
+
+        self.assertEqual(len(rows), 1)
+
+    def test_bad_extension_raises_import_file_error(self):
+        upload = SimpleUploadedFile("books.txt", b"title\nA Book", content_type="text/plain")
+
+        with self.assertRaises(ImportFileError):
+            parse_uploaded_file(upload)
+
+    def test_oversized_file_raises_import_file_error(self):
+        from apps.story.queue_import import MAX_IMPORT_FILE_SIZE
+
+        oversized = SimpleUploadedFile("books.csv", b"a" * (MAX_IMPORT_FILE_SIZE + 1), content_type="text/csv")
+
+        with self.assertRaises(ImportFileError):
+            parse_uploaded_file(oversized)
+
+    def test_too_many_rows_raises_import_file_error(self):
+        rows = [["title"]] + [[f"Book {i}"] for i in range(MAX_IMPORT_ROWS + 1)]
+        upload = _csv_upload(rows)
+
+        with self.assertRaises(ImportFileError):
+            parse_uploaded_file(upload)
+
+    def test_empty_file_raises_import_file_error(self):
+        upload = _csv_upload([["title"]])
+
+        with self.assertRaises(ImportFileError):
+            parse_uploaded_file(upload)
+
+
+class BuildPreviewTests(TestCase):
+    def test_valid_row_is_resolved_and_added(self):
+        upload = _csv_upload(
+            [
+                ["title", "author_name", "country", "language", "genres", "original_published_year"],
+                ["A New Book", "New Author", "Japan", "Japanese", "Adventure; Gothic", "1900"],
+            ]
+        )
+
+        preview = build_preview(upload)
+
+        self.assertEqual(preview["to_add_count"], 1)
+        entry = preview["to_add"][0]
+        self.assertEqual(entry["country"], "JP")
+        self.assertEqual(entry["language"], "ja")
+        self.assertEqual(entry["genres"], ["Adventure", "Gothic"])
+        self.assertEqual(entry["published_date_label"], "1900")
+
+    def test_comma_separated_genres_also_split(self):
+        upload = _csv_upload(
+            [["title", "genres"], ["A Book", "Adventure, Gothic"]]
+        )
+
+        preview = build_preview(upload)
+
+        self.assertEqual(preview["to_add"][0]["genres"], ["Adventure", "Gothic"])
+
+    def test_missing_title_is_reported_as_an_error(self):
+        upload = _csv_upload([["title", "author_name"], ["", "An Author"]])
+
+        preview = build_preview(upload)
+
+        self.assertEqual(preview["to_add_count"], 0)
+        self.assertEqual(preview["error_count"], 1)
+        self.assertIn("missing required 'title'", preview["errors"][0])
+
+    def test_row_matching_an_existing_story_is_a_duplicate(self):
+        Story.objects.create(
+            title="Already Here", slug="already-here", author=Author.objects.create(name="Some Author")
+        )
+        upload = _csv_upload([["title", "author_name"], ["Already Here", "Some Author"]])
+
+        preview = build_preview(upload)
+
+        self.assertEqual(preview["to_add_count"], 0)
+        self.assertEqual(preview["duplicate_count"], 1)
+        self.assertEqual(preview["duplicates"][0]["reason"], "already_a_story")
+
+    def test_row_matching_a_not_yet_added_queue_entry_is_a_duplicate(self):
+        StoryQueue.objects.create(title="In The Queue", author_name="Queue Author")
+        upload = _csv_upload([["title", "author_name"], ["In The Queue", "Queue Author"]])
+
+        preview = build_preview(upload)
+
+        self.assertEqual(preview["duplicates"][0]["reason"], "already_in_queue")
+
+    def test_duplicate_within_the_file_is_flagged(self):
+        upload = _csv_upload(
+            [["title", "author_name"], ["Same Book", "Same Author"], ["same book", "same author"]]
+        )
+
+        preview = build_preview(upload)
+
+        self.assertEqual(preview["to_add_count"], 1)
+        self.assertEqual(preview["duplicates"][0]["reason"], "duplicate_in_file")
+
+    def test_preview_does_not_create_genres_or_categories(self):
+        upload = _csv_upload([["title", "genres", "categories"], ["A Book", "Brand New Genre", "Brand New Category"]])
+
+        build_preview(upload)
+
+        self.assertEqual(Genre.objects.filter(name="Brand New Genre").count(), 0)
+        self.assertEqual(Category.objects.filter(name="Brand New Category").count(), 0)
+
+
+class ImportApiTests(APITestCase):
+    def _make_superuser(self):
+        return User.objects.create(
+            email="admin@example.com", username="admin", is_superuser=True, is_staff=True, is_active=True
+        )
+
+    def test_import_preview_returns_counts(self):
+        self.client.force_authenticate(user=self._make_superuser())
+        upload = _csv_upload([["title", "author_name"], ["A Book", "An Author"]])
+
+        response = self.client.post("/api/admin/story-queue/import-preview/", {"file": upload}, format="multipart")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["to_add_count"], 1)
+
+    def test_import_preview_requires_a_file(self):
+        self.client.force_authenticate(user=self._make_superuser())
+
+        response = self.client.post("/api/admin/story-queue/import-preview/", {}, format="multipart")
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_import_preview_rejects_bad_file_type(self):
+        self.client.force_authenticate(user=self._make_superuser())
+        upload = SimpleUploadedFile("books.txt", b"title\nA Book", content_type="text/plain")
+
+        response = self.client.post("/api/admin/story-queue/import-preview/", {"file": upload}, format="multipart")
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_import_preview_requires_superuser(self):
+        regular_user = User.objects.create(email="user@example.com", username="user", is_active=True)
+        self.client.force_authenticate(user=regular_user)
+        upload = _csv_upload([["title"], ["A Book"]])
+
+        response = self.client.post("/api/admin/story-queue/import-preview/", {"file": upload}, format="multipart")
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_import_confirm_creates_queue_rows_and_resolves_genres(self):
+        self.client.force_authenticate(user=self._make_superuser())
+        upload = _csv_upload([["title", "author_name", "genres"], ["A Book", "An Author", "New Genre"]])
+        preview_response = self.client.post(
+            "/api/admin/story-queue/import-preview/", {"file": upload}, format="multipart"
+        )
+
+        response = self.client.post(
+            "/api/admin/story-queue/import-confirm/",
+            {"records": preview_response.data["to_add"]},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["created_count"], 1)
+        created = StoryQueue.objects.get(title="A Book")
+        self.assertEqual(list(created.genres.values_list("name", flat=True)), ["New Genre"])
+        self.assertEqual(Genre.objects.filter(name="New Genre").count(), 1)
+
+    def test_import_confirm_rejects_empty_records(self):
+        self.client.force_authenticate(user=self._make_superuser())
+
+        response = self.client.post("/api/admin/story-queue/import-confirm/", {"records": []}, format="json")
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_import_confirm_rejects_too_many_records(self):
+        self.client.force_authenticate(user=self._make_superuser())
+        records = [{"title": f"Book {i}"} for i in range(MAX_IMPORT_ROWS + 1)]
+
+        response = self.client.post("/api/admin/story-queue/import-confirm/", {"records": records}, format="json")
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_import_confirm_requires_superuser(self):
+        regular_user = User.objects.create(email="user@example.com", username="user", is_active=True)
+        self.client.force_authenticate(user=regular_user)
+
+        response = self.client.post(
+            "/api/admin/story-queue/import-confirm/", {"records": [{"title": "A Book"}]}, format="json"
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_import_confirm_skips_a_record_that_became_a_duplicate_since_preview(self):
+        self.client.force_authenticate(user=self._make_superuser())
+        upload = _csv_upload([["title", "author_name"], ["A Book", "An Author"]])
+        preview_response = self.client.post(
+            "/api/admin/story-queue/import-preview/", {"file": upload}, format="multipart"
+        )
+
+        # Simulate a race: the same book got added to Story between preview and confirm.
+        Story.objects.create(
+            title="A Book", slug="a-book", author=Author.objects.create(name="An Author")
+        )
+
+        response = self.client.post(
+            "/api/admin/story-queue/import-confirm/",
+            {"records": preview_response.data["to_add"]},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["created_count"], 0)
+        self.assertEqual(response.data["skipped_count"], 1)
+        self.assertEqual(StoryQueue.objects.filter(title="A Book").count(), 0)
+
+
+class StoryExportApiTests(APITestCase):
+    def _make_superuser(self):
+        return User.objects.create(
+            email="admin@example.com", username="admin", is_superuser=True, is_staff=True, is_active=True
+        )
+
+    def test_export_returns_csv_with_expected_header_and_content_type(self):
+        self.client.force_authenticate(user=self._make_superuser())
+
+        response = self.client.get("/api/admin/stories/export/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response["Content-Type"], "text/csv")
+        self.assertIn("attachment", response["Content-Disposition"])
+        rows = list(csv.reader(io.StringIO(response.content.decode("utf-8"))))
+        self.assertEqual(
+            rows[0],
+            [
+                "title", "author_name", "about", "story_type", "country", "language", "genres", "categories",
+                "original_published_year", "original_published_month", "original_published_day",
+                "epub_link", "pdf_link", "cover_image_link",
+            ],
+        )
+
+    def test_export_includes_resolved_names_and_genre_category_lists(self):
+        self.client.force_authenticate(user=self._make_superuser())
+        author = Author.objects.create(name="Some Author")
+        story = Story.objects.create(
+            title="A Book", slug="a-book", author=author, country="JP", language="ja",
+            about="A synopsis.", original_published_year=1900,
+        )
+        story.genres.add(Genre.objects.create(name="Adventure"), Genre.objects.create(name="Gothic"))
+        story.categories.add(Category.objects.create(name="Classic Literature"))
+
+        response = self.client.get("/api/admin/stories/export/")
+
+        rows = list(csv.reader(io.StringIO(response.content.decode("utf-8"))))
+        row = rows[1]
+        self.assertEqual(row[0], "A Book")
+        self.assertEqual(row[1], "Some Author")
+        self.assertEqual(row[4], "Japan")
+        self.assertEqual(row[5], "Japanese")
+        self.assertEqual(row[6], "Adventure, Gothic")
+        self.assertEqual(row[7], "Classic Literature")
+        self.assertEqual(row[8], "1900")
+
+    def test_export_respects_is_published_filter(self):
+        self.client.force_authenticate(user=self._make_superuser())
+        Story.objects.create(title="Published", slug="published", is_published=True)
+        Story.objects.create(title="Draft", slug="draft", is_published=False)
+
+        response = self.client.get("/api/admin/stories/export/", {"is_published": "true"})
+
+        rows = list(csv.reader(io.StringIO(response.content.decode("utf-8"))))
+        titles = [row[0] for row in rows[1:]]
+        self.assertEqual(titles, ["Published"])
+
+    def test_export_does_not_include_story_queue_entries(self):
+        self.client.force_authenticate(user=self._make_superuser())
+        StoryQueue.objects.create(title="Not A Real Story", author_name="Someone")
+
+        response = self.client.get("/api/admin/stories/export/")
+
+        rows = list(csv.reader(io.StringIO(response.content.decode("utf-8"))))
+        self.assertEqual(len(rows), 1)  # header only
+
+    def test_export_requires_superuser(self):
+        regular_user = User.objects.create(email="user@example.com", username="user", is_active=True)
+        self.client.force_authenticate(user=regular_user)
+
+        response = self.client.get("/api/admin/stories/export/")
+
+        self.assertEqual(response.status_code, 403)

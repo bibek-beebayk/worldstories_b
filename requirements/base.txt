@@ -19,3 +19,4 @@ ebooklib
 nh3
 anthropic
 markdown
+openpyxl
