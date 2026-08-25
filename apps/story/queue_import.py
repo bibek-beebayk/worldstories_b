@@ -169,11 +169,12 @@ def _record_to_preview_dict(record: _BookRecord) -> dict:
     year, month, day = sanitize_published_date(
         record.original_published_year, record.original_published_month, record.original_published_day
     )
+    matched_story_type = resolve_story_type(record.story_type)
     return {
         "title": record.title.strip(),
         "author_name": record.author_name.strip(),
         "about": record.about.strip(),
-        "story_type": resolve_story_type(record.story_type),
+        "story_type": matched_story_type.name if matched_story_type else "",
         "country": resolve_country(record.country),
         "language": resolve_language(record.language),
         "genres": [g.strip() for g in record.genres if g.strip()],

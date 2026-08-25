@@ -34,17 +34,6 @@ class StoryQuerySet(models.QuerySet):
     def published(self):
         return self.filter(published_story_q())
 
-STORY_TYPE_CHOICES = [
-    ("Short Story", "Short Story"),
-    ("Novel", "Novel"),
-    ("Novella", "Novella"),
-    ("Poetry", "Poetry"),
-    ("Non Fiction", "Non Fiction"),
-    ("Religious Text", "Religious Text"),
-    ("Summary", "Summary"),
-    ("Collection", "Collection"),
-]
-
 LANGUAGE_CHOICES = [
     ("en", "English"),
     ("es", "Spanish"),
@@ -65,9 +54,10 @@ LANGUAGE_CHOICES = [
 # of origin" on both Story and StoryQueue (StoryQueue.country is copied
 # verbatim into Story.country when a queue entry is turned into a story, so
 # both fields must accept exactly the same set of codes). A fixed list
-# rather than a Genre/Category-style model, matching how STORY_TYPE_CHOICES/
-# LANGUAGE_CHOICES already work here — countries are a well-known, mostly
-# static real-world set, not something admins curate over time.
+# rather than a Genre/Category-style model, matching how LANGUAGE_CHOICES
+# already works here — countries are a well-known, mostly static real-world
+# set, not something admins curate over time (unlike story types, which are
+# a real StoryType model precisely because admins DO want to curate that set).
 COUNTRY_CHOICES = [
     ("AF", "Afghanistan"), ("AL", "Albania"), ("DZ", "Algeria"), ("AD", "Andorra"),
     ("AO", "Angola"), ("AG", "Antigua and Barbuda"), ("AR", "Argentina"), ("AM", "Armenia"),
@@ -173,6 +163,29 @@ class Category(models.Model):
         return self.name
 
 
+class StoryType(models.Model):
+    """A story's format/category (Novel, Poetry, Short Story, ...) — an
+    admin-managed model, same shape as Category, rather than a fixed choices
+    list, so new types can be added/renamed/removed from the admin panel
+    without a code change."""
+
+    name = models.CharField(max_length=100, unique=True)
+
+    class Meta:
+        ordering = ["name"]
+
+    def __str__(self):
+        return self.name
+
+
+def default_story_type_id():
+    # Preserves the old CharField's default="Short Story" behavior for
+    # Story/Submission — "Short Story" is always present (seeded by the
+    # story_type migration). Returns None (leaving the FK unset, caught by
+    # the NOT NULL constraint) only if that row was somehow deleted.
+    return StoryType.objects.filter(name="Short Story").values_list("id", flat=True).first()
+
+
 class Tag(models.Model):
     name = models.CharField(max_length=50)
 
@@ -233,8 +246,8 @@ class Story(models.Model):
     retrospective_error = models.TextField(blank=True, null=True)
     genres = models.ManyToManyField(Genre, related_name="stories")
     categories = models.ManyToManyField(Category, related_name="stories", blank=True)
-    story_type = models.CharField(
-        max_length=50, choices=STORY_TYPE_CHOICES, default="Short Story"
+    story_type = models.ForeignKey(
+        StoryType, on_delete=models.PROTECT, related_name="stories", default=default_story_type_id
     )
     language = models.CharField(max_length=10, choices=LANGUAGE_CHOICES, default="en", db_index=True)
     country = models.CharField(max_length=2, choices=COUNTRY_CHOICES, blank=True)
@@ -422,7 +435,9 @@ class StoryQueue(models.Model):
     title = models.CharField(max_length=256)
     author_name = models.CharField(max_length=256, blank=True)
     about = models.TextField(blank=True, null=True)
-    story_type = models.CharField(max_length=50, choices=STORY_TYPE_CHOICES, blank=True)
+    story_type = models.ForeignKey(
+        StoryType, on_delete=models.PROTECT, null=True, blank=True, related_name="queue_items"
+    )
     country = models.CharField(max_length=2, choices=COUNTRY_CHOICES, blank=True)
     language = models.CharField(max_length=10, choices=LANGUAGE_CHOICES, blank=True)
     genres = models.ManyToManyField(Genre, blank=True, related_name="queue_items")
@@ -661,8 +676,8 @@ class Submission(models.Model):
     title = models.CharField(max_length=256)
     about = models.TextField()
     content = models.TextField()
-    story_type = models.CharField(
-        max_length=50, choices=STORY_TYPE_CHOICES, default="Short Story"
+    story_type = models.ForeignKey(
+        StoryType, on_delete=models.PROTECT, related_name="submissions", default=default_story_type_id
     )
     language = models.CharField(max_length=10, choices=LANGUAGE_CHOICES, default="en")
     genres = models.ManyToManyField(Genre, related_name="submissions")

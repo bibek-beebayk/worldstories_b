@@ -11,9 +11,8 @@ from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.validators import URLValidator
 
 from .book_fetch import _BookRecord
-from .models import COUNTRY_CHOICES, Category, Genre, LANGUAGE_CHOICES, STORY_TYPE_CHOICES, Story, StoryQueue
+from .models import COUNTRY_CHOICES, Category, Genre, LANGUAGE_CHOICES, Story, StoryQueue, StoryType
 
-_STORY_TYPE_VALUES = {value for value, _ in STORY_TYPE_CHOICES}
 _COUNTRY_NAME_TO_CODE = {name.lower(): code for code, name in COUNTRY_CHOICES}
 _LANGUAGE_NAME_TO_CODE = {name.lower(): code for code, name in LANGUAGE_CHOICES}
 _COUNTRY_CODES = {code for code, _ in COUNTRY_CHOICES}
@@ -56,8 +55,21 @@ def existing_queue_normalized_pairs() -> set:
     }
 
 
-def resolve_story_type(raw: str) -> str:
-    return raw if raw in _STORY_TYPE_VALUES else ""
+def resolve_story_type(raw: str, create_missing: bool = False) -> Optional[StoryType]:
+    """Unlike resolve_genres/resolve_categories, create_missing defaults to
+    False — story types are meant to be a small, admin-curated set (that's
+    the whole point of StoryType being a real, admin-manageable model), so
+    an AI suggestion or an import spreadsheet cell should never silently
+    spawn a new one. Idempotent when called on the same name more than once
+    (e.g. once during import preview, again at confirm) — unlike country/
+    language, story types have no separate code/label duality to trip over."""
+    name = raw.strip()
+    if not name:
+        return None
+    story_type = StoryType.objects.filter(name__iexact=name).first()
+    if story_type is None and create_missing:
+        story_type = StoryType.objects.create(name=name)
+    return story_type
 
 
 def resolve_country(raw: str) -> str:

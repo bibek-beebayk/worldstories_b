@@ -40,7 +40,7 @@ def _story_row(story, request) -> list:
         story.title,
         story.author.name if story.author_id else "",
         story.about or "",
-        story.story_type or "",
+        story.story_type.name,
         _COUNTRY_CODE_TO_NAME.get(story.country, ""),
         _LANGUAGE_CODE_TO_NAME.get(story.language, ""),
         ", ".join(genre.name for genre in story.genres.all()),
@@ -58,6 +58,6 @@ def build_story_export_csv(queryset, request=None) -> str:
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow(EXPORT_COLUMNS)
-    for story in queryset.prefetch_related("genres", "categories"):
+    for story in queryset.select_related("story_type").prefetch_related("genres", "categories"):
         writer.writerow(_story_row(story, request))
     return buf.getvalue()

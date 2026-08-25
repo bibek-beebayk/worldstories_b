@@ -37,7 +37,7 @@ class StoryFilter(filters.FilterSet):
     def filter_story_type(self, queryset, name, value):
         if not value or value.lower() == "all":
             return queryset
-        return queryset.filter(story_type=value)
+        return queryset.filter(story_type_id=value)
 
     def filter_country(self, queryset, name, value):
         if not value or value.lower() == "all":

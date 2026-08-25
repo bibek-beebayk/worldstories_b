@@ -21,7 +21,7 @@ from django.db import connections, transaction
 
 from .background_jobs import executor
 from .book_fetch import BookFetchError, fetch_books
-from .models import BookFetchJob, PromptSettings, StoryQueue
+from .models import BookFetchJob, PromptSettings, StoryQueue, StoryType
 from .queue_records import (
     dedupe_records,
     existing_queue_normalized_pairs,
@@ -65,6 +65,7 @@ def run_book_fetch(job_id: int) -> None:
                 existing_titles_csv=existing_titles_csv,
                 count=job.requested_count,
                 instructions=prompt_settings.book_fetch_instructions,
+                story_type_names=list(StoryType.objects.values_list("name", flat=True)),
                 model=prompt_settings.book_fetch_model,
             )
 

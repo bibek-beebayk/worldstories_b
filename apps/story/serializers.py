@@ -22,6 +22,7 @@ from .models import (
     PromptSettings,
     Blog,
     StoryQueue,
+    StoryType,
     published_story_q,
     with_preferred_translation_only,
 )
@@ -59,6 +60,20 @@ class CategorySerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Category
+        fields = ["id", "name", "stories_count"]
+
+
+class StoryTypeSerializer(serializers.ModelSerializer):
+    stories_count = serializers.SerializerMethodField()
+
+    def get_stories_count(self, obj):
+        annotated_count = getattr(obj, "published_stories_count", None)
+        if annotated_count is not None:
+            return annotated_count
+        return obj.stories.filter(published_story_q()).count()
+
+    class Meta:
+        model = StoryType
         fields = ["id", "name", "stories_count"]
 
 
@@ -111,10 +126,22 @@ class AdminCategorySerializer(serializers.ModelSerializer):
         fields = ["id", "name", "stories_count"]
 
 
+class AdminStoryTypeSerializer(serializers.ModelSerializer):
+    stories_count = serializers.SerializerMethodField(read_only=True)
+
+    def get_stories_count(self, obj):
+        return obj.stories.count()
+
+    class Meta:
+        model = StoryType
+        fields = ["id", "name", "stories_count"]
+
+
 class StoryListSerializer(serializers.ModelSerializer):
     genres = serializers.SerializerMethodField()
     categories = serializers.SerializerMethodField()
     author = serializers.SerializerMethodField()
+    story_type = serializers.CharField(source="story_type.name", read_only=True)
     summary_reading_minutes = serializers.SerializerMethodField()
     reviews_count = serializers.SerializerMethodField()
     is_favorite = serializers.SerializerMethodField()
@@ -303,6 +330,7 @@ class StoryDetailSerializer(serializers.ModelSerializer):
     cover_image = serializers.SerializerMethodField()
     pdf_file = serializers.SerializerMethodField()
     epub_file = serializers.SerializerMethodField()
+    story_type = serializers.CharField(source="story_type.name", read_only=True)
     genres = GenreSerializer(many=True, read_only=True)
     categories = CategorySerializer(many=True, read_only=True)
     author = AuthorSerializer(read_only=True)
@@ -481,6 +509,11 @@ class ReviewWriteSerializer(serializers.ModelSerializer):
 
 class SubmissionSerializer(serializers.ModelSerializer):
     user_email = serializers.EmailField(source="user.email", read_only=True)
+    # Wire format stays a plain name string (not an id) — the public
+    # submission form only ever offers a live-fetched list of existing
+    # StoryType names to pick from, never creates a new one, so there's no
+    # need to expose ids here at all.
+    story_type = serializers.SlugRelatedField(slug_field="name", queryset=StoryType.objects.all())
     genres = serializers.PrimaryKeyRelatedField(
         queryset=Genre.objects.all(), many=True
     )
@@ -551,6 +584,7 @@ class SubmissionSerializer(serializers.ModelSerializer):
 class SubmissionListSerializer(serializers.ModelSerializer):
     genres = GenreSerializer(many=True, read_only=True)
     cover_image = serializers.SerializerMethodField()
+    story_type = serializers.CharField(source="story_type.name", read_only=True)
 
     class Meta:
         model = Submission
@@ -587,6 +621,7 @@ class StoryAdminSerializer(serializers.ModelSerializer):
     author = serializers.PrimaryKeyRelatedField(
         queryset=Author.objects.all(), required=False, allow_null=True
     )
+    story_type = serializers.PrimaryKeyRelatedField(queryset=StoryType.objects.all())
     genres = serializers.PrimaryKeyRelatedField(
         queryset=Genre.objects.all(), many=True, required=False
     )
@@ -1144,6 +1179,7 @@ class AudioAdminSerializer(serializers.ModelSerializer):
 
 class SubmissionAdminSerializer(serializers.ModelSerializer):
     user_email = serializers.EmailField(source="user.email", read_only=True)
+    story_type = serializers.CharField(source="story_type.name", read_only=True)
     genres = GenreSerializer(many=True, read_only=True)
     cover_image = serializers.SerializerMethodField()
     cover_image_url = serializers.SerializerMethodField()
@@ -1223,6 +1259,9 @@ class SubmissionAdminSerializer(serializers.ModelSerializer):
 
 
 class StoryQueueSerializer(serializers.ModelSerializer):
+    story_type = serializers.PrimaryKeyRelatedField(
+        queryset=StoryType.objects.all(), required=False, allow_null=True
+    )
     genres = serializers.PrimaryKeyRelatedField(queryset=Genre.objects.all(), many=True, required=False)
     categories = serializers.PrimaryKeyRelatedField(queryset=Category.objects.all(), many=True, required=False)
     published_date_label = serializers.SerializerMethodField(read_only=True)

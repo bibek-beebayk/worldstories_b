@@ -32,6 +32,7 @@ from apps.story.book_fetch import (
     fetch_books,
 )
 from apps.story.book_fetch_jobs import run_book_fetch
+from apps.story.queue_records import resolve_story_type
 from apps.story.queue_import import (
     MAX_IMPORT_ROWS,
     ImportFileError,
@@ -55,6 +56,7 @@ from apps.story.models import (
     PromptSettings,
     Story,
     StoryQueue,
+    StoryType,
 )
 from apps.story.serializers import AudioAdminSerializer, StoryAdminSerializer, SubmissionSerializer
 from apps.story import reading_time
@@ -427,11 +429,15 @@ class ScheduledPublishingTests(SimpleTestCase):
 
     @patch("django.db.models.Model.save")
     def test_scheduled_story_uses_schedule_date_as_site_date(self, model_save):
+        # story_type given explicitly (an unsaved, in-memory instance — no DB
+        # access needed to construct it) so Story.__init__ never evaluates
+        # the field's DB-querying default, which SimpleTestCase forbids.
         story = Story(
             title="Scheduled",
             slug="scheduled",
             is_published=True,
             publish_at=datetime(2026, 9, 4, 10, 0, tzinfo=datetime_timezone.utc),
+            story_type=StoryType(id=1, name="Short Story"),
         )
 
         story.save()
@@ -465,7 +471,7 @@ class ScheduledPublishingTests(SimpleTestCase):
         self.assertContains(response, "/story-map")
         self.assertIn("<lastmod>2026-08-02</lastmod>", xml)
         published.assert_called_once_with()
-        queryset.exclude.assert_called_once_with(story_type="Summary")
+        queryset.exclude.assert_called_once_with(story_type__name="Summary")
 
 
 class BlogModelTests(TestCase):
@@ -940,14 +946,14 @@ class PublicAuthorApiTests(APITestCase):
         Story.objects.create(
             title="Published Spanish Novel",
             slug="published-spanish-novel",
-            story_type="Novel",
+            story_type=StoryType.objects.get(name="Novel"),
             language="es",
             is_published=True,
         )
         Story.objects.create(
             title="Draft French Poetry",
             slug="draft-french-poetry",
-            story_type="Poetry",
+            story_type=StoryType.objects.get(name="Poetry"),
             language="fr",
             is_published=False,
         )
@@ -956,7 +962,7 @@ class PublicAuthorApiTests(APITestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
-            {item["value"]: item["stories_count"] for item in response.data["story_types"]},
+            {item["name"]: item["stories_count"] for item in response.data["story_types"]},
             {"Novel": 1, "Short Story": 1},
         )
         self.assertEqual(
@@ -971,14 +977,15 @@ class PublicAuthorApiTests(APITestCase):
         )
 
     def test_story_list_can_filter_by_story_type(self):
+        novel_type = StoryType.objects.get(name="Novel")
         Story.objects.create(
             title="Published Novel",
             slug="published-novel",
-            story_type="Novel",
+            story_type=novel_type,
             is_published=True,
         )
 
-        response = self.client.get(reverse("story-list"), {"story_type": "Novel"})
+        response = self.client.get(reverse("story-list"), {"story_type": novel_type.id})
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual([story["slug"] for story in response.data["results"]], ["published-novel"])
@@ -1078,6 +1085,7 @@ class StoryAdminMultipartValidationTests(TestCase):
         data = QueryDict("", mutable=True)
         data["title"] = "Multipart Story"
         data["site_published_date"] = ""
+        data["story_type"] = StoryType.objects.get(name="Short Story").id
         data.setlist("pdf_file", [upload])
 
         serializer = StoryAdminSerializer(data=data)
@@ -1240,7 +1248,7 @@ class StoryQueueApiTests(APITestCase):
             title="Kafka on the Shore",
             author_name="Haruki Murakami",
             about="A boy runs away from home.",
-            story_type="Novel",
+            story_type=StoryType.objects.get(name="Novel"),
             country="JP",
             language="ja",
             original_published_year=2002,
@@ -1259,7 +1267,7 @@ class StoryQueueApiTests(APITestCase):
         queue_item.refresh_from_db()
         story = queue_item.added_story
         self.assertEqual(story.about, "A boy runs away from home.")
-        self.assertEqual(story.story_type, "Novel")
+        self.assertEqual(story.story_type.name, "Novel")
         self.assertEqual(story.country, "JP")
         self.assertEqual(story.language, "ja")
         self.assertEqual(story.original_published_year, 2002)
@@ -1364,12 +1372,15 @@ class StoryQueueApiTests(APITestCase):
         self.assertEqual([m["title"] for m in response.data["queue_matches"]], ["Kafka and the Trial"])
 
 
-class SubmissionFileUploadValidationTests(SimpleTestCase):
+class SubmissionFileUploadValidationTests(TestCase):
     """A logged-in user can submit whatever bytes they like under a
     pdf_file/epub_file field — the model previously had no extension or size
     validation, so a mislabeled or oversized upload would sail straight
     through to public R2 storage. These pin the FileExtensionValidator /
-    FileSizeValidator now declared on the model fields."""
+    FileSizeValidator now declared on the model fields.
+
+    TestCase (not SimpleTestCase) since story_type is now a SlugRelatedField
+    that needs a real DB lookup to validate against StoryType."""
 
     def _minimal_submission_data(self, **overrides):
         data = {
@@ -1550,6 +1561,12 @@ class RunEpubImportTests(TransactionTestCase):
     """Uses TransactionTestCase (not TestCase) because run_epub_import calls
     transaction.atomic() and connections.close_all() itself — behavior that
     TestCase's wrap-everything-in-one-rolled-back-transaction would mask."""
+
+    # TransactionTestCase.tearDown() truncates all tables (flush), which
+    # would also wipe the story_type migration's seeded StoryType rows for
+    # every test that runs after this class — serialized_rollback restores
+    # that initial data after each flush.
+    serialized_rollback = True
 
     def _make_story(self):
         return Story.objects.create(title="Story", slug="story", epub_file="story_files/epubs/book.epub")
@@ -1889,6 +1906,8 @@ class RunGenerateFieldTests(TransactionTestCase):
     effectively a standalone function call, mirroring how it runs from a
     worker thread in production."""
 
+    serialized_rollback = True  # see RunEpubImportTests for why
+
     def _make_story(self, with_chapter=True):
         story = Story.objects.create(title="Story", slug="story")
         if with_chapter:
@@ -2173,6 +2192,8 @@ class BlogExcerptPlainTextTests(SimpleTestCase):
 
 
 class RunGenerateBlogExcerptTests(TransactionTestCase):
+    serialized_rollback = True
+
     def _make_blog(self):
         return Blog.objects.create(
             title="A Blog Post", slug="a-blog-post", content="<p>Some post content.</p>", author_name="Jane"
@@ -2357,7 +2378,7 @@ class BookFetchPromptLogicTests(SimpleTestCase):
             mock_client.return_value.messages.parse.return_value = _mock_book_fetch_response(
                 [_book_record(title="Book One"), _book_record(title="Book Two")]
             )
-            books = fetch_books("title,author\n", 2, "instructions")
+            books = fetch_books("title,author\n", 2, "instructions", ["Novel"])
 
         self.assertEqual([b.title for b in books], ["Book One", "Book Two"])
         mock_client.return_value.messages.parse.assert_called_once()
@@ -2373,13 +2394,13 @@ class BookFetchPromptLogicTests(SimpleTestCase):
             with patch("apps.story.book_fetch._client") as mock_client:
                 mock_client.return_value.messages.parse.side_effect = exc
                 with self.assertRaises(BookFetchError):
-                    fetch_books("title,author\n", 5, "instructions")
+                    fetch_books("title,author\n", 5, "instructions", ["Novel"])
 
     def test_empty_books_list_raises_book_fetch_error(self):
         with patch("apps.story.book_fetch._client") as mock_client:
             mock_client.return_value.messages.parse.return_value = _mock_book_fetch_response([])
             with self.assertRaises(BookFetchError):
-                fetch_books("title,author\n", 5, "instructions")
+                fetch_books("title,author\n", 5, "instructions", ["Novel"])
 
     def test_max_tokens_scales_with_count_but_stays_capped(self):
         self.assertEqual(_max_tokens_for(1), 4_500)
@@ -2392,13 +2413,15 @@ class BookFetchPromptLogicTests(SimpleTestCase):
                 "_BookFetchOutput", []
             )
             with self.assertRaises(BookFetchError):
-                fetch_books("title,author\n", 5, "instructions")
+                fetch_books("title,author\n", 5, "instructions", ["Novel"])
 
 
 class RunBookFetchTests(TransactionTestCase):
     """Uses TransactionTestCase (not TestCase) because run_book_fetch calls
     transaction.atomic() and connections.close_all() itself, same reasoning
     as RunEpubImportTests."""
+
+    serialized_rollback = True  # see RunEpubImportTests for why
 
     def test_success_path_creates_queue_rows_and_marks_job_completed(self):
         job = BookFetchJob.objects.create(requested_count=2)
@@ -2415,7 +2438,7 @@ class RunBookFetchTests(TransactionTestCase):
         created = StoryQueue.objects.get(title="Book One")
         self.assertEqual(created.country, "JP")
         self.assertEqual(created.language, "ja")
-        self.assertEqual(created.story_type, "Novel")
+        self.assertEqual(created.story_type.name, "Novel")
         self.assertEqual(list(created.genres.values_list("name", flat=True)), ["Adventure"])
         self.assertEqual(list(created.categories.values_list("name", flat=True)), ["Classic Literature"])
 
@@ -2501,7 +2524,7 @@ class RunBookFetchTests(TransactionTestCase):
             run_book_fetch(job.id)
 
         created = StoryQueue.objects.get()
-        self.assertEqual(created.story_type, "")
+        self.assertIsNone(created.story_type)
         self.assertEqual(created.country, "")
         self.assertEqual(created.language, "")
 
@@ -2959,5 +2982,93 @@ class StoryExportApiTests(APITestCase):
         self.client.force_authenticate(user=regular_user)
 
         response = self.client.get("/api/admin/stories/export/")
+
+        self.assertEqual(response.status_code, 403)
+
+
+class ResolveStoryTypeTests(TestCase):
+    def test_matches_case_insensitively(self):
+        matched = resolve_story_type("novel")
+        self.assertEqual(matched.name, "Novel")
+
+    def test_does_not_create_a_new_type_by_default(self):
+        matched = resolve_story_type("Not A Real Type")
+        self.assertIsNone(matched)
+        self.assertFalse(StoryType.objects.filter(name="Not A Real Type").exists())
+
+    def test_create_missing_true_creates_a_new_type(self):
+        matched = resolve_story_type("Brand New Type", create_missing=True)
+        self.assertEqual(matched.name, "Brand New Type")
+        self.assertTrue(StoryType.objects.filter(name="Brand New Type").exists())
+
+    def test_blank_returns_none(self):
+        self.assertIsNone(resolve_story_type("  "))
+
+
+class StoryTypeViewSetTests(APITestCase):
+    def test_public_list_returns_all_types_ordered_by_name(self):
+        response = self.client.get("/api/story-types/")
+
+        self.assertEqual(response.status_code, 200)
+        names = [item["name"] for item in response.data]
+        self.assertEqual(names, sorted(names))
+        self.assertIn("Novel", names)
+
+
+class StoryTypeAdminApiTests(APITestCase):
+    def _make_superuser(self):
+        return User.objects.create(
+            email="admin@example.com", username="admin", is_superuser=True, is_staff=True, is_active=True
+        )
+
+    def test_create_update_and_list(self):
+        self.client.force_authenticate(user=self._make_superuser())
+
+        create_response = self.client.post("/api/admin/story-types/", {"name": "Fable"}, format="json")
+        self.assertEqual(create_response.status_code, 201)
+        story_type_id = create_response.data["id"]
+
+        update_response = self.client.patch(
+            f"/api/admin/story-types/{story_type_id}/", {"name": "Fables"}, format="json"
+        )
+        self.assertEqual(update_response.status_code, 200)
+        self.assertEqual(update_response.data["name"], "Fables")
+
+        list_response = self.client.get("/api/admin/story-types/")
+        self.assertIn("Fables", [item["name"] for item in list_response.data])
+
+    def test_delete_succeeds_when_not_in_use(self):
+        self.client.force_authenticate(user=self._make_superuser())
+        story_type = StoryType.objects.create(name="Unused Type")
+
+        response = self.client.delete(f"/api/admin/story-types/{story_type.id}/")
+
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(StoryType.objects.filter(id=story_type.id).exists())
+
+    def test_delete_blocked_when_referenced_by_a_story(self):
+        self.client.force_authenticate(user=self._make_superuser())
+        story_type = StoryType.objects.create(name="In Use Type")
+        Story.objects.create(title="A Story", slug="a-story", story_type=story_type)
+
+        response = self.client.delete(f"/api/admin/story-types/{story_type.id}/")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertTrue(StoryType.objects.filter(id=story_type.id).exists())
+
+    def test_delete_blocked_when_referenced_by_a_queue_item(self):
+        self.client.force_authenticate(user=self._make_superuser())
+        story_type = StoryType.objects.create(name="In Use Type")
+        StoryQueue.objects.create(title="A Book", story_type=story_type)
+
+        response = self.client.delete(f"/api/admin/story-types/{story_type.id}/")
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_requires_superuser(self):
+        regular_user = User.objects.create(email="user@example.com", username="user", is_active=True)
+        self.client.force_authenticate(user=regular_user)
+
+        response = self.client.get("/api/admin/story-types/")
 
         self.assertEqual(response.status_code, 403)

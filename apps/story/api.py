@@ -23,6 +23,7 @@ from apps.stats.models import ReadingProgress, AudioReadingProgress
 from apps.users.models import User
 from apps.users.recommendations import recommend_because_finished
 from .models import (
+    default_story_type_id,
     Genre,
     Category,
     Story,
@@ -38,9 +39,9 @@ from .models import (
     PromptSettings,
     Blog,
     StoryQueue,
+    StoryType,
     with_preferred_translation_only,
     published_story_q,
-    STORY_TYPE_CHOICES,
     LANGUAGE_CHOICES,
     COUNTRY_CHOICES,
 )
@@ -57,6 +58,8 @@ from .ai_generation_jobs import (
 from .serializers import (
     GenreSerializer,
     CategorySerializer,
+    StoryTypeSerializer,
+    AdminStoryTypeSerializer,
     AuthorSerializer,
     AuthorDetailSerializer,
     AdminGenreSerializer,
@@ -872,8 +875,10 @@ class StoryQueueViewSet(ModelViewSet):
         if queue_item.author_name:
             author, _ = Author.objects.get_or_create(name=queue_item.author_name)
             story_data["author"] = author.id
-        if queue_item.story_type:
-            story_data["story_type"] = queue_item.story_type
+        # Story.story_type is required — fall back to the same default a
+        # story would get if created with no explicit choice, since a queue
+        # item's story_type is optional but a real Story's isn't.
+        story_data["story_type"] = queue_item.story_type_id or default_story_type_id()
         if queue_item.country:
             story_data["country"] = queue_item.country
         if queue_item.language:
@@ -1178,6 +1183,47 @@ class CategoryAdminViewSet(ModelViewSet):
     search_fields = ["name"]
 
 
+class StoryTypeViewSet(ReadOnlyModelViewSet):
+    """Public, read-only — the live list of story types for any form that
+    needs to offer a choice (Library's filter, the public submission form).
+    No permission override needed (AllowAny). Unpaginated, unlike
+    AuthorViewSet — story types are a small, curated set meant to be listed
+    in full for a dropdown, not paged through."""
+
+    queryset = StoryType.objects.all().order_by("name")
+    serializer_class = StoryTypeSerializer
+    pagination_class = None
+
+
+class StoryTypeAdminViewSet(ModelViewSet):
+    """Full story-type management (list/create/update/delete) for the admin
+    panel. Deletion is blocked while the type is still referenced by any
+    Story, StoryQueue entry, or Submission — story_type uses
+    on_delete=PROTECT everywhere, so an unguarded delete would otherwise hit
+    an unfriendly IntegrityError instead of a clear explanation."""
+
+    queryset = StoryType.objects.all().order_by("name")
+    serializer_class = AdminStoryTypeSerializer
+    permission_classes = [IsSuperUser]
+    pagination_class = None
+    filter_backends = [SearchFilter]
+    search_fields = ["name"]
+
+    def destroy(self, request, *args, **kwargs):
+        story_type = self.get_object()
+        in_use = (
+            story_type.stories.exists()
+            or story_type.queue_items.exists()
+            or story_type.submissions.exists()
+        )
+        if in_use:
+            return Response(
+                {"detail": f"Can't delete \"{story_type.name}\" — it's still in use. Reassign those first."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return super().destroy(request, *args, **kwargs)
+
+
 class AdminGenreListCreateAPIView(APIView):
     permission_classes = [IsSuperUser]
 
@@ -1335,21 +1381,17 @@ class DiscoverDataAPIView(APIView):
             reviews_total=Count("reviews", distinct=True),
         )
 
-        story_type_counts = {
-            item["story_type"]: item["stories_count"]
-            for item in Story.objects.published()
-            .values("story_type")
-            .annotate(stories_count=Count("id"))
-        }
-        story_types = [
-            {
-                "value": value,
-                "label": label,
-                "stories_count": story_type_counts[value],
-            }
-            for value, label in STORY_TYPE_CHOICES
-            if value in story_type_counts
-        ]
+        story_types = (
+            StoryType.objects.filter(published_story_q("stories"))
+            .annotate(
+                published_stories_count=Count(
+                    "stories",
+                    filter=published_story_q("stories"),
+                    distinct=True,
+                )
+            )
+            .order_by("name")
+        )
         language_counts = {
             item["language"]: item["stories_count"]
             for item in Story.objects.published()
@@ -1391,7 +1433,7 @@ class DiscoverDataAPIView(APIView):
             {
                 "genres": GenreSerializer(genres, many=True).data,
                 "categories": CategorySerializer(categories, many=True).data,
-                "story_types": story_types,
+                "story_types": StoryTypeSerializer(story_types, many=True).data,
                 "languages": languages,
                 "most_viewed": StoryListSerializer(
                     trending_qs.order_by("-views", "-id")[:10],

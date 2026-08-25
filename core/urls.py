@@ -19,6 +19,7 @@ router = DefaultRouter()
 
 router.register("stories", story_api.StoryViewSet, basename="story")
 router.register("authors", story_api.AuthorViewSet, basename="author")
+router.register("story-types", story_api.StoryTypeViewSet, basename="story-type")
 router.register("submissions", story_api.SubmissionViewSet, basename="submission")
 router.register("blog", story_api.BlogViewSet, basename="blog")
 router.register("admin/stories", story_api.StoryAdminViewSet, basename="admin-story")
@@ -27,6 +28,7 @@ router.register("admin/audios", story_api.AudioAdminViewSet, basename="admin-aud
 router.register("admin/submissions", story_api.SubmissionAdminViewSet, basename="admin-submission")
 router.register("admin/authors", story_api.AuthorAdminViewSet, basename="admin-author")
 router.register("admin/categories", story_api.CategoryAdminViewSet, basename="admin-category")
+router.register("admin/story-types", story_api.StoryTypeAdminViewSet, basename="admin-story-type")
 router.register("admin/users", users_api.UserAdminViewSet, basename="admin-user")
 router.register("admin/blog", story_api.BlogAdminViewSet, basename="admin-blog")
 router.register("admin/story-queue", story_api.StoryQueueViewSet, basename="admin-story-queue")
@@ -59,7 +61,7 @@ def sitemap(request):
     # offered to search engines as representative site content.
     stories = (
         Story.objects.published()
-        .exclude(story_type="Summary")
+        .exclude(story_type__name="Summary")
         .prefetch_related("chapters")
         .only("slug", "site_published_date")
     )

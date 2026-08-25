@@ -71,7 +71,7 @@ class AdminAnalyticsContentAPIView(APIView):
 
         story_type_breakdown = (
             Story.objects.published()
-            .values("story_type")
+            .values("story_type__name")
             .annotate(count=Count("id"), avg_rating=Avg("rating"), avg_views=Avg("views"))
             .order_by("-count")
         )
@@ -116,7 +116,7 @@ class AdminAnalyticsContentAPIView(APIView):
                 "genre_performance": genre_performance,
                 "story_type_breakdown": [
                     {
-                        "story_type": row["story_type"],
+                        "story_type": row["story_type__name"],
                         "count": row["count"],
                         "avg_rating": round(row["avg_rating"] or 0, 2),
                         "avg_views": round(row["avg_views"] or 0, 1),
@@ -311,7 +311,10 @@ class AdminAnalyticsSubmissionsAPIView(APIView):
         review_hours = [(s.reviewed_at - s.created_at).total_seconds() / 3600 for s in reviewed_qs]
         avg_time_to_review_hours = round(sum(review_hours) / len(review_hours), 1) if review_hours else 0
 
-        by_story_type = list(submissions_qs.values("story_type").annotate(count=Count("id")).order_by("-count"))
+        by_story_type = [
+            {"story_type": row["story_type__name"], "count": row["count"]}
+            for row in submissions_qs.values("story_type__name").annotate(count=Count("id")).order_by("-count")
+        ]
 
         by_genre_qs = (
             Genre.objects.annotate(

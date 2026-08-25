@@ -21,8 +21,6 @@ DEFAULT_BOOK_FETCH_COUNT = 10
 # exceed what a single non-streaming response can reliably return.
 MAX_BOOK_FETCH_COUNT = 14
 
-_STORY_TYPES = ["Short Story", "Novel", "Novella", "Poetry", "Non Fiction", "Religious Text", "Summary", "Collection"]
-
 
 class _BookRecord(BaseModel):
     title: str
@@ -56,12 +54,15 @@ def _client() -> anthropic.Anthropic:
     return anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
 
 
-def _build_user_message(existing_titles_csv: str, count: int) -> str:
+def _build_user_message(existing_titles_csv: str, count: int, story_type_names: List[str]) -> str:
     # Mechanical assembly only — the CSV and count are placed into a fixed
     # template; the admin-editable portion (PromptSettings.book_fetch_instructions)
     # is passed separately as the system prompt and never interpolated into
     # this string, matching ai_generation._build_user_message's same split.
-    story_types = ", ".join(_STORY_TYPES)
+    # story_type_names comes from the live StoryType table (book_fetch_jobs.py
+    # — this module has no DB access of its own) rather than a hardcoded list,
+    # so newly admin-created types are usable immediately.
+    story_types = ", ".join(story_type_names)
     return (
         "Existing titles already in our catalog — do not suggest any of these "
         "(a book counts as a duplicate if both its title and author match a "
@@ -109,7 +110,13 @@ def _max_tokens_for(count: int) -> int:
     return min(20_000, 3_000 + count * 1_500)
 
 
-def fetch_books(existing_titles_csv: str, count: int, instructions: str, model: str = MODEL_ID) -> List[_BookRecord]:
+def fetch_books(
+    existing_titles_csv: str,
+    count: int,
+    instructions: str,
+    story_type_names: List[str],
+    model: str = MODEL_ID,
+) -> List[_BookRecord]:
     """Single Anthropic API call + parse. Raises BookFetchError on API
     failure or an invalid/empty response — callers own recording the
     failure (book_fetch_jobs.run_book_fetch)."""
@@ -121,7 +128,7 @@ def fetch_books(existing_titles_csv: str, count: int, instructions: str, model: 
             messages=[
                 {
                     "role": "user",
-                    "content": _build_user_message(existing_titles_csv, count),
+                    "content": _build_user_message(existing_titles_csv, count, story_type_names),
                 }
             ],
             output_format=_BookFetchOutput,
