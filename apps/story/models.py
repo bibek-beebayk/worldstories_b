@@ -441,6 +441,10 @@ class StoryQueue(models.Model):
     # StoryQueueViewSet.add_to_stories) rather than living on Story itself,
     # since a queue entry has no chapter structure of its own to copy into.
     content = models.TextField(blank=True)
+    # Admin-only scratch notes about this queue entry (e.g. where it was
+    # sourced, quality concerns) — deliberately NOT copied onto the Story
+    # by StoryQueueViewSet.add_to_stories, unlike every other field here.
+    notes = models.TextField(blank=True)
     story_type = models.ForeignKey(
         StoryType, on_delete=models.PROTECT, null=True, blank=True, related_name="queue_items"
     )

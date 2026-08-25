@@ -1334,6 +1334,26 @@ class StoryQueueApiTests(APITestCase):
         queue_item.refresh_from_db()
         self.assertEqual(queue_item.added_story.chapters.count(), 0)
 
+    def test_notes_can_be_saved_and_updated_but_are_never_copied_to_the_story(self):
+        create_response = self.client.post(
+            reverse("admin-story-queue-list"),
+            {"title": "A Book", "author_name": "Someone", "notes": "<p>Found via a library sale.</p>"},
+        )
+        self.assertEqual(create_response.status_code, 201)
+        self.assertEqual(create_response.data["notes"], "<p>Found via a library sale.</p>")
+
+        item_id = create_response.data["id"]
+        update_response = self.client.patch(
+            reverse("admin-story-queue-detail", args=[item_id]), {"notes": "<p>Updated note.</p>"}
+        )
+        self.assertEqual(update_response.status_code, 200)
+        self.assertEqual(update_response.data["notes"], "<p>Updated note.</p>")
+
+        add_response = self.client.post(reverse("admin-story-queue-add", args=[item_id]))
+        self.assertEqual(add_response.status_code, 201)
+        story = StoryQueue.objects.get(id=item_id).added_story
+        self.assertFalse(hasattr(story, "notes"))
+
     def test_queue_item_rejects_a_month_without_a_year(self):
         response = self.client.post(
             reverse("admin-story-queue-list"),
