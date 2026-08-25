@@ -905,6 +905,19 @@ class StoryQueueViewSet(ModelViewSet):
         story_serializer.is_valid(raise_exception=True)
         story = story_serializer.save()
 
+        # A queue entry has no chapter structure of its own — a non-blank
+        # content value is the whole story text (short stories only), so it
+        # becomes the new Story's single chapter rather than living on
+        # Story itself. Mirrors _publish_submission's identical pattern.
+        if queue_item.content.strip():
+            Chapter.objects.create(
+                story=story,
+                title="Chapter 1",
+                slug="chapter-1",
+                content=queue_item.content,
+                order=1,
+            )
+
         queue_item.is_added = True
         queue_item.added_story = story
         queue_item.save(update_fields=["is_added", "added_story"])

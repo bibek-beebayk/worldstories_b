@@ -435,6 +435,12 @@ class StoryQueue(models.Model):
     title = models.CharField(max_length=256)
     author_name = models.CharField(max_length=256, blank=True)
     about = models.TextField(blank=True, null=True)
+    # The full story text — only meaningful for a short, single-chapter
+    # work. When the "add" action turns this entry into a real Story, a
+    # non-blank value here becomes that Story's one chapter (see
+    # StoryQueueViewSet.add_to_stories) rather than living on Story itself,
+    # since a queue entry has no chapter structure of its own to copy into.
+    content = models.TextField(blank=True)
     story_type = models.ForeignKey(
         StoryType, on_delete=models.PROTECT, null=True, blank=True, related_name="queue_items"
     )

@@ -1308,6 +1308,32 @@ class StoryQueueApiTests(APITestCase):
         self.assertEqual(list(story.genres.values_list("id", flat=True)), [genre.id])
         self.assertEqual(list(story.categories.values_list("id", flat=True)), [category.id])
 
+    def test_add_action_copies_content_into_a_chapter_1(self):
+        queue_item = StoryQueue.objects.create(
+            title="A Short Story", author_name="Someone", content="Once upon a time..."
+        )
+
+        response = self.client.post(reverse("admin-story-queue-add", args=[queue_item.id]))
+
+        self.assertEqual(response.status_code, 201)
+        queue_item.refresh_from_db()
+        story = queue_item.added_story
+        self.assertEqual(story.chapters.count(), 1)
+        chapter = story.chapters.first()
+        self.assertEqual(chapter.title, "Chapter 1")
+        self.assertEqual(chapter.slug, "chapter-1")
+        self.assertEqual(chapter.content, "Once upon a time...")
+        self.assertEqual(chapter.order, 1)
+
+    def test_add_action_creates_no_chapter_when_content_is_blank(self):
+        queue_item = StoryQueue.objects.create(title="No Content Here", author_name="Someone")
+
+        response = self.client.post(reverse("admin-story-queue-add", args=[queue_item.id]))
+
+        self.assertEqual(response.status_code, 201)
+        queue_item.refresh_from_db()
+        self.assertEqual(queue_item.added_story.chapters.count(), 0)
+
     def test_queue_item_rejects_a_month_without_a_year(self):
         response = self.client.post(
             reverse("admin-story-queue-list"),

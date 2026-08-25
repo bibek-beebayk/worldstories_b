@@ -1273,6 +1273,7 @@ class StoryQueueSerializer(serializers.ModelSerializer):
             "title",
             "author_name",
             "about",
+            "content",
             "story_type",
             "country",
             "language",
