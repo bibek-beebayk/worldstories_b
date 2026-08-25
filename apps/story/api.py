@@ -775,22 +775,34 @@ class StoryQueueViewSet(ModelViewSet):
         already-added queue entry is a duplicate of the Story it produced,
         which the Story-side check already catches. Prefix (not exact)
         matching so results appear progressively while typing, same as the
-        genre/category suggestion lists elsewhere in this form."""
+        genre/category suggestion lists elsewhere in this form.
+
+        When editing an existing queue item, the Edit form passes its own id
+        as exclude_queue_id so the item doesn't flag itself (and its own
+        added_story, if it has one) as a duplicate of itself."""
         title = request.query_params.get("title", "").strip()
         if not title:
             return Response({"story_matches": [], "queue_matches": []})
 
+        story_queryset = Story.objects.filter(title__istartswith=title)
+        queue_queryset = StoryQueue.objects.filter(title__istartswith=title, is_added=False)
+
+        exclude_queue_id = request.query_params.get("exclude_queue_id")
+        if exclude_queue_id:
+            queue_queryset = queue_queryset.exclude(id=exclude_queue_id)
+            excluded_item = (
+                StoryQueue.objects.filter(id=exclude_queue_id).only("added_story_id").first()
+            )
+            if excluded_item and excluded_item.added_story_id:
+                story_queryset = story_queryset.exclude(id=excluded_item.added_story_id)
+
         story_matches = [
             {"id": story.id, "title": story.title, "slug": story.slug, "is_published": story.is_published}
-            for story in Story.objects.filter(title__istartswith=title).only(
-                "id", "title", "slug", "is_published"
-            )[:8]
+            for story in story_queryset.only("id", "title", "slug", "is_published")[:8]
         ]
         queue_matches = [
             {"id": item.id, "title": item.title, "author_name": item.author_name}
-            for item in StoryQueue.objects.filter(title__istartswith=title, is_added=False).only(
-                "id", "title", "author_name"
-            )[:8]
+            for item in queue_queryset.only("id", "title", "author_name")[:8]
         ]
         return Response({"story_matches": story_matches, "queue_matches": queue_matches})
 

@@ -1194,6 +1194,37 @@ class StoryQueueApiTests(APITestCase):
         self.assertEqual(create_response.data["is_added"], False)
         self.assertIsNone(create_response.data["added_story"])
 
+    def test_can_be_updated(self):
+        item = StoryQueue.objects.create(title="Draft Title", author_name="Someone")
+
+        response = self.client.patch(
+            reverse("admin-story-queue-detail", args=[item.id]),
+            {"title": "Final Title", "author_name": "Someone Else", "about": "Updated blurb."},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        item.refresh_from_db()
+        self.assertEqual(item.title, "Final Title")
+        self.assertEqual(item.author_name, "Someone Else")
+        self.assertEqual(item.about, "Updated blurb.")
+
+    def test_update_cannot_tamper_with_is_added_or_added_story(self):
+        added_story = Story.objects.create(title="Already Published", slug="already-published")
+        item = StoryQueue.objects.create(
+            title="Already Added", author_name="Someone", is_added=True, added_story=added_story
+        )
+        other_story = Story.objects.create(title="Someone Else's Story", slug="someone-elses-story")
+
+        response = self.client.patch(
+            reverse("admin-story-queue-detail", args=[item.id]),
+            {"is_added": False, "added_story": other_story.id},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        item.refresh_from_db()
+        self.assertTrue(item.is_added)
+        self.assertEqual(item.added_story_id, added_story.id)
+
     def test_filters_by_is_added(self):
         StoryQueue.objects.create(title="Not Added", author_name="Someone")
         added_story = Story.objects.create(title="Added Story", slug="added-story")
@@ -1370,6 +1401,41 @@ class StoryQueueApiTests(APITestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual([m["title"] for m in response.data["story_matches"]], ["Kafka on the Shore"])
         self.assertEqual([m["title"] for m in response.data["queue_matches"]], ["Kafka and the Trial"])
+
+    def test_check_title_excludes_the_queue_item_being_edited(self):
+        item = StoryQueue.objects.create(title="The Three Musketeers", author_name="Alexandre Dumas")
+
+        response = self.client.get(
+            reverse("admin-story-queue-check-title"),
+            {"title": "The Three Musketeers", "exclude_queue_id": item.id},
+        )
+
+        self.assertEqual(response.data["story_matches"], [])
+        self.assertEqual(response.data["queue_matches"], [])
+
+    def test_check_title_exclude_queue_id_still_finds_a_different_duplicate(self):
+        editing_item = StoryQueue.objects.create(title="The Three Musketeers", author_name="Alexandre Dumas")
+        StoryQueue.objects.create(title="The Three Musketeers", author_name="A Different Entry")
+
+        response = self.client.get(
+            reverse("admin-story-queue-check-title"),
+            {"title": "The Three Musketeers", "exclude_queue_id": editing_item.id},
+        )
+
+        self.assertEqual(len(response.data["queue_matches"]), 1)
+        self.assertEqual(response.data["queue_matches"][0]["author_name"], "A Different Entry")
+
+    def test_check_title_exclude_queue_id_also_excludes_its_own_added_story(self):
+        story = Story.objects.create(title="Already Added", slug="already-added")
+        item = StoryQueue.objects.create(title="Already Added", is_added=True, added_story=story)
+
+        response = self.client.get(
+            reverse("admin-story-queue-check-title"),
+            {"title": "Already Added", "exclude_queue_id": item.id},
+        )
+
+        self.assertEqual(response.data["story_matches"], [])
+        self.assertEqual(response.data["queue_matches"], [])
 
 
 class SubmissionFileUploadValidationTests(TestCase):
