@@ -41,6 +41,7 @@ from .models import (
     StoryQueue,
     StoryType,
     Tag,
+    Theme,
     with_preferred_translation_only,
     published_story_q,
     LANGUAGE_CHOICES,
@@ -62,6 +63,9 @@ from .serializers import (
     TagSerializer,
     TagDetailSerializer,
     AdminTagSerializer,
+    ThemeSerializer,
+    ThemeDetailSerializer,
+    AdminThemeSerializer,
     StoryTypeSerializer,
     AdminStoryTypeSerializer,
     AuthorSerializer,
@@ -261,6 +265,33 @@ class TagViewSet(ReadOnlyModelViewSet):
         if self.action == "retrieve":
             return TagDetailSerializer
         return TagSerializer
+
+
+class ThemeViewSet(ReadOnlyModelViewSet):
+    """Public theme directory backing /theme/<slug> SEO landing pages —
+    same shape as TagViewSet, independent curation (reading experience
+    rather than search-phrase keywords)."""
+
+    lookup_field = "slug"
+    pagination_class = None
+
+    def get_queryset(self):
+        return (
+            Theme.objects.annotate(
+                published_stories_count=Count(
+                    "stories",
+                    filter=published_story_q("stories"),
+                    distinct=True,
+                )
+            )
+            .filter(published_stories_count__gt=0)
+            .order_by("name")
+        )
+
+    def get_serializer_class(self):
+        if self.action == "retrieve":
+            return ThemeDetailSerializer
+        return ThemeSerializer
 
 
 class StoryViewSet(ReadOnlyModelViewSet):
@@ -789,7 +820,7 @@ class StoryQueueViewSet(ModelViewSet):
     one meaningful custom behavior: turning one entry into a real, draft
     Story."""
 
-    queryset = StoryQueue.objects.select_related("added_story").prefetch_related("genres", "categories", "tags").all()
+    queryset = StoryQueue.objects.select_related("added_story").prefetch_related("genres", "categories", "tags", "themes").all()
     serializer_class = StoryQueueSerializer
     permission_classes = [IsSuperUser]
 
@@ -914,6 +945,7 @@ class StoryQueueViewSet(ModelViewSet):
             "genres": [genre.id for genre in queue_item.genres.all()],
             "categories": [category.id for category in queue_item.categories.all()],
             "tags": [tag.id for tag in queue_item.tags.all()],
+            "themes": [theme.id for theme in queue_item.themes.all()],
             "original_published_year": queue_item.original_published_year,
             "original_published_month": queue_item.original_published_month,
             "original_published_day": queue_item.original_published_day,
@@ -1322,6 +1354,32 @@ class AdminTagListCreateAPIView(APIView):
             return Response({"detail": "name is required."}, status=status.HTTP_400_BAD_REQUEST)
         tag = Tag.objects.create(name=name, slug=_unique_tag_slug(name))
         return Response(AdminTagSerializer(tag).data, status=status.HTTP_201_CREATED)
+
+
+def _unique_theme_slug(name: str) -> str:
+    base_slug = slugify(name) or "theme"
+    slug = base_slug
+    index = 2
+    while Theme.objects.filter(slug=slug).exists():
+        slug = f"{base_slug}-{index}"
+        index += 1
+    return slug
+
+
+class AdminThemeListCreateAPIView(APIView):
+    permission_classes = [IsSuperUser]
+
+    def get(self, request):
+        themes = Theme.objects.all().order_by("name")
+        serializer = AdminThemeSerializer(themes, many=True)
+        return Response(serializer.data)
+
+    def post(self, request):
+        name = (request.data.get("name") or "").strip()
+        if not name:
+            return Response({"detail": "name is required."}, status=status.HTTP_400_BAD_REQUEST)
+        theme = Theme.objects.create(name=name, slug=_unique_theme_slug(name))
+        return Response(AdminThemeSerializer(theme).data, status=status.HTTP_201_CREATED)
 
 
 class HomeDataAPIView(APIView):

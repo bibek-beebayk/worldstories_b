@@ -4,7 +4,7 @@ from django.utils.html import strip_tags
 from django.utils import timezone
 from django.utils.text import slugify
 from solo.admin import SingletonModelAdmin
-from .models import Audio, Blog, Story, Genre, Category, StoryType, Tag, Author, Chapter, PromptSettings, Review, Submission, StoryView
+from .models import Audio, Blog, Story, Genre, Category, StoryType, Tag, Theme, Author, Chapter, PromptSettings, Review, Submission, StoryView
 
 admin.site.register(PromptSettings, SingletonModelAdmin)
 
@@ -50,6 +50,16 @@ def _unique_tag_slug(name: str) -> str:
     slug = base_slug
     index = 2
     while Tag.objects.filter(slug=slug).exists():
+        slug = f"{base_slug}-{index}"
+        index += 1
+    return slug
+
+
+def _unique_theme_slug(name: str) -> str:
+    base_slug = slugify(name) or "theme"
+    slug = base_slug
+    index = 2
+    while Theme.objects.filter(slug=slug).exists():
         slug = f"{base_slug}-{index}"
         index += 1
     return slug
@@ -132,7 +142,7 @@ class StoryAdmin(admin.ModelAdmin):
         (
             "Classification",
             {
-                "fields": ("genres", "categories", "tags", "is_completed"),
+                "fields": ("genres", "categories", "tags", "themes", "is_completed"),
             },
         ),
         (
@@ -183,6 +193,7 @@ class StoryAdmin(admin.ModelAdmin):
         "genres__name",
         "categories__name",
         "tags__name",
+        "themes__name",
     )
     list_filter = (
         "story_type",
@@ -192,11 +203,12 @@ class StoryAdmin(admin.ModelAdmin):
         "genres",
         "categories",
         "tags",
+        "themes",
     )
     ordering = ("-site_published_date", "-id")
     date_hierarchy = "site_published_date"
     list_select_related = ("author", "submitted_by")
-    filter_horizontal = ("genres", "categories", "tags")
+    filter_horizontal = ("genres", "categories", "tags", "themes")
     autocomplete_fields = ("author",)
 
     @admin.display(description="Chapters")
@@ -268,6 +280,22 @@ class TagAdmin(admin.ModelAdmin):
         # reaches save() blank (e.g. a bulk edit or JS-disabled form).
         if not obj.slug:
             obj.slug = _unique_tag_slug(obj.name)
+        super().save_model(request, obj, form, change)
+
+
+@admin.register(Theme)
+class ThemeAdmin(admin.ModelAdmin):
+    prepopulated_fields = {"slug": ("name",)}
+    list_display = ("name", "slug", "stories_count")
+    search_fields = ("name", "slug")
+
+    @admin.display(description="Stories")
+    def stories_count(self, obj):
+        return obj.stories.count()
+
+    def save_model(self, request, obj, form, change):
+        if not obj.slug:
+            obj.slug = _unique_theme_slug(obj.name)
         super().save_model(request, obj, form, change)
 
 

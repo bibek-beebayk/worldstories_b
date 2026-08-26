@@ -201,6 +201,20 @@ class Tag(models.Model):
         return self.name
 
 
+class Theme(models.Model):
+    """Reader-facing emotional register / real-world subject matter of a
+    story (grief, coming of age, colonialism, ...) — independent of Tag
+    (search-phrase keywords) even though the shape is identical; see Tag's
+    URL/slug comment above for why slug is blank=True at the model level."""
+
+    name = models.CharField(max_length=50)
+    slug = models.SlugField(max_length=60, unique=True, blank=True)
+    description = models.TextField(blank=True)
+
+    def __str__(self):
+        return self.name
+
+
 class Author(models.Model):
     name = models.CharField(max_length=100)
     bio = models.TextField(blank=True, null=True)
@@ -322,7 +336,11 @@ class Story(models.Model):
     # live instead since chapter content is already in Postgres.
     cached_file_reading_minutes = models.PositiveIntegerField(blank=True, null=True)
     is_completed = models.BooleanField(default=False)
-    tags = models.ManyToManyField(Tag, blank=True)
+    # related_name explicit to match genres/categories below — without it
+    # the reverse accessor defaults to tag.story_set, but TagSerializer /
+    # TagViewSet / the sitemap all assume tag.stories, same as genres/categories.
+    tags = models.ManyToManyField(Tag, blank=True, related_name="stories")
+    themes = models.ManyToManyField(Theme, blank=True, related_name="stories")
     rating = models.FloatField(default=0.0)
     views = models.PositiveIntegerField(default=0)
     is_published = models.BooleanField(default=True)
@@ -461,6 +479,7 @@ class StoryQueue(models.Model):
     genres = models.ManyToManyField(Genre, blank=True, related_name="queue_items")
     categories = models.ManyToManyField(Category, blank=True, related_name="queue_items")
     tags = models.ManyToManyField(Tag, blank=True, related_name="queue_items")
+    themes = models.ManyToManyField(Theme, blank=True, related_name="queue_items")
     original_published_year = models.PositiveSmallIntegerField(blank=True, null=True)
     original_published_month = models.PositiveSmallIntegerField(
         blank=True, null=True, validators=[MinValueValidator(1), MaxValueValidator(12)]

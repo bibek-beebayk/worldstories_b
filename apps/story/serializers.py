@@ -14,6 +14,7 @@ from .models import (
     Category,
     Chapter,
     Tag,
+    Theme,
     Author,
     Review,
     Submission,
@@ -90,6 +91,33 @@ class TagDetailSerializer(TagSerializer):
         fields = TagSerializer.Meta.fields + ["stories"]
 
 
+class ThemeSerializer(serializers.ModelSerializer):
+    stories_count = serializers.SerializerMethodField()
+
+    def get_stories_count(self, obj):
+        annotated_count = getattr(obj, "published_stories_count", None)
+        if annotated_count is not None:
+            return annotated_count
+        return obj.stories.filter(published_story_q()).count()
+
+    class Meta:
+        model = Theme
+        fields = ["id", "name", "slug", "description", "stories_count"]
+
+
+class ThemeDetailSerializer(ThemeSerializer):
+    stories = serializers.SerializerMethodField()
+
+    def get_stories(self, obj):
+        stories = with_preferred_translation_only(
+            obj.stories.published().select_related("author").order_by("-site_published_date", "-id")
+        )
+        return StoryListSerializer(stories, many=True, context=self.context).data
+
+    class Meta(ThemeSerializer.Meta):
+        fields = ThemeSerializer.Meta.fields + ["stories"]
+
+
 class StoryTypeSerializer(serializers.ModelSerializer):
     stories_count = serializers.SerializerMethodField()
 
@@ -145,6 +173,12 @@ class AdminGenreSerializer(serializers.ModelSerializer):
 class AdminTagSerializer(serializers.ModelSerializer):
     class Meta:
         model = Tag
+        fields = ["id", "name", "slug"]
+
+
+class AdminThemeSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Theme
         fields = ["id", "name", "slug"]
 
 
@@ -503,6 +537,7 @@ class StoryDetailSerializer(serializers.ModelSerializer):
             "epub_size_bytes",
             "is_completed",
             "tags",
+            "themes",
             "rating",
             "views",
             "reviews_count",
@@ -785,6 +820,7 @@ class StoryAdminSerializer(serializers.ModelSerializer):
             "genres",
             "categories",
             "tags",
+            "themes",
             "rating",
             "views",
             "source",
@@ -1298,6 +1334,7 @@ class StoryQueueSerializer(serializers.ModelSerializer):
     genres = serializers.PrimaryKeyRelatedField(queryset=Genre.objects.all(), many=True, required=False)
     categories = serializers.PrimaryKeyRelatedField(queryset=Category.objects.all(), many=True, required=False)
     tags = serializers.PrimaryKeyRelatedField(queryset=Tag.objects.all(), many=True, required=False)
+    themes = serializers.PrimaryKeyRelatedField(queryset=Theme.objects.all(), many=True, required=False)
     published_date_label = serializers.SerializerMethodField(read_only=True)
 
     class Meta:
@@ -1315,6 +1352,7 @@ class StoryQueueSerializer(serializers.ModelSerializer):
             "genres",
             "categories",
             "tags",
+            "themes",
             "original_published_year",
             "original_published_month",
             "original_published_day",
