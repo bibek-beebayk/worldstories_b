@@ -144,6 +144,11 @@ urlpatterns = [
         name="admin-analytics-geography",
     ),
     path(
+        "api/admin/analytics/export/",
+        story_analytics_api.AdminAnalyticsExportAPIView.as_view(),
+        name="admin-analytics-export",
+    ),
+    path(
         "api/admin/analytics/submissions/",
         story_analytics_api.AdminAnalyticsSubmissionsAPIView.as_view(),
         name="admin-analytics-submissions",
