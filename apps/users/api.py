@@ -17,6 +17,7 @@ from collections import defaultdict
 from datetime import timedelta
 from django.db.models import Count, Q
 from django.utils import timezone
+from .geo import record_login
 from .models import OTP
 from .recommendations import recommend_stories_for
 from apps.story.api import IsSuperUser
@@ -196,6 +197,7 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
             )
 
         tokens = get_tokens(user)
+        record_login(request, user)
         return Response(
             {
                 "access": tokens["access"],
@@ -263,6 +265,7 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
 
         # Create JWT tokens
         refresh = RefreshToken.for_user(user)
+        record_login(request, user)
 
         return Response(
             {
@@ -273,9 +276,9 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
                     "email": user.email,
                     "name": name or user.username,
                     # Drives the "pick your genres" onboarding step on the
-                    # frontend — `created` is a cleaner first-login signal
-                    # than login_count, which nothing in this codebase
-                    # actually increments.
+                    # frontend — `created` is a more direct first-login
+                    # signal than login_count == 1 for this exact purpose,
+                    # even though record_login() above now does increment it.
                     "is_first_login": created,
                 },
             }

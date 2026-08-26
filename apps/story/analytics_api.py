@@ -1,3 +1,4 @@
+import statistics
 from datetime import timedelta
 
 from django.db.models import Avg, Count, Min, Q, Sum
@@ -9,7 +10,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.stats.models import AnalyticsEvent, AudioReadingProgress, ChapterReadingProgress, ReadingProgress
-from apps.users.models import User
+from apps.users.models import User, UserLoginLocation
 
 from .api import IsSuperUser
 from .models import Blog, Favorite, Genre, Review, Story, StoryView, Submission, published_blog_q, published_story_q
@@ -279,6 +280,77 @@ class AdminAnalyticsUsersAPIView(APIView):
         )
 
 
+class AdminAnalyticsGeographyAPIView(APIView):
+    """Where users are signing in from — powers the admin panel's country
+    heatmap and city breakdown. Backed by UserLoginLocation, one row per
+    login, populated by apps.users.geo.record_login on every real login."""
+
+    permission_classes = [IsSuperUser]
+
+    @method_decorator(cache_page(CACHE_SECONDS))
+    def get(self, request):
+        days = get_range_days(request)
+        cutoff = get_cutoff(days)
+
+        logins = UserLoginLocation.objects.filter(created_at__gte=cutoff)
+        resolved = logins.exclude(country="")
+
+        by_country = (
+            resolved.values("country", "country_code")
+            .annotate(logins=Count("id"), users=Count("user", distinct=True))
+            .order_by("-users", "-logins")
+        )
+
+        by_city = (
+            resolved.exclude(city="")
+            .values("city", "country")
+            .annotate(logins=Count("id"), users=Count("user", distinct=True))
+            .order_by("-users", "-logins")[:20]
+        )
+
+        logins_over_time = (
+            logins.annotate(day=TruncDate("created_at"))
+            .values("day")
+            .annotate(count=Count("id"), users=Count("user", distinct=True))
+            .order_by("day")
+        )
+
+        total_logins = logins.count()
+
+        return Response(
+            {
+                "range_days": days,
+                "total_logins": total_logins,
+                # Logins ip-api.com couldn't resolve (private/local IP,
+                # provider timeout/outage) — surfaced so a suspiciously high
+                # share is visible rather than silently missing from the map.
+                "unresolved_logins": total_logins - resolved.count(),
+                "countries_reached": by_country.count(),
+                "by_country": [
+                    {
+                        "country": row["country"],
+                        "country_code": row["country_code"],
+                        "logins": row["logins"],
+                        "users": row["users"],
+                    }
+                    for row in by_country
+                ],
+                "by_city": [
+                    {
+                        "city": row["city"],
+                        "country": row["country"],
+                        "logins": row["logins"],
+                        "users": row["users"],
+                    }
+                    for row in by_city
+                ],
+                "logins_over_time": [
+                    {"day": row["day"], "count": row["count"], "users": row["users"]} for row in logins_over_time
+                ],
+            }
+        )
+
+
 class AdminAnalyticsSubmissionsAPIView(APIView):
     permission_classes = [IsSuperUser]
 
@@ -395,12 +467,58 @@ class AdminAnalyticsAudienceAPIView(APIView):
         }
         first_seen = {**anonymous_first, **authenticated_first}
         visitor_days = {}
-        for user_id, visitor_id, created_at in events.filter(
+        page_view_counts = {}
+        page_unique_visitors = {}
+        # Every visit timestamp per browser tab session — summing the gaps
+        # between consecutive page loads (capped, so a tab left open for
+        # hours doesn't register as one enormous "active" gap) approximates
+        # how long that visit actually browsed the site, distinct from
+        # reading_minutes/listening_minutes above, which only count time
+        # spent inside a reader/player specifically.
+        session_timestamps = {}
+        for user_id, visitor_id, session_id, created_at, metadata in events.filter(
             event_type=AnalyticsEvent.EVENT_VISIT
-        ).values_list("user_id", "visitor_id", "created_at"):
+        ).values_list("user_id", "visitor_id", "session_id", "created_at", "metadata"):
             identity = f"u:{user_id}" if user_id else f"v:{visitor_id}"
             day = timezone.localtime(created_at).date()
             visitor_days.setdefault(day, set()).add(identity)
+
+            path = (metadata or {}).get("path") or "unknown"
+            page_view_counts[path] = page_view_counts.get(path, 0) + 1
+            page_unique_visitors.setdefault(path, set()).add(identity)
+
+            if session_id:
+                session_timestamps.setdefault(session_id, []).append(created_at)
+
+        top_pages = sorted(
+            (
+                {"path": path, "views": count, "unique_visitors": len(page_unique_visitors[path])}
+                for path, count in page_view_counts.items()
+            ),
+            key=lambda row: row["views"],
+            reverse=True,
+        )[:20]
+        total_page_views = sum(page_view_counts.values())
+
+        # A gap over 30 minutes between page loads reads as the tab having
+        # been left open/idle rather than active browsing, so it's excluded
+        # from the sum rather than inflating the session's duration.
+        IDLE_GAP_SECONDS = 30 * 60
+        browsing_session_seconds = []
+        for timestamps in session_timestamps.values():
+            timestamps.sort()
+            active_seconds = sum(
+                min((b - a).total_seconds(), IDLE_GAP_SECONDS) for a, b in zip(timestamps, timestamps[1:])
+            )
+            if active_seconds > 0:
+                browsing_session_seconds.append(active_seconds)
+        # Median rather than mean — a handful of very long, mostly-idle
+        # sessions would otherwise dominate the average even after the
+        # per-gap cap above, since a session can still have many small
+        # active gaps that add up over a long visit.
+        median_browsing_session_minutes = (
+            round(statistics.median(browsing_session_seconds) / 60, 1) if browsing_session_seconds else 0
+        )
 
         new_returning = []
         all_visitors = set()
@@ -554,6 +672,8 @@ class AdminAnalyticsAudienceAPIView(APIView):
                     )
                     if total_session_count
                     else 0,
+                    "total_page_views": total_page_views,
+                    "median_browsing_session_minutes": median_browsing_session_minutes,
                 },
                 "daily_activity": list(daily.values()),
                 "visitor_retention": new_returning,
@@ -624,5 +744,6 @@ class AdminAnalyticsAudienceAPIView(APIView):
                     }
                     for row in top_blogs_read
                 ],
+                "top_pages": top_pages,
             }
         )

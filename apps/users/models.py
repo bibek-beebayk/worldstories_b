@@ -129,6 +129,31 @@ class User(AbstractBaseUser, PermissionsMixin):
     #     super().save(*args, **kwargs)
 
 
+class UserLoginLocation(models.Model):
+    """One row per successful login, recording where it came from — powers
+    the "signed in from" country/city breakdown and heatmap in the admin
+    analytics panel. See apps/users/geo.py for how these fields get filled
+    in (IP-based lookup, best-effort — country/city are blank rather than
+    the login failing if that lookup can't resolve the IP)."""
+
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="login_locations")
+    ip_address = models.GenericIPAddressField(null=True, blank=True)
+    country = models.CharField(max_length=100, blank=True, default="")
+    country_code = models.CharField(max_length=8, blank=True, default="")
+    city = models.CharField(max_length=100, blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["country", "created_at"], name="loginloc_country_created_idx"),
+            models.Index(fields=["user", "created_at"], name="loginloc_user_created_idx"),
+        ]
+
+    def __str__(self):
+        return f"{self.user} - {self.country or 'Unknown'} ({self.created_at:%Y-%m-%d})"
+
+
 class OTP(TimeStampModel):
     otp = models.IntegerField()
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="otps")
