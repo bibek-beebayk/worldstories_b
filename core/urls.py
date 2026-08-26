@@ -149,6 +149,16 @@ urlpatterns = [
         name="admin-analytics-export",
     ),
     path(
+        "api/admin/analytics/stories/<slug:story_slug>/",
+        story_analytics_api.AdminStoryDetailAnalyticsAPIView.as_view(),
+        name="admin-analytics-story-detail",
+    ),
+    path(
+        "api/admin/analytics/blog/<slug:blog_slug>/",
+        story_analytics_api.AdminBlogDetailAnalyticsAPIView.as_view(),
+        name="admin-analytics-blog-detail",
+    ),
+    path(
         "api/admin/analytics/submissions/",
         story_analytics_api.AdminAnalyticsSubmissionsAPIView.as_view(),
         name="admin-analytics-submissions",
@@ -173,6 +183,11 @@ urlpatterns = [
         "api/file-reading-progress/<slug:story_slug>/<str:file_format>/",
         stats_views.FileReadingProgressAPIView.as_view(),
         name="file-reading-progress",
+    ),
+    path(
+        "api/blog-reading-progress/<slug:blog_slug>/",
+        stats_views.BlogReadingProgressAPIView.as_view(),
+        name="blog-reading-progress",
     ),
     path("api/genres/", story_api.GenreListAPIView.as_view(), name="genre-list"),
     path("api/categories/", story_api.CategoryListAPIView.as_view(), name="category-list"),

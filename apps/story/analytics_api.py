@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from django.db.models import Avg, Count, Min, Q, Sum
 from django.db.models.functions import TruncDate
 from django.http import HttpResponse
+from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.utils.decorators import method_decorator
 from django.views.decorators.cache import cache_page
@@ -15,7 +16,13 @@ from openpyxl import Workbook
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from apps.stats.models import AnalyticsEvent, AudioReadingProgress, ChapterReadingProgress, ReadingProgress
+from apps.stats.models import (
+    AnalyticsEvent,
+    AudioReadingProgress,
+    BlogReadingProgress,
+    ChapterReadingProgress,
+    ReadingProgress,
+)
 from apps.users.models import User, UserLoginLocation
 
 from .api import IsSuperUser
@@ -954,3 +961,166 @@ class AdminAnalyticsExportAPIView(APIView):
         response = HttpResponse(zip_buffer.getvalue(), content_type="application/zip")
         response["Content-Disposition"] = f'attachment; filename="analytics-export-{timestamp}.zip"'
         return response
+
+
+# ----------------------------------------------------------------------------
+# Per-title analytics — how one specific story or blog post is doing, rather
+# than a site-wide aggregate. Reuses the same time-range filtering as the
+# aggregate endpoints above, scoped down to a single title's data.
+# ----------------------------------------------------------------------------
+
+
+def build_story_detail_data(story, days):
+    cutoff = get_cutoff(days)
+
+    # StoryView is throttled/deduped at write time (one row per IP per
+    # dedupe window — see its own docstring in models.py), so a plain count
+    # already approximates distinct viewers; deduping again here on top of
+    # that by (user, ip) catches the case of the same visitor crossing that
+    # window more than once in the selected range.
+    page_opens = (
+        story.view_events.filter(created_at__gte=cutoff)
+        .values("user_id", "ip_address")
+        .distinct()
+        .count()
+    )
+
+    progress_qs = ReadingProgress.objects.filter(story=story, updated_at__gte=cutoff)
+    started_reading = progress_qs.filter(progress__gt=0).count()
+    completed_reading = progress_qs.filter(progress__gte=0.99).count()
+    avg_progress = progress_qs.aggregate(avg=Avg("progress"))["avg"] or 0
+
+    chapter_breakdown = (
+        ChapterReadingProgress.objects.filter(story=story, updated_at__gte=cutoff)
+        .values("chapter__order", "chapter__title", "chapter__slug")
+        .annotate(
+            readers=Count("user", distinct=True),
+            avg_progress=Avg("progress"),
+            completed=Count("user", filter=Q(progress__gte=0.99), distinct=True),
+        )
+        .order_by("chapter__order")
+    )
+
+    events = AnalyticsEvent.objects.filter(story=story, created_at__gte=cutoff)
+    reading_seconds = events.filter(event_type=AnalyticsEvent.EVENT_READING_SESSION).aggregate(
+        total=Sum("duration_seconds")
+    )["total"] or 0
+    completions_tracked = events.filter(event_type=AnalyticsEvent.EVENT_COMPLETION).count()
+
+    has_audio = story.audios.exists()
+    audio_data = None
+    if has_audio:
+        audio_progress_qs = AudioReadingProgress.objects.filter(story=story, updated_at__gte=cutoff)
+        listening_seconds = events.filter(event_type=AnalyticsEvent.EVENT_LISTENING_SESSION).aggregate(
+            total=Sum("duration_seconds")
+        )["total"] or 0
+        audio_data = {
+            "listeners": audio_progress_qs.values("user_id").distinct().count(),
+            "avg_progress": round(audio_progress_qs.aggregate(avg=Avg("progress"))["avg"] or 0, 3),
+            "listening_minutes": round(listening_seconds / 60, 1),
+        }
+
+    return {
+        "range_days": days,
+        "story": {"id": story.id, "title": story.title, "slug": story.slug},
+        "page_opens": page_opens,
+        "started_reading": started_reading,
+        "completed_reading": completed_reading,
+        "avg_progress": round(avg_progress, 3),
+        "reading_minutes": round(reading_seconds / 60, 1),
+        "completions_tracked": completions_tracked,
+        "favorites_count": story.favorites.filter(created_at__gte=cutoff).count(),
+        "reviews_count": story.reviews.filter(created_at__gte=cutoff).count(),
+        "avg_rating_in_range": round(
+            story.reviews.filter(created_at__gte=cutoff).aggregate(avg=Avg("rating"))["avg"] or 0, 2
+        ),
+        "chapter_breakdown": [
+            {
+                "chapter_order": row["chapter__order"],
+                "chapter_title": row["chapter__title"],
+                "chapter_slug": row["chapter__slug"],
+                "readers": row["readers"],
+                "avg_progress": round(row["avg_progress"] or 0, 3),
+                "completed": row["completed"],
+            }
+            for row in chapter_breakdown
+        ],
+        "has_audio": has_audio,
+        "audio": audio_data,
+    }
+
+
+def build_blog_detail_data(blog, days):
+    cutoff = get_cutoff(days)
+
+    visit_qs = AnalyticsEvent.objects.filter(
+        event_type=AnalyticsEvent.EVENT_VISIT,
+        metadata__path=f"/blog/{blog.slug}",
+        created_at__gte=cutoff,
+    )
+    page_open_identities = {
+        f"u:{user_id}" if user_id else f"v:{visitor_id}"
+        for user_id, visitor_id in visit_qs.values_list("user_id", "visitor_id")
+    }
+
+    reading_sessions = AnalyticsEvent.objects.filter(
+        event_type=AnalyticsEvent.EVENT_READING_SESSION, blog=blog, created_at__gte=cutoff
+    )
+    reader_identities = {
+        f"u:{user_id}" if user_id else f"v:{visitor_id}"
+        for user_id, visitor_id in reading_sessions.values_list("user_id", "visitor_id")
+    }
+    reading_seconds = reading_sessions.aggregate(total=Sum("duration_seconds"))["total"] or 0
+
+    # Scroll-depth progress: authenticated readers only (BlogReadingProgress
+    # has the same limitation ReadingProgress already has for stories — see
+    # its docstring), so this is a subset of reader_identities above, not
+    # the full picture. Surfaced separately and clearly labeled rather than
+    # blended into "started reading", which stays anonymous-inclusive.
+    depth_qs = BlogReadingProgress.objects.filter(blog=blog, updated_at__gte=cutoff)
+    bucket_defs = [
+        ("0-25%", 0.0, 0.25),
+        ("25-50%", 0.25, 0.5),
+        ("50-75%", 0.5, 0.75),
+        ("75-100%", 0.75, 1.01),
+    ]
+    progress_distribution = [
+        {"bucket": label, "count": depth_qs.filter(progress__gte=lo, progress__lt=hi).count()}
+        for label, lo, hi in bucket_defs
+    ]
+
+    return {
+        "range_days": days,
+        "blog": {"id": blog.id, "title": blog.title, "slug": blog.slug},
+        "page_opens": len(page_open_identities),
+        "started_reading": len(reader_identities),
+        "reading_minutes": round(reading_seconds / 60, 1),
+        "signed_in_readers_with_depth_tracked": depth_qs.count(),
+        "avg_progress_signed_in": round(depth_qs.aggregate(avg=Avg("progress"))["avg"] or 0, 3),
+        "completed_signed_in": depth_qs.filter(progress__gte=0.99).count(),
+        "progress_distribution_signed_in": progress_distribution,
+    }
+
+
+class AdminStoryDetailAnalyticsAPIView(APIView):
+    """One specific story's engagement, as opposed to the site-wide
+    aggregates above — page opens, who started reading, how far they got,
+    and a per-chapter breakdown of exactly where readers dropped off."""
+
+    permission_classes = [IsSuperUser]
+
+    def get(self, request, story_slug):
+        story = get_object_or_404(Story.objects.published(), slug=story_slug)
+        return Response(build_story_detail_data(story, get_range_days(request)))
+
+
+class AdminBlogDetailAnalyticsAPIView(APIView):
+    """One specific blog post's engagement — see build_blog_detail_data's
+    docstring-equivalent comment for why the depth/drop-off metrics are
+    scoped to signed-in readers only."""
+
+    permission_classes = [IsSuperUser]
+
+    def get(self, request, blog_slug):
+        blog = get_object_or_404(Blog.objects.published(), slug=blog_slug)
+        return Response(build_blog_detail_data(blog, get_range_days(request)))

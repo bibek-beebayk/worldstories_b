@@ -119,6 +119,39 @@ class FileReadingProgress(models.Model):
         return f"{self.user} - {self.story} [{self.format}] ({self.progress:.2%})"
 
 
+class BlogReadingProgress(models.Model):
+    """Scroll-depth progress through a blog post — mirrors ReadingProgress's
+    role for stories, but blogs are single-page (no chapter concept), so
+    there's just one progress fraction per (user, blog). Same limitation as
+    ReadingProgress: authenticated readers only, so this can't say anything
+    about anonymous readers' depth (see AnalyticsEvent's reading_session for
+    the anonymous-inclusive open+duration signal instead)."""
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="blog_reading_progress",
+    )
+    blog = models.ForeignKey(
+        Blog,
+        on_delete=models.CASCADE,
+        related_name="reading_progress",
+    )
+    # Scroll depth through the post (0.0 - 1.0), not time-based.
+    progress = models.FloatField(default=0.0)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = ("user", "blog")
+        indexes = [
+            models.Index(fields=["user", "blog"]),
+            models.Index(fields=["blog", "updated_at"]),
+        ]
+
+    def __str__(self):
+        return f"{self.user} - {self.blog} ({self.progress:.2%})"
+
+
 class AudioReadingProgress(models.Model):
     user = models.ForeignKey(
         settings.AUTH_USER_MODEL,

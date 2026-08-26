@@ -5,12 +5,13 @@ from rest_framework.response import Response
 from rest_framework import status
 from rest_framework.throttling import SimpleRateThrottle
 
-from apps.story.models import Story
+from apps.story.models import Blog, Story
 from apps.stats.models import (
     AnalyticsEvent,
     ReadingProgress,
     ChapterReadingProgress,
     AudioReadingProgress,
+    BlogReadingProgress,
     FileReadingProgress,
 )
 from apps.stats.serializers import (
@@ -19,6 +20,8 @@ from apps.stats.serializers import (
     ReadingProgressWriteSerializer,
     AudioReadingProgressSerializer,
     AudioReadingProgressWriteSerializer,
+    BlogReadingProgressSerializer,
+    BlogReadingProgressWriteSerializer,
     FileReadingProgressSerializer,
     FileReadingProgressWriteSerializer,
 )
@@ -187,6 +190,33 @@ class AudioReadingProgressAPIView(APIView):
         progress_obj.save()
 
         return Response(self._build_progress_payload(request, story, progress_obj))
+
+
+class BlogReadingProgressAPIView(APIView):
+    """Tracks scroll-depth progress through a blog post — one row per
+    (user, blog), no chapter-style breakdown since posts are single-page."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, blog_slug):
+        blog = get_object_or_404(Blog.objects.published(), slug=blog_slug)
+        progress = BlogReadingProgress.objects.filter(user=request.user, blog=blog).first()
+        if not progress:
+            return Response({"detail": "Progress not found."}, status=status.HTTP_404_NOT_FOUND)
+        return Response(BlogReadingProgressSerializer(progress).data)
+
+    def put(self, request, blog_slug):
+        blog = get_object_or_404(Blog.objects.published(), slug=blog_slug)
+        serializer = BlogReadingProgressWriteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        progress_obj, _ = BlogReadingProgress.objects.get_or_create(user=request.user, blog=blog)
+        # Only ever moves forward — a reader jumping back up to re-read an
+        # earlier section shouldn't erase how far they'd actually gotten.
+        progress_obj.progress = max(progress_obj.progress, serializer.validated_data["progress"])
+        progress_obj.save()
+
+        return Response(BlogReadingProgressSerializer(progress_obj).data)
 
 
 class FileReadingProgressAPIView(APIView):

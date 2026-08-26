@@ -3,7 +3,13 @@ import json
 from rest_framework import serializers
 
 from apps.story.models import Chapter, Audio, Story, Blog
-from apps.stats.models import AnalyticsEvent, ReadingProgress, AudioReadingProgress, FileReadingProgress
+from apps.stats.models import (
+    AnalyticsEvent,
+    ReadingProgress,
+    AudioReadingProgress,
+    BlogReadingProgress,
+    FileReadingProgress,
+)
 
 
 class ChapterProgressSerializer(serializers.Serializer):
@@ -61,6 +67,16 @@ class ReadingProgressWriteSerializer(serializers.Serializer):
                 )
         attrs["chapter"] = chapter
         return attrs
+
+
+class BlogReadingProgressSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = BlogReadingProgress
+        fields = ["progress", "updated_at"]
+
+
+class BlogReadingProgressWriteSerializer(serializers.Serializer):
+    progress = serializers.FloatField(min_value=0.0, max_value=1.0)
 
 
 class FileReadingProgressSerializer(serializers.ModelSerializer):
