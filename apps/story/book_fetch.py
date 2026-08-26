@@ -31,6 +31,12 @@ class _BookRecord(BaseModel):
     language: str
     genres: List[str]
     categories: List[str]
+    # Optional/defaulted — unlike genres/categories, the AI "Fetch Book
+    # Data" prompt doesn't ask Claude to suggest these (tags are real
+    # search-phrase keywords, themes are a curatorial judgment call; both
+    # need a human, not a metadata guess). Only CSV import populates them.
+    tags: List[str] = []
+    themes: List[str] = []
     original_published_year: Optional[int] = None
     original_published_month: Optional[int] = None
     original_published_day: Optional[int] = None

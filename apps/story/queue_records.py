@@ -9,9 +9,10 @@ from typing import List, Optional, Tuple
 
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.validators import URLValidator
+from django.utils.text import slugify
 
 from .book_fetch import _BookRecord
-from .models import COUNTRY_CHOICES, Category, Genre, LANGUAGE_CHOICES, Story, StoryQueue, StoryType
+from .models import COUNTRY_CHOICES, Category, Genre, LANGUAGE_CHOICES, Story, StoryQueue, StoryType, Tag, Theme
 
 _COUNTRY_NAME_TO_CODE = {name.lower(): code for code, name in COUNTRY_CHOICES}
 _LANGUAGE_NAME_TO_CODE = {name.lower(): code for code, name in LANGUAGE_CHOICES}
@@ -135,6 +136,52 @@ def resolve_categories(names: List[str], create_missing: bool = True) -> List[Ca
         if category.id not in seen_ids:
             resolved.append(category)
             seen_ids.add(category.id)
+    return resolved
+
+
+def _unique_slug(model, base: str) -> str:
+    # Tag/Theme both require a unique slug that Genre/Category don't have —
+    # shared here since resolve_tags/resolve_themes are otherwise identical.
+    base_slug = slugify(base) or model.__name__.lower()
+    slug = base_slug
+    index = 2
+    while model.objects.filter(slug=slug).exists():
+        slug = f"{base_slug}-{index}"
+        index += 1
+    return slug
+
+
+def resolve_tags(names: List[str], create_missing: bool = True) -> List[Tag]:
+    resolved, seen_ids = [], set()
+    for raw_name in names:
+        name = raw_name.strip()
+        if not name:
+            continue
+        tag = Tag.objects.filter(name__iexact=name).first()
+        if tag is None:
+            if not create_missing:
+                continue
+            tag = Tag.objects.create(name=name, slug=_unique_slug(Tag, name))
+        if tag.id not in seen_ids:
+            resolved.append(tag)
+            seen_ids.add(tag.id)
+    return resolved
+
+
+def resolve_themes(names: List[str], create_missing: bool = True) -> List[Theme]:
+    resolved, seen_ids = [], set()
+    for raw_name in names:
+        name = raw_name.strip()
+        if not name:
+            continue
+        theme = Theme.objects.filter(name__iexact=name).first()
+        if theme is None:
+            if not create_missing:
+                continue
+            theme = Theme.objects.create(name=name, slug=_unique_slug(Theme, name))
+        if theme.id not in seen_ids:
+            resolved.append(theme)
+            seen_ids.add(theme.id)
     return resolved
 
 

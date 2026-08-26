@@ -703,11 +703,13 @@ class StoryAdminViewSet(ModelViewSet):
 
     @action(detail=False, methods=["get"], url_path="export")
     def export(self, request):
-        """CSV export for the Story Report page — Story rows only (never
-        StoryQueue), respecting whatever report filters/search are currently
-        applied (same query params as the list endpoint), unpaginated. Same
-        column schema queue_import.py expects, so the file can be re-imported
-        elsewhere unchanged."""
+        """CSV export for the Story Report page — Story rows (respecting
+        whatever report filters/search are currently applied, same query
+        params as the list endpoint, unpaginated), plus every not-yet-added
+        StoryQueue row appended unconditionally (build_story_export_csv's
+        job, not filtered by these report params — queue items aren't Story
+        rows). Same column schema queue_import.py expects, so the file can
+        be re-imported elsewhere unchanged."""
         queryset = self.filter_queryset(self.get_queryset())
         csv_text = build_story_export_csv(queryset, request)
         response = HttpResponse(csv_text, content_type="text/csv")

@@ -26,6 +26,8 @@ from .queue_records import (
     resolve_genres,
     resolve_language,
     resolve_story_type,
+    resolve_tags,
+    resolve_themes,
     sanitize_published_date,
     sanitize_url,
     validate_country_code,
@@ -153,6 +155,8 @@ def _row_to_record(row: Dict[str, str], row_number: int) -> Tuple[Optional[_Book
             language=(row.get("language") or "").strip(),
             genres=_split_multi(row.get("genres") or ""),
             categories=_split_multi(row.get("categories") or ""),
+            tags=_split_multi(row.get("tags") or ""),
+            themes=_split_multi(row.get("themes") or ""),
             original_published_year=_int_or_none(row, "original_published_year"),
             original_published_month=_int_or_none(row, "original_published_month"),
             original_published_day=_int_or_none(row, "original_published_day"),
@@ -179,6 +183,8 @@ def _record_to_preview_dict(record: _BookRecord) -> dict:
         "language": resolve_language(record.language),
         "genres": [g.strip() for g in record.genres if g.strip()],
         "categories": [c.strip() for c in record.categories if c.strip()],
+        "tags": [t.strip() for t in record.tags if t.strip()],
+        "themes": [t.strip() for t in record.themes if t.strip()],
         "original_published_year": year,
         "original_published_month": month,
         "original_published_day": day,
@@ -268,6 +274,8 @@ def confirm_import(records_data: List[dict]) -> Tuple[int, int]:
             )
             queue_item.genres.set(resolve_genres(record.genres))
             queue_item.categories.set(resolve_categories(record.categories))
+            queue_item.tags.set(resolve_tags(record.tags))
+            queue_item.themes.set(resolve_themes(record.themes))
             created_count += 1
 
     return created_count, len(duplicates)

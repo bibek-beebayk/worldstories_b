@@ -2,11 +2,16 @@
 the exact same column schema queue_import.py expects on upload, so an
 exported file can be edited and re-imported (into this or another
 environment's Story Queue) unchanged.
+
+Also appends every not-yet-added StoryQueue row (is_added=False) after the
+Story rows, using the same columns — otherwise a "back up everything and
+re-import elsewhere" export would silently drop whatever's still sitting in
+the queue.
 """
 import csv
 import io
 
-from .models import COUNTRY_CHOICES, LANGUAGE_CHOICES
+from .models import COUNTRY_CHOICES, LANGUAGE_CHOICES, StoryQueue
 
 _COUNTRY_CODE_TO_NAME = dict(COUNTRY_CHOICES)
 _LANGUAGE_CODE_TO_NAME = dict(LANGUAGE_CHOICES)
@@ -20,6 +25,8 @@ EXPORT_COLUMNS = [
     "language",
     "genres",
     "categories",
+    "tags",
+    "themes",
     "original_published_year",
     "original_published_month",
     "original_published_day",
@@ -45,6 +52,8 @@ def _story_row(story, request) -> list:
         _LANGUAGE_CODE_TO_NAME.get(story.language, ""),
         ", ".join(genre.name for genre in story.genres.all()),
         ", ".join(category.name for category in story.categories.all()),
+        ", ".join(tag.name for tag in story.tags.all()),
+        ", ".join(theme.name for theme in story.themes.all()),
         story.original_published_year or "",
         story.original_published_month or "",
         story.original_published_day or "",
@@ -54,10 +63,40 @@ def _story_row(story, request) -> list:
     ]
 
 
+def _queue_row(queue_item) -> list:
+    # StoryQueue's link/cover fields are already plain URLs (unlike Story's
+    # file fields), so no _file_url resolution needed here.
+    return [
+        queue_item.title,
+        queue_item.author_name,
+        queue_item.about or "",
+        queue_item.story_type.name if queue_item.story_type_id else "",
+        _COUNTRY_CODE_TO_NAME.get(queue_item.country, ""),
+        _LANGUAGE_CODE_TO_NAME.get(queue_item.language, ""),
+        ", ".join(genre.name for genre in queue_item.genres.all()),
+        ", ".join(category.name for category in queue_item.categories.all()),
+        ", ".join(tag.name for tag in queue_item.tags.all()),
+        ", ".join(theme.name for theme in queue_item.themes.all()),
+        queue_item.original_published_year or "",
+        queue_item.original_published_month or "",
+        queue_item.original_published_day or "",
+        queue_item.epub_link,
+        queue_item.pdf_link,
+        queue_item.cover_image_link,
+    ]
+
+
 def build_story_export_csv(queryset, request=None) -> str:
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow(EXPORT_COLUMNS)
-    for story in queryset.select_related("story_type").prefetch_related("genres", "categories"):
+    for story in queryset.select_related("story_type").prefetch_related(
+        "genres", "categories", "tags", "themes"
+    ):
         writer.writerow(_story_row(story, request))
+    not_added = StoryQueue.objects.filter(is_added=False).select_related("story_type").prefetch_related(
+        "genres", "categories", "tags", "themes"
+    )
+    for queue_item in not_added:
+        writer.writerow(_queue_row(queue_item))
     return buf.getvalue()
