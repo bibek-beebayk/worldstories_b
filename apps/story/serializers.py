@@ -63,6 +63,33 @@ class CategorySerializer(serializers.ModelSerializer):
         fields = ["id", "name", "stories_count"]
 
 
+class TagSerializer(serializers.ModelSerializer):
+    stories_count = serializers.SerializerMethodField()
+
+    def get_stories_count(self, obj):
+        annotated_count = getattr(obj, "published_stories_count", None)
+        if annotated_count is not None:
+            return annotated_count
+        return obj.stories.filter(published_story_q()).count()
+
+    class Meta:
+        model = Tag
+        fields = ["id", "name", "slug", "description", "stories_count"]
+
+
+class TagDetailSerializer(TagSerializer):
+    stories = serializers.SerializerMethodField()
+
+    def get_stories(self, obj):
+        stories = with_preferred_translation_only(
+            obj.stories.published().select_related("author").order_by("-site_published_date", "-id")
+        )
+        return StoryListSerializer(stories, many=True, context=self.context).data
+
+    class Meta(TagSerializer.Meta):
+        fields = TagSerializer.Meta.fields + ["stories"]
+
+
 class StoryTypeSerializer(serializers.ModelSerializer):
     stories_count = serializers.SerializerMethodField()
 
@@ -113,6 +140,12 @@ class AdminGenreSerializer(serializers.ModelSerializer):
     class Meta:
         model = Genre
         fields = ["id", "name"]
+
+
+class AdminTagSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Tag
+        fields = ["id", "name", "slug"]
 
 
 class AdminCategorySerializer(serializers.ModelSerializer):
@@ -1264,6 +1297,7 @@ class StoryQueueSerializer(serializers.ModelSerializer):
     )
     genres = serializers.PrimaryKeyRelatedField(queryset=Genre.objects.all(), many=True, required=False)
     categories = serializers.PrimaryKeyRelatedField(queryset=Category.objects.all(), many=True, required=False)
+    tags = serializers.PrimaryKeyRelatedField(queryset=Tag.objects.all(), many=True, required=False)
     published_date_label = serializers.SerializerMethodField(read_only=True)
 
     class Meta:
@@ -1280,6 +1314,7 @@ class StoryQueueSerializer(serializers.ModelSerializer):
             "language",
             "genres",
             "categories",
+            "tags",
             "original_published_year",
             "original_published_month",
             "original_published_day",

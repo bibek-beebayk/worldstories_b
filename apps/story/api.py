@@ -40,6 +40,7 @@ from .models import (
     Blog,
     StoryQueue,
     StoryType,
+    Tag,
     with_preferred_translation_only,
     published_story_q,
     LANGUAGE_CHOICES,
@@ -58,6 +59,9 @@ from .ai_generation_jobs import (
 from .serializers import (
     GenreSerializer,
     CategorySerializer,
+    TagSerializer,
+    TagDetailSerializer,
+    AdminTagSerializer,
     StoryTypeSerializer,
     AdminStoryTypeSerializer,
     AuthorSerializer,
@@ -228,6 +232,35 @@ class AuthorViewSet(ReadOnlyModelViewSet):
         if self.action == "retrieve":
             return AuthorDetailSerializer
         return AuthorSerializer
+
+
+class TagViewSet(ReadOnlyModelViewSet):
+    """Public tag directory backing /tag/<slug> SEO landing pages. Unpaginated
+    like Genre/Category (a small, admin-curated set), unlike AuthorViewSet."""
+
+    lookup_field = "slug"
+    pagination_class = None
+
+    def get_queryset(self):
+        return (
+            Tag.objects.annotate(
+                published_stories_count=Count(
+                    "stories",
+                    filter=published_story_q("stories"),
+                    distinct=True,
+                )
+            )
+            # Only tags with at least one published story become a live URL —
+            # keeps unused/unpublished tags from ever 404ing or, worse,
+            # rendering an empty page for search engines to index.
+            .filter(published_stories_count__gt=0)
+            .order_by("name")
+        )
+
+    def get_serializer_class(self):
+        if self.action == "retrieve":
+            return TagDetailSerializer
+        return TagSerializer
 
 
 class StoryViewSet(ReadOnlyModelViewSet):
@@ -756,7 +789,7 @@ class StoryQueueViewSet(ModelViewSet):
     one meaningful custom behavior: turning one entry into a real, draft
     Story."""
 
-    queryset = StoryQueue.objects.select_related("added_story").prefetch_related("genres", "categories").all()
+    queryset = StoryQueue.objects.select_related("added_story").prefetch_related("genres", "categories", "tags").all()
     serializer_class = StoryQueueSerializer
     permission_classes = [IsSuperUser]
 
@@ -880,6 +913,7 @@ class StoryQueueViewSet(ModelViewSet):
             "about": queue_item.about or "",
             "genres": [genre.id for genre in queue_item.genres.all()],
             "categories": [category.id for category in queue_item.categories.all()],
+            "tags": [tag.id for tag in queue_item.tags.all()],
             "original_published_year": queue_item.original_published_year,
             "original_published_month": queue_item.original_published_month,
             "original_published_day": queue_item.original_published_day,
@@ -1262,6 +1296,32 @@ class AdminGenreListCreateAPIView(APIView):
         serializer.is_valid(raise_exception=True)
         genre = serializer.save()
         return Response(AdminGenreSerializer(genre).data, status=status.HTTP_201_CREATED)
+
+
+def _unique_tag_slug(name: str) -> str:
+    base_slug = slugify(name) or "tag"
+    slug = base_slug
+    index = 2
+    while Tag.objects.filter(slug=slug).exists():
+        slug = f"{base_slug}-{index}"
+        index += 1
+    return slug
+
+
+class AdminTagListCreateAPIView(APIView):
+    permission_classes = [IsSuperUser]
+
+    def get(self, request):
+        tags = Tag.objects.all().order_by("name")
+        serializer = AdminTagSerializer(tags, many=True)
+        return Response(serializer.data)
+
+    def post(self, request):
+        name = (request.data.get("name") or "").strip()
+        if not name:
+            return Response({"detail": "name is required."}, status=status.HTTP_400_BAD_REQUEST)
+        tag = Tag.objects.create(name=name, slug=_unique_tag_slug(name))
+        return Response(AdminTagSerializer(tag).data, status=status.HTTP_201_CREATED)
 
 
 class HomeDataAPIView(APIView):

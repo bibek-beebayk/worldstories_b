@@ -188,6 +188,14 @@ def default_story_type_id():
 
 class Tag(models.Model):
     name = models.CharField(max_length=50)
+    # Unique per-tag URL segment for /tag/<slug> landing pages. blank=True
+    # so the admin's prepopulated_fields (JS-side, from `name`) can leave it
+    # empty in the form; the actual value always comes from admin/API-side
+    # slugging, never left blank in the DB (see _unique_tag_slug).
+    slug = models.SlugField(max_length=60, unique=True, blank=True)
+    # Short hand-written intro shown at the top of the /tag/<slug> page, so
+    # it reads as real content rather than a bare auto-generated story list.
+    description = models.TextField(blank=True)
 
     def __str__(self):
         return self.name
@@ -452,6 +460,7 @@ class StoryQueue(models.Model):
     language = models.CharField(max_length=10, choices=LANGUAGE_CHOICES, blank=True)
     genres = models.ManyToManyField(Genre, blank=True, related_name="queue_items")
     categories = models.ManyToManyField(Category, blank=True, related_name="queue_items")
+    tags = models.ManyToManyField(Tag, blank=True, related_name="queue_items")
     original_published_year = models.PositiveSmallIntegerField(blank=True, null=True)
     original_published_month = models.PositiveSmallIntegerField(
         blank=True, null=True, validators=[MinValueValidator(1), MaxValueValidator(12)]

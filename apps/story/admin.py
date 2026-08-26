@@ -45,6 +45,16 @@ def _unique_story_slug(title: str) -> str:
     return slug
 
 
+def _unique_tag_slug(name: str) -> str:
+    base_slug = slugify(name) or "tag"
+    slug = base_slug
+    index = 2
+    while Tag.objects.filter(slug=slug).exists():
+        slug = f"{base_slug}-{index}"
+        index += 1
+    return slug
+
+
 def _publish_submission(submission: Submission, reviewer) -> Story:
     story = Story.objects.create(
         title=submission.title,
@@ -244,7 +254,21 @@ class StoryTypeAdmin(admin.ModelAdmin):
 
 @admin.register(Tag)
 class TagAdmin(admin.ModelAdmin):
-    pass
+    prepopulated_fields = {"slug": ("name",)}
+    list_display = ("name", "slug", "stories_count")
+    search_fields = ("name", "slug")
+
+    @admin.display(description="Stories")
+    def stories_count(self, obj):
+        return obj.stories.count()
+
+    def save_model(self, request, obj, form, change):
+        # prepopulated_fields only fills the slug client-side while typing
+        # the name — fall back to a generated slug for anything that
+        # reaches save() blank (e.g. a bulk edit or JS-disabled form).
+        if not obj.slug:
+            obj.slug = _unique_tag_slug(obj.name)
+        super().save_model(request, obj, form, change)
 
 
 @admin.register(Author)
