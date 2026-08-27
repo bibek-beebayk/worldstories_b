@@ -6,7 +6,7 @@ import uuid
 from rest_framework.viewsets import ReadOnlyModelViewSet, ModelViewSet
 from rest_framework.views import APIView
 from django.core.exceptions import ValidationError as DjangoValidationError
-from django.db.models import Sum, Avg, Count, F
+from django.db.models import Sum, Avg, Count, F, Prefetch
 from django.db.models import Q
 from django.http import FileResponse, HttpResponse, StreamingHttpResponse
 from django.db import transaction
@@ -656,17 +656,28 @@ class BlogViewSet(ReadOnlyModelViewSet):
     search_fields = ["title", "excerpt"]
 
     def get_queryset(self):
-        queryset = Blog.objects.published().select_related("linked_story").order_by("-created_at")
+        queryset = Blog.objects.published().prefetch_related(
+            Prefetch(
+                "linked_stories",
+                queryset=Story.objects.published().select_related("author", "story_type"),
+                to_attr="published_linked_stories",
+            ),
+            Prefetch(
+                "linked_blogs",
+                queryset=Blog.objects.published(),
+                to_attr="published_linked_blogs",
+            ),
+        ).order_by("-created_at")
         if self.request.query_params.get("sort") == "oldest":
             queryset = queryset.order_by("created_at")
         linked = self.request.query_params.get("linked_to_story")
         if linked == "true":
-            queryset = queryset.filter(linked_story__isnull=False)
+            queryset = queryset.filter(linked_stories__isnull=False).distinct()
         elif linked == "false":
-            queryset = queryset.filter(linked_story__isnull=True)
+            queryset = queryset.filter(linked_stories__isnull=True)
         linked_story_slug = self.request.query_params.get("linked_story")
         if linked_story_slug:
-            queryset = queryset.filter(linked_story__slug=linked_story_slug)
+            queryset = queryset.filter(linked_stories__slug=linked_story_slug).distinct()
         return queryset
 
 
@@ -1087,7 +1098,7 @@ class StoryQueueViewSet(ModelViewSet):
 
 
 class BlogAdminViewSet(ModelViewSet):
-    queryset = Blog.objects.select_related("linked_story").all().order_by("-created_at")
+    queryset = Blog.objects.prefetch_related("linked_stories", "linked_blogs").all().order_by("-created_at")
     serializer_class = BlogAdminSerializer
     parser_classes = [MultiPartParser, FormParser, JSONParser]
     permission_classes = [IsSuperUser]

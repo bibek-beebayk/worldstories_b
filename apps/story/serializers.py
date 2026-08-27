@@ -1085,19 +1085,23 @@ class PromptSettingsSerializer(serializers.ModelSerializer):
 
 class LinkedStorySummarySerializer(serializers.ModelSerializer):
     cover_image = serializers.SerializerMethodField()
+    author = serializers.SerializerMethodField()
+    story_type = serializers.CharField(source="story_type.name", read_only=True)
 
     def get_cover_image(self, obj):
         request = self.context.get("request")
         return get_cover_image_url(obj.cover_image_file, obj.cover_image, request, size=CARD_COVER_SIZE)
 
+    def get_author(self, obj):
+        return obj.author.name if obj.author_id else None
+
     class Meta:
         model = Story
-        fields = ["id", "slug", "title", "cover_image"]
+        fields = ["id", "slug", "title", "cover_image", "author", "story_type", "language"]
 
 
-class BlogSerializer(serializers.ModelSerializer):
+class LinkedBlogSummarySerializer(serializers.ModelSerializer):
     cover_image = serializers.SerializerMethodField()
-    linked_story = LinkedStorySummarySerializer(read_only=True)
     published_at = serializers.DateTimeField(source="created_at", read_only=True)
 
     def get_cover_image(self, obj):
@@ -1106,17 +1110,48 @@ class BlogSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Blog
+        fields = ["id", "slug", "title", "excerpt", "cover_image", "author_name", "published_at"]
+
+
+class BlogSerializer(serializers.ModelSerializer):
+    cover_image = serializers.SerializerMethodField()
+    linked_stories = serializers.SerializerMethodField()
+    linked_blogs = serializers.SerializerMethodField()
+    published_at = serializers.DateTimeField(source="created_at", read_only=True)
+
+    def get_cover_image(self, obj):
+        request = self.context.get("request")
+        return get_cover_image_url(obj.cover_image_file, None, request, size=BLOG_COVER_SIZE)
+
+    def get_linked_stories(self, obj):
+        stories = getattr(obj, "published_linked_stories", None)
+        if stories is None:
+            stories = obj.linked_stories.published().select_related("author", "story_type")
+        return LinkedStorySummarySerializer(stories, many=True, context=self.context).data
+
+    def get_linked_blogs(self, obj):
+        blogs = getattr(obj, "published_linked_blogs", None)
+        if blogs is None:
+            blogs = obj.linked_blogs.published()
+        return LinkedBlogSummarySerializer(blogs, many=True, context=self.context).data
+
+    class Meta:
+        model = Blog
         fields = [
             "id", "title", "slug", "excerpt", "content", "cover_image",
-            "author_name", "linked_story", "published_at", "updated_at",
+            "author_name", "linked_stories", "linked_blogs", "published_at", "updated_at",
         ]
 
 
 class BlogAdminSerializer(serializers.ModelSerializer):
-    linked_story = serializers.PrimaryKeyRelatedField(
-        queryset=Story.objects.all(), required=False, allow_null=True
+    linked_stories = serializers.PrimaryKeyRelatedField(
+        queryset=Story.objects.all(), many=True, required=False
     )
-    linked_story_detail = serializers.SerializerMethodField(read_only=True)
+    linked_blogs = serializers.PrimaryKeyRelatedField(
+        queryset=Blog.objects.all(), many=True, required=False
+    )
+    linked_story_details = serializers.SerializerMethodField(read_only=True)
+    linked_blog_details = serializers.SerializerMethodField(read_only=True)
     remove_cover_image_file = serializers.BooleanField(required=False, write_only=True)
     cover_image_url = serializers.SerializerMethodField(read_only=True)
     # Copies a story's cover image onto this blog post server-side (avoids a
@@ -1128,6 +1163,7 @@ class BlogAdminSerializer(serializers.ModelSerializer):
     )
 
     CLEARABLE_DATE_FIELDS = ("publish_at",)
+    CLEARABLE_MANY_FIELDS = ("linked_stories", "linked_blogs")
 
     def to_internal_value(self, data):
         # Same multipart-empty-string-means-"clear this field" handling as
@@ -1145,12 +1181,17 @@ class BlogAdminSerializer(serializers.ModelSerializer):
             for field_name in self.CLEARABLE_DATE_FIELDS:
                 if data.get(field_name) == "":
                     data[field_name] = None
+            if hasattr(data, "getlist") and hasattr(data, "setlist"):
+                for field_name in self.CLEARABLE_MANY_FIELDS:
+                    if data.getlist(field_name) == [""]:
+                        data.setlist(field_name, [])
         return super().to_internal_value(data)
 
-    def get_linked_story_detail(self, obj):
-        if not obj.linked_story:
-            return None
-        return {"id": obj.linked_story.id, "title": obj.linked_story.title, "slug": obj.linked_story.slug}
+    def get_linked_story_details(self, obj):
+        return list(obj.linked_stories.values("id", "title", "slug"))
+
+    def get_linked_blog_details(self, obj):
+        return list(obj.linked_blogs.values("id", "title", "slug"))
 
     def get_cover_image_url(self, obj):
         if obj.cover_image_file:
@@ -1174,6 +1215,8 @@ class BlogAdminSerializer(serializers.ModelSerializer):
         title = attrs.get("title") or getattr(self.instance, "title", "")
         if not attrs.get("slug") and title:
             attrs["slug"] = self._build_unique_slug(title, self.instance)
+        if self.instance and self.instance in attrs.get("linked_blogs", []):
+            raise serializers.ValidationError({"linked_blogs": "A blog post cannot link to itself."})
         return attrs
 
     def _copy_cover_from_story(self, instance, story):
@@ -1219,7 +1262,8 @@ class BlogAdminSerializer(serializers.ModelSerializer):
             "excerpt_status", "excerpt_source", "excerpt_confident", "excerpt_confidence_note", "excerpt_error",
             "content", "cover_image_file",
             "remove_cover_image_file", "copy_cover_from_story", "cover_image_url", "author_name",
-            "linked_story", "linked_story_detail", "is_published", "publish_at",
+            "linked_stories", "linked_story_details", "linked_blogs", "linked_blog_details",
+            "is_published", "publish_at",
             "created_at", "updated_at",
         ]
         read_only_fields = [

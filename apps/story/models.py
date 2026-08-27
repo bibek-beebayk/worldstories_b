@@ -863,13 +863,18 @@ class Blog(TimeStampModel):
     content = CKEditor5Field('Text', config_name='extends')
     cover_image_file = VersatileImageField(upload_to="blog_covers/", blank=True, null=True)
     author_name = models.CharField(max_length=150, blank=True, null=True)
-    linked_story = models.ForeignKey(
+    linked_stories = models.ManyToManyField(
         Story,
-        on_delete=models.SET_NULL,
         blank=True,
-        null=True,
-        related_name="blog_posts",
-        help_text="Optional — shows a 'Read the full story' link on the published post.",
+        related_name="linked_blog_posts",
+        help_text="Optional stories shown after the published post.",
+    )
+    linked_blogs = models.ManyToManyField(
+        "self",
+        blank=True,
+        symmetrical=False,
+        related_name="linked_from_blogs",
+        help_text="Optional blog posts shown after this published post.",
     )
     is_published = models.BooleanField(default=True)
     publish_at = models.DateTimeField(

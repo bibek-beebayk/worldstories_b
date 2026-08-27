@@ -506,14 +506,14 @@ class BlogModelTests(TestCase):
 
         self.assertEqual(published_slugs, {"live", "past"})
 
-    def test_linked_story_survives_but_nulls_when_story_deleted(self):
+    def test_linked_story_relationship_is_removed_when_story_is_deleted(self):
         story = Story.objects.create(title="Book", slug="book")
-        blog = Blog.objects.create(title="Post", slug="post", content="<p>x</p>", linked_story=story)
+        blog = Blog.objects.create(title="Post", slug="post", content="<p>x</p>")
+        blog.linked_stories.add(story)
 
         story.delete()
-        blog.refresh_from_db()
 
-        self.assertIsNone(blog.linked_story)
+        self.assertFalse(blog.linked_stories.exists())
 
     def test_sitemap_includes_only_published_blog_posts(self):
         Blog.objects.create(title="Live Post", slug="live-post", content="<p>x</p>")
@@ -577,16 +577,63 @@ class BlogAdminApiTests(APITestCase):
                 "content": "<p>Body</p>",
                 "excerpt": "Short teaser",
                 "author_name": "Jane Doe",
-                "linked_story": story.id,
+                "linked_stories": [story.id],
                 "cover_image_file": image,
             },
             format="multipart",
         )
 
         self.assertEqual(response.status_code, 201)
-        self.assertEqual(response.data["linked_story"], story.id)
-        self.assertEqual(response.data["linked_story_detail"]["slug"], "linked-book")
+        self.assertEqual(response.data["linked_stories"], [story.id])
+        self.assertEqual(response.data["linked_story_details"][0]["slug"], "linked-book")
         self.assertTrue(response.data["cover_image_url"])
+
+    def test_create_and_update_with_multiple_linked_stories_and_blogs(self):
+        self.client.force_authenticate(user=self._make_superuser())
+        stories = [
+            Story.objects.create(title="Book A", slug="book-a"),
+            Story.objects.create(title="Book B", slug="book-b"),
+        ]
+        related_blogs = [
+            Blog.objects.create(title="Related A", slug="related-a", content="<p>x</p>"),
+            Blog.objects.create(title="Related B", slug="related-b", content="<p>x</p>"),
+        ]
+
+        response = self.client.post(
+            "/api/admin/blog/",
+            {
+                "title": "Post",
+                "content": "<p>Body</p>",
+                "linked_stories": [story.id for story in stories],
+                "linked_blogs": [blog.id for blog in related_blogs],
+            },
+            format="multipart",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertCountEqual(response.data["linked_stories"], [story.id for story in stories])
+        self.assertCountEqual(response.data["linked_blogs"], [blog.id for blog in related_blogs])
+
+        clear_response = self.client.patch(
+            f"/api/admin/blog/{response.data['id']}/",
+            {"linked_stories": "", "linked_blogs": ""},
+            format="multipart",
+        )
+
+        self.assertEqual(clear_response.status_code, 200)
+        self.assertEqual(clear_response.data["linked_stories"], [])
+        self.assertEqual(clear_response.data["linked_blogs"], [])
+
+    def test_blog_cannot_link_to_itself(self):
+        self.client.force_authenticate(user=self._make_superuser())
+        blog = Blog.objects.create(title="Post", slug="post", content="<p>x</p>")
+
+        response = self.client.patch(
+            f"/api/admin/blog/{blog.id}/", {"linked_blogs": [blog.id]}, format="json"
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("linked_blogs", response.data)
 
     def test_copy_cover_from_story(self):
         self.client.force_authenticate(user=self._make_superuser())
@@ -701,7 +748,8 @@ class BlogPublicApiTests(APITestCase):
 
     def test_linked_to_story_filter(self):
         story = Story.objects.create(title="Book", slug="book")
-        Blog.objects.create(title="Linked", slug="linked", content="<p>x</p>", linked_story=story)
+        linked_blog = Blog.objects.create(title="Linked", slug="linked", content="<p>x</p>")
+        linked_blog.linked_stories.add(story)
         Blog.objects.create(title="General", slug="general", content="<p>x</p>")
 
         linked_response = self.client.get("/api/blog/?linked_to_story=true")
@@ -713,8 +761,10 @@ class BlogPublicApiTests(APITestCase):
     def test_linked_story_slug_filter_scopes_to_one_story(self):
         story_a = Story.objects.create(title="Book A", slug="book-a")
         story_b = Story.objects.create(title="Book B", slug="book-b")
-        Blog.objects.create(title="For A", slug="for-a", content="<p>x</p>", linked_story=story_a)
-        Blog.objects.create(title="For B", slug="for-b", content="<p>x</p>", linked_story=story_b)
+        blog_a = Blog.objects.create(title="For A", slug="for-a", content="<p>x</p>")
+        blog_a.linked_stories.add(story_a)
+        blog_b = Blog.objects.create(title="For B", slug="for-b", content="<p>x</p>")
+        blog_b.linked_stories.add(story_b)
         Blog.objects.create(title="Unlinked", slug="unlinked", content="<p>x</p>")
 
         response = self.client.get("/api/blog/?linked_story=book-a")
@@ -730,13 +780,30 @@ class BlogPublicApiTests(APITestCase):
 
     def test_detail_includes_linked_story_summary(self):
         story = Story.objects.create(title="Book Title", slug="book-title")
-        Blog.objects.create(title="Post", slug="post", content="<p>x</p>", linked_story=story)
+        blog = Blog.objects.create(title="Post", slug="post", content="<p>x</p>")
+        blog.linked_stories.add(story)
 
         response = self.client.get("/api/blog/post/")
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.data["linked_story"]["slug"], "book-title")
-        self.assertEqual(response.data["linked_story"]["title"], "Book Title")
+        self.assertEqual(response.data["linked_stories"][0]["slug"], "book-title")
+        self.assertEqual(response.data["linked_stories"][0]["title"], "Book Title")
+
+    def test_detail_includes_only_published_linked_content(self):
+        live_story = Story.objects.create(title="Live Book", slug="live-book")
+        draft_story = Story.objects.create(title="Draft Book", slug="draft-book", is_published=False)
+        live_blog = Blog.objects.create(title="Live Related", slug="live-related", content="<p>x</p>")
+        draft_blog = Blog.objects.create(
+            title="Draft Related", slug="draft-related", content="<p>x</p>", is_published=False
+        )
+        blog = Blog.objects.create(title="Post", slug="post", content="<p>x</p>")
+        blog.linked_stories.add(live_story, draft_story)
+        blog.linked_blogs.add(live_blog, draft_blog)
+
+        response = self.client.get("/api/blog/post/")
+
+        self.assertEqual([item["slug"] for item in response.data["linked_stories"]], ["live-book"])
+        self.assertEqual([item["slug"] for item in response.data["linked_blogs"]], ["live-related"])
 
     def test_detail_includes_updated_at_for_date_modified(self):
         Blog.objects.create(title="Post", slug="post", content="<p>x</p>")
@@ -745,12 +812,13 @@ class BlogPublicApiTests(APITestCase):
 
         self.assertTrue(response.data["updated_at"])
 
-    def test_detail_linked_story_null_when_absent(self):
+    def test_detail_linked_content_is_empty_when_absent(self):
         Blog.objects.create(title="Post", slug="post", content="<p>x</p>")
 
         response = self.client.get("/api/blog/post/")
 
-        self.assertIsNone(response.data["linked_story"])
+        self.assertEqual(response.data["linked_stories"], [])
+        self.assertEqual(response.data["linked_blogs"], [])
 
 
 class BecauseFinishedApiTests(APITestCase):

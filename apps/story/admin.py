@@ -247,21 +247,23 @@ class BlogAdmin(admin.ModelAdmin):
         ("Core Details", {"fields": ("title", "slug", "excerpt", "author_name")}),
         ("Content", {"fields": ("content",)}),
         ("Cover Image", {"fields": ("cover_image_file",)}),
-        (
-            "Linked Story",
-            {
-                "fields": ("linked_story",),
-                "description": "Optional — shows a 'Read the full story' link on the published post.",
-            },
-        ),
+        ("Linked Content", {"fields": ("linked_stories", "linked_blogs")}),
         ("Publishing", {"fields": ("is_published", "publish_at")}),
     )
-    list_display = ("title", "author_name", "linked_story", "is_published", "publish_at", "created_at")
-    list_filter = ("is_published", "linked_story")
+    list_display = ("title", "author_name", "linked_stories_count", "linked_blogs_count", "is_published", "publish_at", "created_at")
+    list_filter = ("is_published",)
     search_fields = ("title", "slug", "excerpt", "author_name")
-    autocomplete_fields = ("linked_story",)
+    autocomplete_fields = ("linked_stories", "linked_blogs")
     date_hierarchy = "created_at"
     ordering = ("-created_at",)
+
+    @admin.display(description="Linked Stories")
+    def linked_stories_count(self, obj):
+        return obj.linked_stories.count()
+
+    @admin.display(description="Linked Blogs")
+    def linked_blogs_count(self, obj):
+        return obj.linked_blogs.count()
 
     @admin.display(description="Content Preview")
     def content_preview(self, obj):
