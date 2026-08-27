@@ -33,6 +33,9 @@ router.register("admin/audios", story_api.AudioAdminViewSet, basename="admin-aud
 router.register("admin/submissions", story_api.SubmissionAdminViewSet, basename="admin-submission")
 router.register("admin/authors", story_api.AuthorAdminViewSet, basename="admin-author")
 router.register("admin/categories", story_api.CategoryAdminViewSet, basename="admin-category")
+router.register("admin/genres", story_api.GenreAdminViewSet, basename="admin-genre")
+router.register("admin/tags", story_api.TagAdminViewSet, basename="admin-tag")
+router.register("admin/themes", story_api.ThemeAdminViewSet, basename="admin-theme")
 router.register("admin/story-types", story_api.StoryTypeAdminViewSet, basename="admin-story-type")
 router.register("admin/users", users_api.UserAdminViewSet, basename="admin-user")
 router.register("admin/blog", story_api.BlogAdminViewSet, basename="admin-blog")
@@ -231,9 +234,6 @@ urlpatterns = [
         story_analytics_api.AdminAnalyticsAudienceAPIView.as_view(),
         name="admin-analytics-audience",
     ),
-    path("api/admin/genres/", story_api.AdminGenreListCreateAPIView.as_view(), name="admin-genres"),
-    path("api/admin/tags/", story_api.AdminTagListCreateAPIView.as_view(), name="admin-tags"),
-    path("api/admin/themes/", story_api.AdminThemeListCreateAPIView.as_view(), name="admin-themes"),
     path(
         "api/reading-progress/<slug:story_slug>/",
         stats_views.ReadingProgressAPIView.as_view(),

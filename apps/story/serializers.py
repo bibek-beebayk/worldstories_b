@@ -191,21 +191,43 @@ class AdminAuthorSerializer(serializers.ModelSerializer):
 
 
 class AdminGenreSerializer(serializers.ModelSerializer):
+    # slug is read-only here — the admin management panel's create/update
+    # form is name-only (matching AdminCategorySerializer's existing
+    # behavior), the viewset's perform_create generates it, and it's never
+    # regenerated on rename so /genre/<slug> URLs already out there don't break.
+    stories_count = serializers.SerializerMethodField(read_only=True)
+
+    def get_stories_count(self, obj):
+        return obj.stories.count()
+
     class Meta:
         model = Genre
-        fields = ["id", "name"]
+        fields = ["id", "name", "slug", "stories_count"]
+        read_only_fields = ["slug"]
 
 
 class AdminTagSerializer(serializers.ModelSerializer):
+    stories_count = serializers.SerializerMethodField(read_only=True)
+
+    def get_stories_count(self, obj):
+        return obj.stories.count()
+
     class Meta:
         model = Tag
-        fields = ["id", "name", "slug"]
+        fields = ["id", "name", "slug", "stories_count"]
+        read_only_fields = ["slug"]
 
 
 class AdminThemeSerializer(serializers.ModelSerializer):
+    stories_count = serializers.SerializerMethodField(read_only=True)
+
+    def get_stories_count(self, obj):
+        return obj.stories.count()
+
     class Meta:
         model = Theme
-        fields = ["id", "name", "slug"]
+        fields = ["id", "name", "slug", "stories_count"]
+        read_only_fields = ["slug"]
 
 
 class AdminCategorySerializer(serializers.ModelSerializer):
@@ -216,7 +238,8 @@ class AdminCategorySerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Category
-        fields = ["id", "name", "stories_count"]
+        fields = ["id", "name", "slug", "stories_count"]
+        read_only_fields = ["slug"]
 
 
 class AdminStoryTypeSerializer(serializers.ModelSerializer):

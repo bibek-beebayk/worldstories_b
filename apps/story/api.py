@@ -1326,13 +1326,34 @@ class AuthorAdminViewSet(ModelViewSet):
         return super().destroy(request, *args, **kwargs)
 
 
+def _unique_category_slug(name: str) -> str:
+    base_slug = slugify(name) or "category"
+    slug = base_slug
+    index = 2
+    while Category.objects.filter(slug=slug).exists():
+        slug = f"{base_slug}-{index}"
+        index += 1
+    return slug
+
+
 class CategoryAdminViewSet(ModelViewSet):
+    """Full management CRUD (list/create/update/delete) for the admin
+    panel's Categories page. Delete needs no in-use guard, unlike
+    StoryTypeAdminViewSet — categories/genres/tags/themes are all
+    many-to-many with Story, so removing one just detaches it from
+    whatever stories had it, it never blocks or cascades into deleting
+    a Story the way a PROTECTed ForeignKey would."""
+
     queryset = Category.objects.all().order_by("name")
     serializer_class = AdminCategorySerializer
     permission_classes = [IsSuperUser]
     pagination_class = None
     filter_backends = [SearchFilter]
     search_fields = ["name"]
+
+    def perform_create(self, serializer):
+        name = serializer.validated_data["name"]
+        serializer.save(slug=_unique_category_slug(name))
 
 
 class StoryTypeViewSet(ReadOnlyModelViewSet):
@@ -1376,19 +1397,30 @@ class StoryTypeAdminViewSet(ModelViewSet):
         return super().destroy(request, *args, **kwargs)
 
 
-class AdminGenreListCreateAPIView(APIView):
+def _unique_genre_slug(name: str) -> str:
+    base_slug = slugify(name) or "genre"
+    slug = base_slug
+    index = 2
+    while Genre.objects.filter(slug=slug).exists():
+        slug = f"{base_slug}-{index}"
+        index += 1
+    return slug
+
+
+class GenreAdminViewSet(ModelViewSet):
+    """Full management CRUD for the admin panel's Genres page — same shape
+    as CategoryAdminViewSet."""
+
+    queryset = Genre.objects.all().order_by("name")
+    serializer_class = AdminGenreSerializer
     permission_classes = [IsSuperUser]
+    pagination_class = None
+    filter_backends = [SearchFilter]
+    search_fields = ["name"]
 
-    def get(self, request):
-        genres = Genre.objects.all().order_by("name")
-        serializer = AdminGenreSerializer(genres, many=True)
-        return Response(serializer.data)
-
-    def post(self, request):
-        serializer = AdminGenreSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        genre = serializer.save()
-        return Response(AdminGenreSerializer(genre).data, status=status.HTTP_201_CREATED)
+    def perform_create(self, serializer):
+        name = serializer.validated_data["name"]
+        serializer.save(slug=_unique_genre_slug(name))
 
 
 def _unique_tag_slug(name: str) -> str:
@@ -1401,20 +1433,22 @@ def _unique_tag_slug(name: str) -> str:
     return slug
 
 
-class AdminTagListCreateAPIView(APIView):
+class TagAdminViewSet(ModelViewSet):
+    """Full management CRUD for the admin panel's Tags page — replaces the
+    old list+create-only AdminTagListCreateAPIView; the quick-add "create a
+    tag while editing a story" flow (AdminContent.tsx/StoryQueueManager.tsx)
+    still POSTs to this same /admin/tags/ endpoint unchanged."""
+
+    queryset = Tag.objects.all().order_by("name")
+    serializer_class = AdminTagSerializer
     permission_classes = [IsSuperUser]
+    pagination_class = None
+    filter_backends = [SearchFilter]
+    search_fields = ["name"]
 
-    def get(self, request):
-        tags = Tag.objects.all().order_by("name")
-        serializer = AdminTagSerializer(tags, many=True)
-        return Response(serializer.data)
-
-    def post(self, request):
-        name = (request.data.get("name") or "").strip()
-        if not name:
-            return Response({"detail": "name is required."}, status=status.HTTP_400_BAD_REQUEST)
-        tag = Tag.objects.create(name=name, slug=_unique_tag_slug(name))
-        return Response(AdminTagSerializer(tag).data, status=status.HTTP_201_CREATED)
+    def perform_create(self, serializer):
+        name = serializer.validated_data["name"]
+        serializer.save(slug=_unique_tag_slug(name))
 
 
 def _unique_theme_slug(name: str) -> str:
@@ -1427,20 +1461,21 @@ def _unique_theme_slug(name: str) -> str:
     return slug
 
 
-class AdminThemeListCreateAPIView(APIView):
+class ThemeAdminViewSet(ModelViewSet):
+    """Full management CRUD for the admin panel's Themes page — same
+    relationship to AdminThemeListCreateAPIView as TagAdminViewSet has to
+    AdminTagListCreateAPIView."""
+
+    queryset = Theme.objects.all().order_by("name")
+    serializer_class = AdminThemeSerializer
     permission_classes = [IsSuperUser]
+    pagination_class = None
+    filter_backends = [SearchFilter]
+    search_fields = ["name"]
 
-    def get(self, request):
-        themes = Theme.objects.all().order_by("name")
-        serializer = AdminThemeSerializer(themes, many=True)
-        return Response(serializer.data)
-
-    def post(self, request):
-        name = (request.data.get("name") or "").strip()
-        if not name:
-            return Response({"detail": "name is required."}, status=status.HTTP_400_BAD_REQUEST)
-        theme = Theme.objects.create(name=name, slug=_unique_theme_slug(name))
-        return Response(AdminThemeSerializer(theme).data, status=status.HTTP_201_CREATED)
+    def perform_create(self, serializer):
+        name = serializer.validated_data["name"]
+        serializer.save(slug=_unique_theme_slug(name))
 
 
 class HomeDataAPIView(APIView):
