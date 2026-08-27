@@ -761,13 +761,19 @@ class StoryAdminViewSet(ModelViewSet):
     def export(self, request):
         """CSV export for the Story Report page — Story rows (respecting
         whatever report filters/search are currently applied, same query
-        params as the list endpoint, unpaginated), plus every not-yet-added
-        StoryQueue row appended unconditionally (build_story_export_csv's
-        job, not filtered by these report params — queue items aren't Story
-        rows). Same column schema queue_import.py expects, so the file can
+        params as the list endpoint, unpaginated), optionally with every
+        not-yet-added StoryQueue row appended (build_story_export_csv's job,
+        not filtered by these report params — queue items aren't Story
+        rows). include_stories/include_queue (?include_stories=false etc.,
+        both default true) let the admin pick either source, both, or
+        neither. Same column schema queue_import.py expects, so the file can
         be re-imported elsewhere unchanged."""
+        include_stories = request.query_params.get("include_stories", "true").lower() != "false"
+        include_queue = request.query_params.get("include_queue", "true").lower() != "false"
         queryset = self.filter_queryset(self.get_queryset())
-        csv_text = build_story_export_csv(queryset, request)
+        csv_text = build_story_export_csv(
+            queryset, request, include_stories=include_stories, include_queue=include_queue
+        )
         response = HttpResponse(csv_text, content_type="text/csv")
         response["Content-Disposition"] = 'attachment; filename="stories-export.csv"'
         return response

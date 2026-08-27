@@ -3,10 +3,11 @@ the exact same column schema queue_import.py expects on upload, so an
 exported file can be edited and re-imported (into this or another
 environment's Story Queue) unchanged.
 
-Also appends every not-yet-added StoryQueue row (is_added=False) after the
-Story rows, using the same columns — otherwise a "back up everything and
+Can also append every not-yet-added StoryQueue row (is_added=False) after
+the Story rows, using the same columns — otherwise a "back up everything and
 re-import elsewhere" export would silently drop whatever's still sitting in
-the queue.
+the queue. include_stories/include_queue (both default True) let the caller
+pick either source, both, or (degenerately) neither.
 """
 import csv
 import io
@@ -86,17 +87,19 @@ def _queue_row(queue_item) -> list:
     ]
 
 
-def build_story_export_csv(queryset, request=None) -> str:
+def build_story_export_csv(queryset, request=None, include_stories=True, include_queue=True) -> str:
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow(EXPORT_COLUMNS)
-    for story in queryset.select_related("story_type").prefetch_related(
-        "genres", "categories", "tags", "themes"
-    ):
-        writer.writerow(_story_row(story, request))
-    not_added = StoryQueue.objects.filter(is_added=False).select_related("story_type").prefetch_related(
-        "genres", "categories", "tags", "themes"
-    )
-    for queue_item in not_added:
-        writer.writerow(_queue_row(queue_item))
+    if include_stories:
+        for story in queryset.select_related("story_type").prefetch_related(
+            "genres", "categories", "tags", "themes"
+        ):
+            writer.writerow(_story_row(story, request))
+    if include_queue:
+        not_added = StoryQueue.objects.filter(is_added=False).select_related("story_type").prefetch_related(
+            "genres", "categories", "tags", "themes"
+        )
+        for queue_item in not_added:
+            writer.writerow(_queue_row(queue_item))
     return buf.getvalue()
