@@ -51,6 +51,8 @@ def sitemap(request):
             "/story-map",
             "/audiobooks",
             "/authors",
+            "/tags",
+            "/themes",
             "/contest",
             "/about",
             "/contact",
