@@ -3,19 +3,20 @@ builds a review-before-write preview, and (once the admin confirms) creates
 the reviewed rows. Reuses the exact same resolve/sanitize/dedupe rules as
 the AI "Fetch Book Data" path — see queue_records.py.
 """
-import csv
-import io
 import re
 from typing import Dict, List, Optional, Tuple
 
-import openpyxl
 from django.core.exceptions import ValidationError as DjangoValidationError
-from django.core.validators import FileExtensionValidator
 from django.db import transaction
 
-from core.libs.validators import FileSizeValidator
-
 from .book_fetch import _BookRecord
+from .import_parsing import (
+    ImportFileError,
+    MAX_IMPORT_FILE_SIZE,
+    _FILE_VALIDATORS,
+    _rows_from_csv,
+    _rows_from_xlsx,
+)
 from .models import StoryQueue, format_original_published_date
 from .queue_records import (
     dedupe_records,
@@ -34,13 +35,7 @@ from .queue_records import (
     validate_language_code,
 )
 
-MAX_IMPORT_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
 MAX_IMPORT_ROWS = 500
-
-_FILE_VALIDATORS = [
-    FileExtensionValidator(allowed_extensions=["csv", "xlsx"]),
-    FileSizeValidator(MAX_IMPORT_FILE_SIZE),
-]
 
 # Maps common alternate header spellings onto the canonical StoryQueue-
 # matching column names admins are asked to use.
@@ -57,46 +52,6 @@ _COLUMN_ALIASES = {
 }
 
 
-class ImportFileError(Exception):
-    """Can't even start parsing — bad extension/size, unreadable file, no
-    data rows, or too many rows. apps.story.api's import_preview action
-    turns this into a 400 response."""
-
-
-def _normalize_header(raw: str) -> str:
-    key = raw.strip().lower().replace(" ", "_").replace("-", "_")
-    return _COLUMN_ALIASES.get(key, key)
-
-
-def _rows_from_csv(file_bytes: bytes) -> List[Dict[str, str]]:
-    text = file_bytes.decode("utf-8-sig", errors="replace")
-    reader = csv.reader(io.StringIO(text))
-    rows = list(reader)
-    if not rows:
-        return []
-    headers = [_normalize_header(h) for h in rows[0]]
-    return [dict(zip(headers, row)) for row in rows[1:] if any(cell.strip() for cell in row)]
-
-
-def _rows_from_xlsx(file_bytes: bytes) -> List[Dict[str, str]]:
-    workbook = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
-    sheet = workbook.active
-    rows_iter = sheet.iter_rows(values_only=True)
-    try:
-        header_row = next(rows_iter)
-    except StopIteration:
-        return []
-    headers = [_normalize_header(str(cell or "")) for cell in header_row]
-
-    rows = []
-    for row in rows_iter:
-        if row is None or all(cell is None for cell in row):
-            continue
-        values = ["" if cell is None else str(cell).strip() for cell in row]
-        rows.append(dict(zip(headers, values)))
-    return rows
-
-
 def parse_uploaded_file(uploaded_file) -> List[Dict[str, str]]:
     """Validates and parses an uploaded CSV/XLSX into raw row dicts (headers
     normalized, values as strings). Raises ImportFileError for anything that
@@ -110,7 +65,11 @@ def parse_uploaded_file(uploaded_file) -> List[Dict[str, str]]:
     file_bytes = uploaded_file.read()
     name = (uploaded_file.name or "").lower()
     try:
-        rows = _rows_from_xlsx(file_bytes) if name.endswith(".xlsx") else _rows_from_csv(file_bytes)
+        rows = (
+            _rows_from_xlsx(file_bytes, _COLUMN_ALIASES)
+            if name.endswith(".xlsx")
+            else _rows_from_csv(file_bytes, _COLUMN_ALIASES)
+        )
     except Exception as exc:
         raise ImportFileError(f"Could not read this file: {exc}") from exc
 

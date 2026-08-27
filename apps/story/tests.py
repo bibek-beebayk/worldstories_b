@@ -40,6 +40,11 @@ from apps.story.queue_import import (
     confirm_import,
     parse_uploaded_file,
 )
+from apps.story.taxonomy_bulk_update import (
+    build_taxonomy_preview,
+    confirm_taxonomy_update,
+    resolve_story_match,
+)
 from apps.story.epub_import import EpubParseError, extract_chapters
 from apps.story.excerpts import _excerpt_from_text
 from apps.story.epub_import_jobs import run_epub_import
@@ -57,6 +62,8 @@ from apps.story.models import (
     Story,
     StoryQueue,
     StoryType,
+    Tag,
+    Theme,
 )
 from apps.story.serializers import AudioAdminSerializer, StoryAdminSerializer, SubmissionSerializer
 from apps.story import reading_time
@@ -445,10 +452,16 @@ class ScheduledPublishingTests(SimpleTestCase):
         self.assertEqual(story.site_published_date, date(2026, 9, 4))
         model_save.assert_called_once()
 
+    @patch("core.urls.Category.objects.annotate")
+    @patch("core.urls.Genre.objects.annotate")
+    @patch("core.urls.Theme.objects.annotate")
+    @patch("core.urls.Tag.objects.annotate")
     @patch("core.urls.Author.objects.all")
     @patch("core.urls.Blog.objects.published")
     @patch("core.urls.Story.objects.published")
-    def test_sitemap_uses_scheduled_publication_gate(self, published, blogs_published, authors_all):
+    def test_sitemap_uses_scheduled_publication_gate(
+        self, published, blogs_published, authors_all, tags_annotate, themes_annotate, genres_annotate, categories_annotate
+    ):
         chapter = SimpleNamespace(slug="chapter-one")
         story = SimpleNamespace(
             slug="visible-story",
@@ -462,6 +475,8 @@ class ScheduledPublishingTests(SimpleTestCase):
         published.return_value = queryset
         blogs_published.return_value.only.return_value.iterator.return_value = iter([])
         authors_all.return_value.only.return_value.iterator.return_value = iter([])
+        for taxonomy_annotate in (tags_annotate, themes_annotate, genres_annotate, categories_annotate):
+            taxonomy_annotate.return_value.filter.return_value.only.return_value.iterator.return_value = iter([])
 
         response = sitemap(RequestFactory().get("/api/sitemap.xml"))
         xml = response.content.decode()
@@ -3023,6 +3038,367 @@ class ImportApiTests(APITestCase):
         self.assertEqual(StoryQueue.objects.filter(title="A Book").count(), 0)
 
 
+class ResolveStoryMatchTests(TestCase):
+    def test_exact_single_match(self):
+        story = Story.objects.create(title="A Book", slug="a-book")
+
+        result = resolve_story_match("a book")
+
+        self.assertEqual(result["status"], "matched")
+        self.assertEqual(result["story"].id, story.id)
+
+    def test_not_found(self):
+        result = resolve_story_match("Nonexistent Book")
+
+        self.assertEqual(result["status"], "not_found")
+        self.assertIsNone(result["story"])
+
+    def test_only_considers_published_stories(self):
+        Story.objects.create(title="Draft Book", slug="draft-book", is_published=False)
+
+        result = resolve_story_match("Draft Book")
+
+        self.assertEqual(result["status"], "not_found")
+
+    def test_ambiguous_without_author_name(self):
+        Story.objects.create(title="Twins", slug="twins-1", author=Author.objects.create(name="Author One"))
+        Story.objects.create(title="Twins", slug="twins-2", author=Author.objects.create(name="Author Two"))
+
+        result = resolve_story_match("Twins")
+
+        self.assertEqual(result["status"], "ambiguous")
+        self.assertEqual(len(result["candidates"]), 2)
+
+    def test_ambiguous_resolved_by_author_name(self):
+        Story.objects.create(title="Twins", slug="twins-1", author=Author.objects.create(name="Author One"))
+        correct = Story.objects.create(
+            title="Twins", slug="twins-2", author=Author.objects.create(name="Author Two")
+        )
+
+        result = resolve_story_match("Twins", "author two")
+
+        self.assertEqual(result["status"], "matched")
+        self.assertEqual(result["story"].id, correct.id)
+
+    def test_ambiguous_stays_ambiguous_when_author_name_does_not_narrow_to_one(self):
+        Story.objects.create(title="Twins", slug="twins-1", author=Author.objects.create(name="Author One"))
+        Story.objects.create(title="Twins", slug="twins-2", author=Author.objects.create(name="Author One"))
+
+        result = resolve_story_match("Twins", "author one")
+
+        self.assertEqual(result["status"], "ambiguous")
+        self.assertEqual(len(result["candidates"]), 2)
+
+
+class TaxonomyBulkUpdatePreviewTests(TestCase):
+    def test_blank_tags_cell_leaves_tags_unchanged(self):
+        story = Story.objects.create(title="A Book", slug="a-book")
+        story.tags.add(Tag.objects.create(name="Existing Tag", slug="existing-tag"))
+        upload = _csv_upload([["title", "themes"], ["A Book", "New Theme"]])
+
+        preview = build_taxonomy_preview(upload)
+
+        row = preview["rows"][0]
+        self.assertIsNone(row["proposed_tags"])
+        self.assertEqual(row["current_tags"], ["Existing Tag"])
+        self.assertEqual(row["tags_added"], [])
+        self.assertEqual(row["tags_removed"], [])
+
+    def test_blank_themes_cell_leaves_themes_unchanged(self):
+        story = Story.objects.create(title="A Book", slug="a-book")
+        story.themes.add(Theme.objects.create(name="Existing Theme", slug="existing-theme"))
+        upload = _csv_upload([["title", "tags"], ["A Book", "New Tag"]])
+
+        preview = build_taxonomy_preview(upload)
+
+        row = preview["rows"][0]
+        self.assertIsNone(row["proposed_themes"])
+        self.assertEqual(row["current_themes"], ["Existing Theme"])
+        self.assertEqual(row["themes_added"], [])
+        self.assertEqual(row["themes_removed"], [])
+
+    def test_blank_genres_cell_leaves_genres_unchanged(self):
+        story = Story.objects.create(title="A Book", slug="a-book")
+        story.genres.add(Genre.objects.create(name="Existing Genre"))
+        upload = _csv_upload([["title", "tags"], ["A Book", "New Tag"]])
+
+        preview = build_taxonomy_preview(upload)
+
+        row = preview["rows"][0]
+        self.assertIsNone(row["proposed_genres"])
+        self.assertEqual(row["current_genres"], ["Existing Genre"])
+        self.assertEqual(row["genres_added"], [])
+        self.assertEqual(row["genres_removed"], [])
+
+    def test_blank_categories_cell_leaves_categories_unchanged(self):
+        story = Story.objects.create(title="A Book", slug="a-book")
+        story.categories.add(Category.objects.create(name="Existing Category"))
+        upload = _csv_upload([["title", "tags"], ["A Book", "New Tag"]])
+
+        preview = build_taxonomy_preview(upload)
+
+        row = preview["rows"][0]
+        self.assertIsNone(row["proposed_categories"])
+        self.assertEqual(row["current_categories"], ["Existing Category"])
+        self.assertEqual(row["categories_added"], [])
+        self.assertEqual(row["categories_removed"], [])
+        self.assertIsNone(row["category_count_warning"])
+        self.assertIsNone(row["category_forbidden_value"])
+
+    def test_new_tag_theme_and_genre_are_reported_but_not_created(self):
+        Story.objects.create(title="A Book", slug="a-book")
+        upload = _csv_upload(
+            [["title", "tags", "themes", "genres"], ["A Book", "Brand New Tag", "Brand New Theme", "Brand New Genre"]]
+        )
+
+        preview = build_taxonomy_preview(upload)
+
+        row = preview["rows"][0]
+        self.assertEqual(row["new_tags_to_create"], ["Brand New Tag"])
+        self.assertEqual(row["new_themes_to_create"], ["Brand New Theme"])
+        self.assertEqual(row["new_genres_to_create"], ["Brand New Genre"])
+        self.assertFalse(Tag.objects.filter(name="Brand New Tag").exists())
+        self.assertFalse(Theme.objects.filter(name="Brand New Theme").exists())
+        self.assertFalse(Genre.objects.filter(name="Brand New Genre").exists())
+
+    def test_new_category_is_flagged_as_never_created(self):
+        Story.objects.create(title="A Book", slug="a-book")
+        upload = _csv_upload([["title", "categories"], ["A Book", "Brand New Category"]])
+
+        preview = build_taxonomy_preview(upload)
+
+        row = preview["rows"][0]
+        self.assertEqual(row["new_categories_not_created"], ["Brand New Category"])
+        self.assertFalse(Category.objects.filter(name="Brand New Category").exists())
+
+    def test_forbidden_category_is_flagged(self):
+        Story.objects.create(title="A Book", slug="a-book")
+        Category.objects.create(name="Science Fiction")
+        upload = _csv_upload([["title", "categories"], ["A Book", "Science Fiction"]])
+
+        preview = build_taxonomy_preview(upload)
+
+        row = preview["rows"][0]
+        self.assertEqual(row["category_forbidden_value"], "Science Fiction")
+
+    def test_category_count_of_zero_warns(self):
+        story = Story.objects.create(title="A Book", slug="a-book")
+        story.categories.add(Category.objects.create(name="Existing Category"))
+        upload = _csv_upload([["title", "categories"], ["A Book", ","]])  # non-blank cell, splits to []
+
+        preview = build_taxonomy_preview(upload)
+
+        row = preview["rows"][0]
+        self.assertEqual(row["proposed_categories"], [])
+        self.assertIsNotNone(row["category_count_warning"])
+
+    def test_category_count_of_three_warns(self):
+        Story.objects.create(title="A Book", slug="a-book")
+        Category.objects.create(name="Cat One")
+        Category.objects.create(name="Cat Two")
+        Category.objects.create(name="Cat Three")
+        upload = _csv_upload([["title", "categories"], ["A Book", "Cat One; Cat Two; Cat Three"]])
+
+        preview = build_taxonomy_preview(upload)
+
+        row = preview["rows"][0]
+        self.assertIsNotNone(row["category_count_warning"])
+
+    def test_category_count_of_two_does_not_warn(self):
+        Story.objects.create(title="A Book", slug="a-book")
+        Category.objects.create(name="Cat One")
+        Category.objects.create(name="Cat Two")
+        upload = _csv_upload([["title", "categories"], ["A Book", "Cat One; Cat Two"]])
+
+        preview = build_taxonomy_preview(upload)
+
+        row = preview["rows"][0]
+        self.assertIsNone(row["category_count_warning"])
+
+    def test_missing_title_is_reported_as_an_error(self):
+        upload = _csv_upload([["title", "tags"], ["", "A Tag"]])
+
+        preview = build_taxonomy_preview(upload)
+
+        self.assertEqual(len(preview["rows"]), 0)
+        self.assertEqual(len(preview["errors"]), 1)
+        self.assertIn("missing required 'title'", preview["errors"][0])
+
+    def test_not_found_and_ambiguous_counts(self):
+        Story.objects.create(title="Twins", slug="twins-1", author=Author.objects.create(name="A"))
+        Story.objects.create(title="Twins", slug="twins-2", author=Author.objects.create(name="B"))
+        upload = _csv_upload([["title"], ["Nonexistent"], ["Twins"]])
+
+        preview = build_taxonomy_preview(upload)
+
+        self.assertEqual(preview["not_found_count"], 1)
+        self.assertEqual(preview["ambiguous_count"], 1)
+        self.assertEqual(preview["matched_count"], 0)
+        ambiguous_row = next(r for r in preview["rows"] if r["match_status"] == "ambiguous")
+        self.assertEqual(len(ambiguous_row["ambiguous_candidates"]), 2)
+
+
+class TaxonomyBulkUpdateConfirmTests(TestCase):
+    def test_new_tag_theme_genre_are_created_only_at_confirm(self):
+        Story.objects.create(title="A Book", slug="a-book")
+        upload = _csv_upload(
+            [["title", "tags", "themes", "genres"], ["A Book", "New Tag", "New Theme", "New Genre"]]
+        )
+        preview = build_taxonomy_preview(upload)
+        self.assertFalse(Tag.objects.filter(name="New Tag").exists())
+
+        result = confirm_taxonomy_update(preview["rows"])
+
+        self.assertEqual(result["updated_count"], 1)
+        self.assertTrue(Tag.objects.filter(name="New Tag").exists())
+        self.assertTrue(Theme.objects.filter(name="New Theme").exists())
+        self.assertTrue(Genre.objects.filter(name="New Genre").exists())
+        story = Story.objects.get(title="A Book")
+        self.assertEqual(list(story.tags.values_list("name", flat=True)), ["New Tag"])
+
+    def test_new_category_is_never_created_at_confirm(self):
+        Story.objects.create(title="A Book", slug="a-book")
+        upload = _csv_upload([["title", "categories"], ["A Book", "Brand New Category"]])
+        preview = build_taxonomy_preview(upload)
+
+        result = confirm_taxonomy_update(preview["rows"])
+
+        self.assertEqual(result["updated_count"], 1)
+        self.assertFalse(Category.objects.filter(name="Brand New Category").exists())
+        story = Story.objects.get(title="A Book")
+        self.assertEqual(list(story.categories.all()), [])
+
+    def test_forbidden_category_blocks_confirm_even_if_included(self):
+        Category.objects.create(name="Science Fiction")
+        story = Story.objects.create(title="A Book", slug="a-book")
+        upload = _csv_upload([["title", "categories"], ["A Book", "Science Fiction"]])
+        preview = build_taxonomy_preview(upload)
+        self.assertIsNotNone(preview["rows"][0]["category_forbidden_value"])
+
+        result = confirm_taxonomy_update(preview["rows"])
+
+        self.assertEqual(result["updated_count"], 0)
+        self.assertEqual(result["skipped_count"], 1)
+        self.assertTrue(any("Science Fiction" in e for e in result["errors"]))
+        story.refresh_from_db()
+        self.assertEqual(list(story.categories.all()), [])
+
+    def test_category_count_warning_does_not_block_confirm(self):
+        # 0 resulting categories is outside the expected 1-2 range — should
+        # warn but still apply (unlike category_forbidden_value, which blocks).
+        story = Story.objects.create(title="A Book", slug="a-book")
+        story.categories.add(Category.objects.create(name="Old Category"))
+        upload = _csv_upload([["title", "categories"], ["A Book", ","]])  # non-blank, splits to []
+        preview = build_taxonomy_preview(upload)
+        self.assertIsNotNone(preview["rows"][0]["category_count_warning"])
+
+        result = confirm_taxonomy_update(preview["rows"])
+
+        self.assertEqual(result["updated_count"], 1)
+        story.refresh_from_db()
+        self.assertEqual(list(story.categories.all()), [])
+
+    def test_only_fields_with_a_proposed_value_are_applied(self):
+        story = Story.objects.create(title="A Book", slug="a-book")
+        story.tags.add(Tag.objects.create(name="Untouched Tag", slug="untouched-tag"))
+        upload = _csv_upload([["title", "themes"], ["A Book", "New Theme"]])
+        preview = build_taxonomy_preview(upload)
+
+        confirm_taxonomy_update(preview["rows"])
+
+        story.refresh_from_db()
+        self.assertEqual(list(story.tags.values_list("name", flat=True)), ["Untouched Tag"])
+        self.assertEqual(list(story.themes.values_list("name", flat=True)), ["New Theme"])
+
+    def test_skips_a_row_that_no_longer_matches_since_preview(self):
+        story = Story.objects.create(title="A Book", slug="a-book")
+        upload = _csv_upload([["title", "tags"], ["A Book", "A Tag"]])
+        preview = build_taxonomy_preview(upload)
+        story.is_published = False
+        story.save(update_fields=["is_published"])
+
+        result = confirm_taxonomy_update(preview["rows"])
+
+        self.assertEqual(result["updated_count"], 0)
+        self.assertEqual(result["skipped_count"], 1)
+
+
+class TaxonomyBulkUpdateApiTests(APITestCase):
+    def _make_superuser(self):
+        return User.objects.create(
+            email="admin@example.com", username="admin", is_superuser=True, is_staff=True, is_active=True
+        )
+
+    def test_preview_and_confirm_end_to_end(self):
+        self.client.force_authenticate(user=self._make_superuser())
+        Story.objects.create(title="A Book", slug="a-book")
+        upload = _csv_upload([["title", "tags"], ["A Book", "A New Tag"]])
+
+        preview_response = self.client.post(
+            "/api/admin/stories/bulk-taxonomy-preview/", {"file": upload}, format="multipart"
+        )
+        self.assertEqual(preview_response.status_code, 200)
+        self.assertEqual(preview_response.data["matched_count"], 1)
+
+        confirm_response = self.client.post(
+            "/api/admin/stories/bulk-taxonomy-confirm/",
+            {"records": preview_response.data["rows"]},
+            format="json",
+        )
+
+        self.assertEqual(confirm_response.status_code, 200)
+        self.assertEqual(confirm_response.data["updated_count"], 1)
+        story = Story.objects.get(title="A Book")
+        self.assertEqual(list(story.tags.values_list("name", flat=True)), ["A New Tag"])
+
+    def test_preview_requires_a_file(self):
+        self.client.force_authenticate(user=self._make_superuser())
+
+        response = self.client.post("/api/admin/stories/bulk-taxonomy-preview/", {}, format="multipart")
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_preview_requires_superuser(self):
+        regular_user = User.objects.create(email="user@example.com", username="user", is_active=True)
+        self.client.force_authenticate(user=regular_user)
+        upload = _csv_upload([["title"], ["A Book"]])
+
+        response = self.client.post(
+            "/api/admin/stories/bulk-taxonomy-preview/", {"file": upload}, format="multipart"
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_confirm_rejects_empty_records(self):
+        self.client.force_authenticate(user=self._make_superuser())
+
+        response = self.client.post(
+            "/api/admin/stories/bulk-taxonomy-confirm/", {"records": []}, format="json"
+        )
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_confirm_rejects_too_many_records(self):
+        self.client.force_authenticate(user=self._make_superuser())
+        records = [{"title": f"Book {i}"} for i in range(MAX_IMPORT_ROWS + 1)]
+
+        response = self.client.post(
+            "/api/admin/stories/bulk-taxonomy-confirm/", {"records": records}, format="json"
+        )
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_confirm_requires_superuser(self):
+        regular_user = User.objects.create(email="user@example.com", username="user", is_active=True)
+        self.client.force_authenticate(user=regular_user)
+
+        response = self.client.post(
+            "/api/admin/stories/bulk-taxonomy-confirm/", {"records": [{"title": "A Book"}]}, format="json"
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+
 class StoryExportApiTests(APITestCase):
     def _make_superuser(self):
         return User.objects.create(
@@ -3042,8 +3418,8 @@ class StoryExportApiTests(APITestCase):
             rows[0],
             [
                 "title", "author_name", "about", "story_type", "country", "language", "genres", "categories",
-                "original_published_year", "original_published_month", "original_published_day",
-                "epub_link", "pdf_link", "cover_image_link",
+                "tags", "themes", "original_published_year", "original_published_month",
+                "original_published_day", "epub_link", "pdf_link", "cover_image_link",
             ],
         )
 
@@ -3056,6 +3432,8 @@ class StoryExportApiTests(APITestCase):
         )
         story.genres.add(Genre.objects.create(name="Adventure"), Genre.objects.create(name="Gothic"))
         story.categories.add(Category.objects.create(name="Classic Literature"))
+        story.tags.add(Tag.objects.create(name="A Tag", slug="a-tag"))
+        story.themes.add(Theme.objects.create(name="A Theme", slug="a-theme"))
 
         response = self.client.get("/api/admin/stories/export/")
 
@@ -3067,7 +3445,9 @@ class StoryExportApiTests(APITestCase):
         self.assertEqual(row[5], "Japanese")
         self.assertEqual(row[6], "Adventure, Gothic")
         self.assertEqual(row[7], "Classic Literature")
-        self.assertEqual(row[8], "1900")
+        self.assertEqual(row[8], "A Tag")
+        self.assertEqual(row[9], "A Theme")
+        self.assertEqual(row[10], "1900")
 
     def test_export_respects_is_published_filter(self):
         self.client.force_authenticate(user=self._make_superuser())
@@ -3080,14 +3460,49 @@ class StoryExportApiTests(APITestCase):
         titles = [row[0] for row in rows[1:]]
         self.assertEqual(titles, ["Published"])
 
-    def test_export_does_not_include_story_queue_entries(self):
+    def test_export_includes_not_added_story_queue_entries_by_default(self):
         self.client.force_authenticate(user=self._make_superuser())
-        StoryQueue.objects.create(title="Not A Real Story", author_name="Someone")
+        StoryQueue.objects.create(title="Not A Real Story Yet", author_name="Someone")
 
         response = self.client.get("/api/admin/stories/export/")
 
         rows = list(csv.reader(io.StringIO(response.content.decode("utf-8"))))
-        self.assertEqual(len(rows), 1)  # header only
+        titles = [row[0] for row in rows[1:]]
+        self.assertEqual(titles, ["Not A Real Story Yet"])
+
+    def test_export_omits_already_added_queue_entries(self):
+        self.client.force_authenticate(user=self._make_superuser())
+        added_story = Story.objects.create(title="Already Published", slug="already-published")
+        StoryQueue.objects.create(
+            title="Already Added", author_name="Someone", is_added=True, added_story=added_story
+        )
+
+        response = self.client.get("/api/admin/stories/export/", {"include_stories": "false"})
+
+        rows = list(csv.reader(io.StringIO(response.content.decode("utf-8"))))
+        self.assertEqual(len(rows), 1)  # header only — is_added=True queue entries are never in scope
+
+    def test_export_include_stories_false_omits_story_rows(self):
+        self.client.force_authenticate(user=self._make_superuser())
+        Story.objects.create(title="A Published Story", slug="a-published-story")
+        StoryQueue.objects.create(title="A Queue Entry", author_name="Someone")
+
+        response = self.client.get("/api/admin/stories/export/", {"include_stories": "false"})
+
+        rows = list(csv.reader(io.StringIO(response.content.decode("utf-8"))))
+        titles = [row[0] for row in rows[1:]]
+        self.assertEqual(titles, ["A Queue Entry"])
+
+    def test_export_include_queue_false_omits_queue_rows(self):
+        self.client.force_authenticate(user=self._make_superuser())
+        Story.objects.create(title="A Published Story", slug="a-published-story")
+        StoryQueue.objects.create(title="A Queue Entry", author_name="Someone")
+
+        response = self.client.get("/api/admin/stories/export/", {"include_queue": "false"})
+
+        rows = list(csv.reader(io.StringIO(response.content.decode("utf-8"))))
+        titles = [row[0] for row in rows[1:]]
+        self.assertEqual(titles, ["A Published Story"])
 
     def test_export_requires_superuser(self):
         regular_user = User.objects.create(email="user@example.com", username="user", is_active=True)

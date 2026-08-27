@@ -51,6 +51,7 @@ from .epub_import_jobs import executor as epub_import_executor, run_epub_import
 from .book_fetch import DEFAULT_BOOK_FETCH_COUNT, MAX_BOOK_FETCH_COUNT
 from .book_fetch_jobs import executor as book_fetch_executor, run_book_fetch
 from .queue_import import MAX_IMPORT_ROWS, ImportFileError, build_preview, confirm_import
+from .taxonomy_bulk_update import build_taxonomy_preview, confirm_taxonomy_update
 from .story_export import build_story_export_csv
 from .ai_generation_jobs import (
     executor as ai_generation_executor,
@@ -777,6 +778,36 @@ class StoryAdminViewSet(ModelViewSet):
         response = HttpResponse(csv_text, content_type="text/csv")
         response["Content-Disposition"] = 'attachment; filename="stories-export.csv"'
         return response
+
+    @action(detail=False, methods=["post"], url_path="bulk-taxonomy-preview")
+    def bulk_taxonomy_preview(self, request):
+        """Parses an uploaded CSV/Excel file and previews the tags/themes/
+        genres/categories changes it would make to already-published Story
+        rows (matched by title, disambiguated by author_name) — writes
+        nothing to the DB. See taxonomy_bulk_update.build_taxonomy_preview."""
+        uploaded_file = request.FILES.get("file")
+        if not uploaded_file:
+            return Response({"detail": "Upload a CSV or Excel (.xlsx) file."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            return Response(build_taxonomy_preview(uploaded_file))
+        except ImportFileError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=["post"], url_path="bulk-taxonomy-confirm")
+    def bulk_taxonomy_confirm(self, request):
+        """Applies the admin-reviewed subset of a bulk-taxonomy-preview's
+        matched rows. Re-resolves each row's story match defensively before
+        writing. See taxonomy_bulk_update.confirm_taxonomy_update."""
+        records = request.data.get("records")
+        if not isinstance(records, list) or not records:
+            return Response({"detail": "No records to update."}, status=status.HTTP_400_BAD_REQUEST)
+        if len(records) > MAX_IMPORT_ROWS:
+            return Response(
+                {"detail": f"Too many records — max {MAX_IMPORT_ROWS} per update."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        result = confirm_taxonomy_update(records)
+        return Response(result, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["post"], url_path="link-translation")
     def link_translation(self, request, pk=None):

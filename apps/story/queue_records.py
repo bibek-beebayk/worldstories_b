@@ -102,6 +102,19 @@ def validate_language_code(code: str) -> str:
     return code if code in _LANGUAGE_CODES else ""
 
 
+def _unique_slug(model, base: str) -> str:
+    # Genre/Category/Tag/Theme all require a unique slug — shared here since
+    # resolve_genres/resolve_categories/resolve_tags/resolve_themes are
+    # otherwise identical.
+    base_slug = slugify(base) or model.__name__.lower()
+    slug = base_slug
+    index = 2
+    while model.objects.filter(slug=slug).exists():
+        slug = f"{base_slug}-{index}"
+        index += 1
+    return slug
+
+
 def resolve_genres(names: List[str], create_missing: bool = True) -> List[Genre]:
     """create_missing=False (used by queue_import's preview) only looks up
     existing genres — it must never write to the DB before the admin has
@@ -115,7 +128,7 @@ def resolve_genres(names: List[str], create_missing: bool = True) -> List[Genre]
         if genre is None:
             if not create_missing:
                 continue
-            genre = Genre.objects.create(name=name)
+            genre = Genre.objects.create(name=name, slug=_unique_slug(Genre, name))
         if genre.id not in seen_ids:
             resolved.append(genre)
             seen_ids.add(genre.id)
@@ -132,23 +145,11 @@ def resolve_categories(names: List[str], create_missing: bool = True) -> List[Ca
         if category is None:
             if not create_missing:
                 continue
-            category = Category.objects.create(name=name)
+            category = Category.objects.create(name=name, slug=_unique_slug(Category, name))
         if category.id not in seen_ids:
             resolved.append(category)
             seen_ids.add(category.id)
     return resolved
-
-
-def _unique_slug(model, base: str) -> str:
-    # Tag/Theme both require a unique slug that Genre/Category don't have —
-    # shared here since resolve_tags/resolve_themes are otherwise identical.
-    base_slug = slugify(base) or model.__name__.lower()
-    slug = base_slug
-    index = 2
-    while model.objects.filter(slug=slug).exists():
-        slug = f"{base_slug}-{index}"
-        index += 1
-    return slug
 
 
 def resolve_tags(names: List[str], create_missing: bool = True) -> List[Tag]:
