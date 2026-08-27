@@ -44,10 +44,23 @@ class GenreSerializer(serializers.ModelSerializer):
         if annotated_count is not None:
             return annotated_count
         return obj.stories.filter(published_story_q()).count()
-    
+
     class Meta:
         model = Genre
-        fields = ["id", "name", "stories_count"]
+        fields = ["id", "name", "slug", "description", "stories_count"]
+
+
+class GenreDetailSerializer(GenreSerializer):
+    stories = serializers.SerializerMethodField()
+
+    def get_stories(self, obj):
+        stories = with_preferred_translation_only(
+            obj.stories.published().select_related("author").order_by("-site_published_date", "-id")
+        )
+        return StoryListSerializer(stories, many=True, context=self.context).data
+
+    class Meta(GenreSerializer.Meta):
+        fields = GenreSerializer.Meta.fields + ["stories"]
 
 
 class CategorySerializer(serializers.ModelSerializer):
@@ -61,7 +74,20 @@ class CategorySerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Category
-        fields = ["id", "name", "stories_count"]
+        fields = ["id", "name", "slug", "description", "stories_count"]
+
+
+class CategoryDetailSerializer(CategorySerializer):
+    stories = serializers.SerializerMethodField()
+
+    def get_stories(self, obj):
+        stories = with_preferred_translation_only(
+            obj.stories.published().select_related("author").order_by("-site_published_date", "-id")
+        )
+        return StoryListSerializer(stories, many=True, context=self.context).data
+
+    class Meta(CategorySerializer.Meta):
+        fields = CategorySerializer.Meta.fields + ["stories"]
 
 
 class TagSerializer(serializers.ModelSerializer):

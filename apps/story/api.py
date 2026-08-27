@@ -59,7 +59,9 @@ from .ai_generation_jobs import (
 )
 from .serializers import (
     GenreSerializer,
+    GenreDetailSerializer,
     CategorySerializer,
+    CategoryDetailSerializer,
     TagSerializer,
     TagDetailSerializer,
     AdminTagSerializer,
@@ -292,6 +294,60 @@ class ThemeViewSet(ReadOnlyModelViewSet):
         if self.action == "retrieve":
             return ThemeDetailSerializer
         return ThemeSerializer
+
+
+class GenreViewSet(ReadOnlyModelViewSet):
+    """Public genre directory — list behavior unchanged from the old
+    GenreListAPIView it replaces, plus a slug-keyed retrieve backing the new
+    /genre/<slug> SEO landing pages. Same shape as TagViewSet."""
+
+    lookup_field = "slug"
+    pagination_class = None
+
+    def get_queryset(self):
+        return (
+            Genre.objects.annotate(
+                published_stories_count=Count(
+                    "stories",
+                    filter=published_story_q("stories"),
+                    distinct=True,
+                )
+            )
+            .filter(published_stories_count__gt=0)
+            .order_by("name")
+        )
+
+    def get_serializer_class(self):
+        if self.action == "retrieve":
+            return GenreDetailSerializer
+        return GenreSerializer
+
+
+class CategoryViewSet(ReadOnlyModelViewSet):
+    """Public category directory — replaces the old CategoryListAPIView the
+    same way GenreViewSet replaces GenreListAPIView. Same shape as
+    TagViewSet; unrelated to the admin/categories CategoryAdminViewSet."""
+
+    lookup_field = "slug"
+    pagination_class = None
+
+    def get_queryset(self):
+        return (
+            Category.objects.annotate(
+                published_stories_count=Count(
+                    "stories",
+                    filter=published_story_q("stories"),
+                    distinct=True,
+                )
+            )
+            .filter(published_stories_count__gt=0)
+            .order_by("name")
+        )
+
+    def get_serializer_class(self):
+        if self.action == "retrieve":
+            return CategoryDetailSerializer
+        return CategorySerializer
 
 
 class StoryViewSet(ReadOnlyModelViewSet):
@@ -1145,40 +1201,6 @@ class SubmissionAdminViewSet(ModelViewSet):
                 order=1,
             )
         return story
-
-
-class GenreListAPIView(APIView):
-    def get(self, request):
-        genres = (
-            Genre.objects.filter(published_story_q("stories"))
-            .annotate(
-                published_stories_count=Count(
-                    "stories",
-                    filter=published_story_q("stories"),
-                    distinct=True,
-                )
-            )
-            .order_by("name")
-        )
-        serializer = GenreSerializer(genres, many=True)
-        return Response(serializer.data)
-
-
-class CategoryListAPIView(APIView):
-    def get(self, request):
-        categories = (
-            Category.objects.filter(published_story_q("stories"))
-            .annotate(
-                published_stories_count=Count(
-                    "stories",
-                    filter=published_story_q("stories"),
-                    distinct=True,
-                )
-            )
-            .order_by("name")
-        )
-        serializer = CategorySerializer(categories, many=True)
-        return Response(serializer.data)
 
 
 class LibraryShelvesAPIView(APIView):

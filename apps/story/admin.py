@@ -65,6 +65,26 @@ def _unique_theme_slug(name: str) -> str:
     return slug
 
 
+def _unique_genre_slug(name: str) -> str:
+    base_slug = slugify(name) or "genre"
+    slug = base_slug
+    index = 2
+    while Genre.objects.filter(slug=slug).exists():
+        slug = f"{base_slug}-{index}"
+        index += 1
+    return slug
+
+
+def _unique_category_slug(name: str) -> str:
+    base_slug = slugify(name) or "category"
+    slug = base_slug
+    index = 2
+    while Category.objects.filter(slug=slug).exists():
+        slug = f"{base_slug}-{index}"
+        index += 1
+    return slug
+
+
 def _publish_submission(submission: Submission, reviewer) -> Story:
     story = Story.objects.create(
         title=submission.title,
@@ -251,12 +271,34 @@ class BlogAdmin(admin.ModelAdmin):
 
 @admin.register(Genre)
 class GenreAdmin(admin.ModelAdmin):
-    pass
+    prepopulated_fields = {"slug": ("name",)}
+    list_display = ("name", "slug", "stories_count")
+    search_fields = ("name", "slug")
+
+    @admin.display(description="Stories")
+    def stories_count(self, obj):
+        return obj.stories.count()
+
+    def save_model(self, request, obj, form, change):
+        if not obj.slug:
+            obj.slug = _unique_genre_slug(obj.name)
+        super().save_model(request, obj, form, change)
 
 
 @admin.register(Category)
 class CategoryAdmin(admin.ModelAdmin):
-    search_fields = ("name",)
+    prepopulated_fields = {"slug": ("name",)}
+    list_display = ("name", "slug", "stories_count")
+    search_fields = ("name", "slug")
+
+    @admin.display(description="Stories")
+    def stories_count(self, obj):
+        return obj.stories.count()
+
+    def save_model(self, request, obj, form, change):
+        if not obj.slug:
+            obj.slug = _unique_category_slug(obj.name)
+        super().save_model(request, obj, form, change)
 
 
 @admin.register(StoryType)

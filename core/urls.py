@@ -14,7 +14,7 @@ from apps.story import api as story_api
 from apps.story import analytics_api as story_analytics_api
 from apps.stats import views as stats_views
 from apps.users import api as users_api
-from apps.story.models import Author, Story, Blog, Tag, Theme, published_story_q
+from apps.story.models import Author, Story, Blog, Tag, Theme, Genre, Category, published_story_q
 
 router = DefaultRouter()
 
@@ -22,6 +22,8 @@ router.register("stories", story_api.StoryViewSet, basename="story")
 router.register("authors", story_api.AuthorViewSet, basename="author")
 router.register("tags", story_api.TagViewSet, basename="tag")
 router.register("themes", story_api.ThemeViewSet, basename="theme")
+router.register("genres", story_api.GenreViewSet, basename="genre")
+router.register("categories", story_api.CategoryViewSet, basename="category")
 router.register("story-types", story_api.StoryTypeViewSet, basename="story-type")
 router.register("submissions", story_api.SubmissionViewSet, basename="submission")
 router.register("blog", story_api.BlogViewSet, basename="blog")
@@ -129,6 +131,34 @@ def sitemap(request):
             f"<url><loc>{escape(f'{site_url}/theme/{theme.slug}')}</loc></url>"
         )
 
+    genres = (
+        Genre.objects.annotate(
+            published_stories_count=Count(
+                "stories", filter=published_story_q("stories"), distinct=True
+            )
+        )
+        .filter(published_stories_count__gt=0)
+        .only("slug")
+    )
+    for genre in genres.iterator():
+        entries.append(
+            f"<url><loc>{escape(f'{site_url}/genre/{genre.slug}')}</loc></url>"
+        )
+
+    categories = (
+        Category.objects.annotate(
+            published_stories_count=Count(
+                "stories", filter=published_story_q("stories"), distinct=True
+            )
+        )
+        .filter(published_stories_count__gt=0)
+        .only("slug")
+    )
+    for category in categories.iterator():
+        entries.append(
+            f"<url><loc>{escape(f'{site_url}/category/{category.slug}')}</loc></url>"
+        )
+
     xml = (
         '<?xml version="1.0" encoding="UTF-8"?>'
         '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
@@ -224,8 +254,6 @@ urlpatterns = [
         stats_views.BlogReadingProgressAPIView.as_view(),
         name="blog-reading-progress",
     ),
-    path("api/genres/", story_api.GenreListAPIView.as_view(), name="genre-list"),
-    path("api/categories/", story_api.CategoryListAPIView.as_view(), name="category-list"),
     path("api/library-shelves/", story_api.LibraryShelvesAPIView.as_view(), name="library-shelves"),
     path("api/sitemap.xml", sitemap, name="sitemap"),
     path("ckeditor5/", include("django_ckeditor_5.urls")),

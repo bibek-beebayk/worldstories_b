@@ -143,6 +143,11 @@ def format_original_published_date(year, month, day):
 
 class Genre(models.Model):
     name = models.CharField(max_length=100)
+    # Unique per-genre URL segment for /genre/<slug> landing pages — same
+    # shape/reasoning as Tag.slug above (blank=True for admin JS
+    # prepopulation; always populated by admin/API-side slugging).
+    slug = models.SlugField(max_length=60, unique=True, blank=True)
+    description = models.TextField(blank=True)
 
     def __str__(self):
         return self.name
@@ -154,6 +159,8 @@ class Category(models.Model):
     filter. Same shape as Genre (many-to-many, admin-managed) on purpose."""
 
     name = models.CharField(max_length=100, unique=True)
+    slug = models.SlugField(max_length=60, unique=True, blank=True)
+    description = models.TextField(blank=True)
 
     class Meta:
         verbose_name_plural = "Categories"
