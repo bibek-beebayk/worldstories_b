@@ -29,6 +29,7 @@ from apps.story.models import Favorite, Genre, Review, Story
 from apps.story.serializers import similar_stories_candidates
 from apps.stats.models import (
     AudioReadingProgress,
+    VideoWatchProgress,
     ChapterReadingProgress,
     FileReadingProgress,
     ReadingProgress,
@@ -81,6 +82,9 @@ def _engagement_pairs(user_ids=None, story_ids=None):
         AudioReadingProgress.objects.filter(
             progress__gte=ENGAGEMENT_PROGRESS_THRESHOLD
         ).values_list("user_id", "story_id"),
+        VideoWatchProgress.objects.filter(
+            progress__gte=ENGAGEMENT_PROGRESS_THRESHOLD
+        ).values_list("user_id", "story_id"),
     ]
     if user_ids is not None:
         querysets = [qs.filter(user_id__in=user_ids) for qs in querysets]
@@ -101,6 +105,7 @@ def _already_engaged_q(user):
         | Q(chapter_reading_progress__user=user)
         | Q(file_reading_progress__user=user)
         | Q(audio_reading_progress__user=user)
+        | Q(video_watch_progress__user=user)
     )
 
 

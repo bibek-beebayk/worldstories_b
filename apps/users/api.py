@@ -28,6 +28,7 @@ from apps.stats.models import (
     ReadingProgress,
     ChapterReadingProgress,
     AudioReadingProgress,
+    VideoWatchProgress,
     FileReadingProgress,
 )
 from apps.stats.streaks import compute_streak
@@ -42,6 +43,7 @@ from .serializers import (
     UserProfileUpdateSerializer,
     ContinueReadingItemSerializer,
     ContinueListeningItemSerializer,
+    ContinueWatchingItemSerializer,
     FavoriteItemSerializer,
     MyReviewItemSerializer,
 )
@@ -87,6 +89,7 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
             "library_continue_reading",
             "library_completed_reading",
             "library_continue_listening",
+            "library_continue_watching",
             "library_favorites",
             "library_reviews",
             "library_recommendations",
@@ -335,6 +338,11 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
                 "story_id", "progress", "updated_at"
             )
         )
+        video_rows = list(
+            VideoWatchProgress.objects.filter(user=request.user).values_list(
+                "story_id", "progress", "updated_at"
+            )
+        )
 
         chapter_story_ids = {story_id for story_id, _, _ in chapter_rows}
         chapter_mode_ids = chapter_story_ids | {
@@ -347,7 +355,8 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
             story_id for story_id, file_format, _, _ in file_rows if file_format == "pdf"
         }
         audio_ids = {story_id for story_id, _, _ in audio_rows}
-        started_ids = chapter_mode_ids | epub_ids | pdf_ids | audio_ids
+        video_ids = {story_id for story_id, _, _ in video_rows}
+        started_ids = chapter_mode_ids | epub_ids | pdf_ids | audio_ids | video_ids
 
         completed_ids = {
             story_id for story_id, _, progress, _ in file_rows if progress >= 0.995
@@ -385,6 +394,22 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
             and completed_count >= audio_totals[story_id]
         )
 
+        video_totals = dict(
+            Story.objects.filter(id__in=video_ids)
+            .annotate(item_count=Count("videos"))
+            .values_list("id", "item_count")
+        )
+        completed_video = defaultdict(int)
+        for story_id, progress, _ in video_rows:
+            if progress >= 0.995:
+                completed_video[story_id] += 1
+        completed_ids.update(
+            story_id
+            for story_id, completed_count in completed_video.items()
+            if video_totals.get(story_id, 0) > 0
+            and completed_count >= video_totals[story_id]
+        )
+
         def activity_date(value):
             if timezone.is_aware(value):
                 return timezone.localtime(value).date()
@@ -392,7 +417,7 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
 
         today = timezone.localdate()
         activity = {
-            today - timedelta(days=offset): {"reading": 0, "listening": 0}
+            today - timedelta(days=offset): {"reading": 0, "listening": 0, "watching": 0}
             for offset in range(13, -1, -1)
         }
         all_activity_dates = []
@@ -408,6 +433,7 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
         )
         reading_timestamps.extend(updated_at for _, _, _, updated_at in file_rows)
         listening_timestamps = [updated_at for _, _, updated_at in audio_rows]
+        watching_timestamps = [updated_at for _, _, updated_at in video_rows]
 
         for updated_at in reading_timestamps:
             day = activity_date(updated_at)
@@ -419,6 +445,11 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
             all_activity_dates.append(day)
             if day in activity:
                 activity[day]["listening"] += 1
+        for updated_at in watching_timestamps:
+            day = activity_date(updated_at)
+            all_activity_dates.append(day)
+            if day in activity:
+                activity[day]["watching"] += 1
 
         genre_rows = list(
             Story.objects.filter(id__in=started_ids, genres__isnull=False)
@@ -447,6 +478,7 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
                         "date": day.isoformat(),
                         "reading": counts["reading"],
                         "listening": counts["listening"],
+                        "watching": counts["watching"],
                     }
                     for day, counts in activity.items()
                 ],
@@ -455,6 +487,7 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
                     {"name": "EPUB", "value": len(epub_ids)},
                     {"name": "PDF", "value": len(pdf_ids)},
                     {"name": "Audio", "value": len(audio_ids)},
+                    {"name": "Video", "value": len(video_ids)},
                 ],
                 "genres": genres,
             }
@@ -469,7 +502,11 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
         apps/stats/streaks.py)."""
         created_ats = AnalyticsEvent.objects.filter(
             user=request.user,
-            event_type__in=[AnalyticsEvent.EVENT_READING_SESSION, AnalyticsEvent.EVENT_LISTENING_SESSION],
+            event_type__in=[
+                AnalyticsEvent.EVENT_READING_SESSION,
+                AnalyticsEvent.EVENT_LISTENING_SESSION,
+                AnalyticsEvent.EVENT_WATCHING_SESSION,
+            ],
         ).values_list("created_at", flat=True)
         activity_dates = {timezone.localtime(created_at).date() for created_at in created_ats}
         current_streak, longest_streak = compute_streak(activity_dates, timezone.localdate())
@@ -626,6 +663,61 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
             )
             return self.get_paginated_response(serializer.data)
         serializer = ContinueListeningItemSerializer(
+            payload, many=True, context={"request": request}
+        )
+        return Response(serializer.data)
+
+    @action(detail=False, methods=["get"], url_path="library/continue-watching")
+    def library_continue_watching(self, request):
+        all_video_progress = (
+            VideoWatchProgress.objects.filter(user=request.user)
+            .select_related("story", "video")
+            .order_by("story_id", "-updated_at")
+        )
+
+        latest_by_story = {}
+        for item in all_video_progress:
+            if item.story_id not in latest_by_story:
+                latest_by_story[item.story_id] = item
+
+        selected_items = [
+            item for item in latest_by_story.values() if 0 < item.progress < 1
+        ]
+        story_ids = [item.story_id for item in selected_items]
+        video_progress_qs = VideoWatchProgress.objects.filter(
+            user=request.user, story_id__in=story_ids
+        )
+        video_progress_map = {}
+        for item in video_progress_qs:
+            video_progress_map.setdefault(item.story_id, []).append(
+                max(0.0, min(1.0, item.progress))
+            )
+
+        payload = []
+        for item in sorted(selected_items, key=lambda x: x.updated_at, reverse=True):
+            story_video_count = item.story.videos.count()
+            story_progress_values = video_progress_map.get(item.story_id, [])
+            overall_progress = (
+                sum(story_progress_values) / story_video_count if story_video_count > 0 else 0.0
+            )
+            payload.append(
+                {
+                    "story": item.story,
+                    "video_slug": item.video.slug if item.video else None,
+                    "video_title": item.video.title if item.video else None,
+                    "video_progress": max(0.0, min(1.0, item.progress)),
+                    "overall_progress": round(overall_progress, 4),
+                    "updated_at": item.updated_at,
+                }
+            )
+
+        page = self.paginate_queryset(payload)
+        if page is not None:
+            serializer = ContinueWatchingItemSerializer(
+                page, many=True, context={"request": request}
+            )
+            return self.get_paginated_response(serializer.data)
+        serializer = ContinueWatchingItemSerializer(
             payload, many=True, context={"request": request}
         )
         return Response(serializer.data)

@@ -203,3 +203,10 @@ def story_listening_minutes(audios):
     if not durations:
         return None
     return max(1, round(sum(durations) / 60))
+
+
+def story_watch_minutes(videos):
+    durations = [video.duration_seconds for video in videos if video.duration_seconds]
+    if not durations:
+        return None
+    return max(1, round(sum(durations) / 60))

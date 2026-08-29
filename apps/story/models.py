@@ -373,6 +373,9 @@ class Story(models.Model):
     def has_audio(self):
         return self.audios.exists()
 
+    def has_video(self):
+        return self.videos.exists()
+
     def save(self, *args, **kwargs):
         if self.is_published and not self.site_published_date:
             self.site_published_date = (
@@ -678,6 +681,43 @@ class Audio(models.Model):
     def __str__(self):
         return f"Audio for {self.story.title} uploaded at {self.uploaded_at}"
     
+    class Meta:
+        unique_together = ("story", "order")
+        ordering = ["order"]
+
+
+class Video(models.Model):
+    """A YouTube-hosted video narration of a story. One story can have many
+    videos (ordered), mirroring Audio — but the media lives on YouTube, so we
+    store only the video id / URL, not a file."""
+
+    story = models.ForeignKey(Story, on_delete=models.CASCADE, related_name="videos")
+    title = models.CharField(max_length=256)
+    slug = models.SlugField(max_length=256, null=True)
+    # Canonical 11-char YouTube id, stored bare (derived from youtube_url).
+    youtube_id = models.CharField(max_length=32)
+    # The original URL an admin pasted, kept for reference / editing.
+    youtube_url = models.URLField(max_length=512)
+    order = models.PositiveIntegerField(default=1)
+    # Admin-entered (optional); refined client-side from the IFrame Player API
+    # once a viewer actually plays the video.
+    duration_seconds = models.FloatField(null=True, blank=True, default=None)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"Video for {self.story.title}: {self.title}"
+
+    def save(self, *args, **kwargs):
+        # Safety net so videos added via the Django admin inline (which does not
+        # go through VideoAdminSerializer) still get a usable youtube_id.
+        if self.youtube_url and not self.youtube_id:
+            from .youtube import parse_youtube_id
+
+            parsed = parse_youtube_id(self.youtube_url)
+            if parsed:
+                self.youtube_id = parsed
+        return super().save(*args, **kwargs)
+
     class Meta:
         unique_together = ("story", "order")
         ordering = ["order"]

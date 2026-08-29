@@ -19,7 +19,7 @@ from rest_framework.permissions import BasePermission
 from rest_framework.filters import SearchFilter
 
 from apps.story.filters import StoryFilter
-from apps.stats.models import ReadingProgress, AudioReadingProgress
+from apps.stats.models import ReadingProgress, AudioReadingProgress, VideoWatchProgress
 from apps.users.models import User
 from apps.users.recommendations import recommend_because_finished
 from .models import (
@@ -29,6 +29,7 @@ from .models import (
     Story,
     Chapter,
     Audio,
+    Video,
     Author,
     Review,
     Favorite,
@@ -82,6 +83,7 @@ from .serializers import (
     StoryDetailSerializer,
     ChapterSerializer,
     AudioSerializer,
+    VideoSerializer,
     ReviewSerializer,
     ReviewWriteSerializer,
     SubmissionSerializer,
@@ -89,6 +91,7 @@ from .serializers import (
     StoryAdminSerializer,
     ChapterAdminSerializer,
     AudioAdminSerializer,
+    VideoAdminSerializer,
     SubmissionAdminSerializer,
     EpubImportJobSerializer,
     BookFetchJobSerializer,
@@ -362,7 +365,12 @@ class StoryViewSet(ReadOnlyModelViewSet):
     pagination_class = CataloguePagination
 
     def get_queryset(self):
-        queryset = Story.objects.published().select_related("author").order_by("-id")
+        queryset = (
+            Story.objects.published()
+            .select_related("author")
+            .prefetch_related("genres", "audios", "videos")
+            .order_by("-id")
+        )
         # Only the "list" action (the public browse/search listing) collapses
         # each translation_group down to one edition — retrieve and the other
         # detail actions (chapter, favorite, reviews, etc.) must still resolve
@@ -1163,6 +1171,33 @@ class AudioAdminViewSet(ModelViewSet):
         return queryset
 
 
+class VideoAdminViewSet(ModelViewSet):
+    queryset = Video.objects.select_related("story").all().order_by("story_id", "order")
+    serializer_class = VideoAdminSerializer
+    pagination_class = AdminStoryItemPagination
+    permission_classes = [IsSuperUser]
+    filter_backends = [SearchFilter]
+    search_fields = ["title", "slug", "story__title"]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        story_id = self.request.query_params.get("story")
+        if story_id:
+            queryset = queryset.filter(story_id=story_id).order_by("order", "id")
+        return queryset
+
+    def perform_destroy(self, instance):
+        story = instance.story
+        deleted_order = instance.order
+        instance.delete()
+
+        # Keep order contiguous from 1 — see ChapterAdminViewSet.perform_destroy.
+        later_videos = Video.objects.filter(story=story, order__gt=deleted_order).order_by("order")
+        for video in later_videos:
+            video.order -= 1
+            video.save(update_fields=["order"])
+
+
 class SubmissionAdminViewSet(ModelViewSet):
     queryset = (
         Submission.objects.select_related("user", "reviewed_by", "published_story")
@@ -1288,7 +1323,7 @@ class LibraryShelvesAPIView(APIView):
             preview_stories = (
                 preferred_stories.filter(genres=genre)
                 .select_related("author")
-                .prefetch_related("genres", "audios")
+                .prefetch_related("genres", "audios", "videos")
                 .order_by("-views", "-rating", "-id")[: self.PREVIEW_SIZE]
             )
             shelves.append(
@@ -1491,7 +1526,7 @@ class ThemeAdminViewSet(ModelViewSet):
 
 class HomeDataAPIView(APIView):
     def get(self, request):
-        base_qs = Story.objects.published().select_related("author").prefetch_related("genres", "audios")
+        base_qs = Story.objects.published().select_related("author").prefetch_related("genres", "audios", "videos")
         used_ids = set()
 
         def take(queryset, limit):
@@ -1577,7 +1612,7 @@ class TrendingDataAPIView(APIView):
         base_qs = (
             Story.objects.published()
             .select_related("author")
-            .prefetch_related("genres", "audios")
+            .prefetch_related("genres", "audios", "videos")
             .annotate(
                 favorites_total=Count("favorites", distinct=True),
                 reviews_total=Count("reviews", distinct=True),
@@ -1611,7 +1646,7 @@ class TrendingDataAPIView(APIView):
 
 class OriginalsDataAPIView(APIView):
     def get(self, request):
-        base_qs = Story.objects.published().select_related("author").prefetch_related("genres", "audios")
+        base_qs = Story.objects.published().select_related("author").prefetch_related("genres", "audios", "videos")
         return Response(
             {
                 "stories": StoryListSerializer(
@@ -1625,7 +1660,7 @@ class OriginalsDataAPIView(APIView):
 
 class DiscoverDataAPIView(APIView):
     def get(self, request):
-        base_qs = Story.objects.published().select_related("author").prefetch_related("genres", "audios")
+        base_qs = Story.objects.published().select_related("author").prefetch_related("genres", "audios", "videos")
         trending_qs = base_qs.annotate(
             favorites_total=Count("favorites", distinct=True),
             reviews_total=Count("reviews", distinct=True),
@@ -1762,6 +1797,7 @@ class AdminOverviewAPIView(APIView):
             "stories": Story.objects.count(),
             "chapters": Chapter.objects.count(),
             "audios": Audio.objects.count(),
+            "videos": Video.objects.count(),
             "users": User.objects.count(),
             "submissions_pending": Submission.objects.filter(status="pending").count(),
             "submissions_approved": Submission.objects.filter(status="approved").count(),
@@ -1771,6 +1807,7 @@ class AdminOverviewAPIView(APIView):
             "total_story_views": total_views,
             "active_readers": ReadingProgress.objects.values("user_id").distinct().count(),
             "active_listeners": AudioReadingProgress.objects.values("user_id").distinct().count(),
+            "active_watchers": VideoWatchProgress.objects.values("user_id").distinct().count(),
         }
 
         most_read_stories_qs = (
@@ -1816,6 +1853,28 @@ class AdminOverviewAPIView(APIView):
             for audio in most_listened_audios_qs
         ]
 
+        most_watched_videos_qs = (
+            Video.objects.select_related("story")
+            .annotate(
+                watchers_count=Count("video_watch_progress", distinct=True),
+                avg_progress=Avg("video_watch_progress__progress"),
+            )
+            .order_by("-watchers_count", "-id")[:8]
+        )
+        most_watched_videos = [
+            {
+                "id": video.id,
+                "title": video.title,
+                "slug": video.slug,
+                "story_id": video.story_id,
+                "story_title": video.story.title,
+                "story_slug": video.story.slug,
+                "watchers_count": video.watchers_count,
+                "avg_progress": round(float(video.avg_progress or 0), 3),
+            }
+            for video in most_watched_videos_qs
+        ]
+
         top_favorited_stories_qs = (
             Story.objects.annotate(favorites_count=Count("favorites", distinct=True))
             .order_by("-favorites_count", "-id")[:8]
@@ -1847,6 +1906,7 @@ class AdminOverviewAPIView(APIView):
                 "summary": summary,
                 "most_read_stories": most_read_stories,
                 "most_listened_audios": most_listened_audios,
+                "most_watched_videos": most_watched_videos,
                 "top_favorited_stories": top_favorited_stories,
                 "top_rated_stories": top_rated_stories,
             }
@@ -1886,7 +1946,7 @@ class SearchStoryAPIView(APIView):
             stories = (
                 Story.objects.published()
                 .select_related("author")
-                .prefetch_related("genres", "audios", "tags")
+                .prefetch_related("genres", "audios", "videos", "tags")
                 .filter(
                     Q(title__icontains=q)
                     | Q(about__icontains=q)

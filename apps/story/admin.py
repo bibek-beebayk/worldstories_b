@@ -4,7 +4,7 @@ from django.utils.html import strip_tags
 from django.utils import timezone
 from django.utils.text import slugify
 from solo.admin import SingletonModelAdmin
-from .models import Audio, Blog, Story, Genre, Category, StoryType, Tag, Theme, Author, Chapter, PromptSettings, Review, Submission, StoryView
+from .models import Audio, Video, Blog, Story, Genre, Category, StoryType, Tag, Theme, Author, Chapter, PromptSettings, Review, Submission, StoryView
 
 admin.site.register(PromptSettings, SingletonModelAdmin)
 
@@ -33,6 +33,14 @@ class AudioInline(admin.StackedInline):
     extra = 0
     classes = ("collapse",)
     fields = ("title", "slug", "order", "audio_file")
+
+
+class VideoInline(admin.StackedInline):
+    model = Video
+    extra = 0
+    classes = ("collapse",)
+    fields = ("title", "slug", "order", "youtube_url", "youtube_id", "duration_seconds")
+    readonly_fields = ("youtube_id",)
 
 
 def _unique_story_slug(title: str) -> str:
@@ -129,7 +137,7 @@ def _publish_submission(submission: Submission, reviewer) -> Story:
 
 @admin.register(Story)
 class StoryAdmin(admin.ModelAdmin):
-    inlines = [ChapterInline, AudioInline]
+    inlines = [ChapterInline, AudioInline, VideoInline]
     change_form_template = "admin/story/story/change_form.html"
     prepopulated_fields = {"slug": ("title",)}
     fieldsets = (
@@ -183,12 +191,12 @@ class StoryAdmin(admin.ModelAdmin):
         (
             "Read-only Metrics",
             {
-                "fields": ("rating", "views", "chapters_count", "audios_count"),
+                "fields": ("rating", "views", "chapters_count", "audios_count", "videos_count"),
                 "classes": ("collapse",),
             },
         ),
     )
-    readonly_fields = ("submitted_by", "rating", "views", "chapters_count", "audios_count")
+    readonly_fields = ("submitted_by", "rating", "views", "chapters_count", "audios_count", "videos_count")
     list_display = (
         "title",
         "story_type",
@@ -202,6 +210,7 @@ class StoryAdmin(admin.ModelAdmin):
         "site_published_date",
         "chapters_count",
         "audios_count",
+        "videos_count",
     )
     search_fields = (
         "title",
@@ -238,6 +247,10 @@ class StoryAdmin(admin.ModelAdmin):
     @admin.display(description="Audios")
     def audios_count(self, obj):
         return obj.audios.count()
+
+    @admin.display(description="Videos")
+    def videos_count(self, obj):
+        return obj.videos.count()
 
 
 @admin.register(Blog)

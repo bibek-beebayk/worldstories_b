@@ -66,6 +66,7 @@ class UserProfileSerializer(serializers.ModelSerializer):
     reviews_count = serializers.SerializerMethodField()
     reading_in_progress_count = serializers.SerializerMethodField()
     listening_in_progress_count = serializers.SerializerMethodField()
+    watching_in_progress_count = serializers.SerializerMethodField()
     preferred_genres = GenreSerializer(many=True, read_only=True)
 
     class Meta:
@@ -83,6 +84,7 @@ class UserProfileSerializer(serializers.ModelSerializer):
             "reviews_count",
             "reading_in_progress_count",
             "listening_in_progress_count",
+            "watching_in_progress_count",
             "preferred_genres",
         ]
 
@@ -97,6 +99,9 @@ class UserProfileSerializer(serializers.ModelSerializer):
 
     def get_listening_in_progress_count(self, obj):
         return obj.audio_reading_progress.filter(progress__gt=0, progress__lt=1).count()
+
+    def get_watching_in_progress_count(self, obj):
+        return obj.video_watch_progress.filter(progress__gt=0, progress__lt=1).count()
 
 
 class UserAdminSerializer(serializers.ModelSerializer):
@@ -184,6 +189,15 @@ class ContinueListeningItemSerializer(serializers.Serializer):
     audio_slug = serializers.CharField(allow_null=True)
     audio_title = serializers.CharField(allow_null=True)
     audio_progress = serializers.FloatField()
+    overall_progress = serializers.FloatField()
+    updated_at = serializers.DateTimeField()
+
+
+class ContinueWatchingItemSerializer(serializers.Serializer):
+    story = StoryListSerializer()
+    video_slug = serializers.CharField(allow_null=True)
+    video_title = serializers.CharField(allow_null=True)
+    video_progress = serializers.FloatField()
     overall_progress = serializers.FloatField()
     updated_at = serializers.DateTimeField()
 

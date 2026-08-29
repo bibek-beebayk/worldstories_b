@@ -11,6 +11,7 @@ from apps.stats.models import (
     ReadingProgress,
     ChapterReadingProgress,
     AudioReadingProgress,
+    VideoWatchProgress,
     BlogReadingProgress,
     FileReadingProgress,
 )
@@ -20,6 +21,8 @@ from apps.stats.serializers import (
     ReadingProgressWriteSerializer,
     AudioReadingProgressSerializer,
     AudioReadingProgressWriteSerializer,
+    VideoWatchProgressSerializer,
+    VideoWatchProgressWriteSerializer,
     BlogReadingProgressSerializer,
     BlogReadingProgressWriteSerializer,
     FileReadingProgressSerializer,
@@ -182,6 +185,77 @@ class AudioReadingProgressAPIView(APIView):
             user=request.user,
             story=story,
             audio=audio,
+        )
+        current_progress = serializer.validated_data["progress"]
+        progress_obj.progress = max(progress_obj.progress, current_progress)
+        progress_obj.position_seconds = serializer.validated_data.get("position_seconds", 0.0)
+        progress_obj.duration_seconds = serializer.validated_data.get("duration_seconds", 0.0)
+        progress_obj.save()
+
+        return Response(self._build_progress_payload(request, story, progress_obj))
+
+
+class VideoWatchProgressAPIView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def _build_progress_payload(self, request, story, progress):
+        video_progress_qs = VideoWatchProgress.objects.filter(
+            user=request.user, story=story
+        ).select_related("video")
+        video_progress_map = {
+            item.video.slug: {
+                "progress": max(0.0, min(1.0, item.progress)),
+                "position_seconds": max(0.0, item.position_seconds),
+                "duration_seconds": max(0.0, item.duration_seconds),
+            }
+            for item in video_progress_qs
+            if item.video and item.video.slug
+        }
+
+        total_videos = story.videos.count()
+        overall_progress = 0.0
+        if total_videos > 0:
+            overall_progress = sum(
+                item["progress"] for item in video_progress_map.values()
+            ) / total_videos
+
+        serializer = VideoWatchProgressSerializer(
+            progress,
+            context={
+                "video_progress_map": video_progress_map,
+                "overall_progress": round(overall_progress, 4),
+            },
+        )
+        return serializer.data
+
+    def get(self, request, story_slug):
+        story = get_object_or_404(Story.objects.published(), slug=story_slug)
+        progress = VideoWatchProgress.objects.filter(
+            user=request.user, story=story
+        ).order_by("-updated_at").first()
+        if not progress:
+            return Response({"detail": "Progress not found."}, status=status.HTTP_404_NOT_FOUND)
+        return Response(self._build_progress_payload(request, story, progress))
+
+    def put(self, request, story_slug):
+        story = get_object_or_404(Story.objects.published(), slug=story_slug)
+        serializer = VideoWatchProgressWriteSerializer(
+            data=request.data,
+            context={"story": story},
+        )
+        serializer.is_valid(raise_exception=True)
+
+        video = serializer.validated_data.get("video")
+        if not video:
+            return Response(
+                {"detail": "video_slug is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        progress_obj, _ = VideoWatchProgress.objects.get_or_create(
+            user=request.user,
+            story=story,
+            video=video,
         )
         current_progress = serializer.validated_data["progress"]
         progress_obj.progress = max(progress_obj.progress, current_progress)

@@ -7,10 +7,10 @@ from django.urls import reverse
 from django.utils import timezone
 from rest_framework.test import APITestCase
 
-from apps.story.models import Audio, Blog, Story
+from apps.story.models import Audio, Video, Blog, Story
 from apps.users.models import User
 
-from .models import AnalyticsEvent
+from .models import AnalyticsEvent, VideoWatchProgress
 from .streaks import compute_streak
 
 
@@ -268,6 +268,26 @@ class AdminAudienceAnalyticsApiTests(APITestCase):
         self.assertEqual(referral_sources.get("twitter"), 1)
         self.assertEqual(referral_sources.get("direct"), 1)
 
+    def test_watching_sessions_feed_watch_metrics(self):
+        AnalyticsEvent.objects.create(
+            event_type=AnalyticsEvent.EVENT_WATCHING_SESSION,
+            visitor_id="returning-browser",
+            story=self.story,
+            duration_seconds=240,
+        )
+        cache.clear()
+        self.client.force_authenticate(self.admin)
+
+        response = self.client.get(reverse("admin-analytics-audience"), {"days": 30})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["summary"]["watching_minutes"], 4)
+        self.assertEqual(response.data["top_watched"][0]["slug"], self.story.slug)
+        self.assertEqual(response.data["top_watched"][0]["minutes"], 4)
+        self.assertTrue(
+            any(day["watching_minutes"] for day in response.data["daily_activity"])
+        )
+
     def test_non_superuser_is_forbidden(self):
         self.client.force_authenticate(self.reader)
 
@@ -305,6 +325,17 @@ class AdminContentAnalyticsApiTests(APITestCase):
             order=1,
             audio_file="story_audios/fake.mp3",
         )
+        self.watchable_story = Story.objects.create(
+            title="Watchable Story", slug="watchable-story", is_published=True
+        )
+        Video.objects.create(
+            story=self.watchable_story,
+            title="Narration 1",
+            slug="narration-1",
+            order=1,
+            youtube_url="https://youtu.be/dQw4w9WgXcQ",
+            youtube_id="dQw4w9WgXcQ",
+        )
         Story.objects.create(
             title="Quick Read Story",
             slug="quick-read-story",
@@ -321,9 +352,71 @@ class AdminContentAnalyticsApiTests(APITestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data["blog_posts_count"], 2)
         self.assertGreaterEqual(sum(row["count"] for row in response.data["blog_publishing_over_time"]), 2)
-        self.assertEqual(response.data["stories_count"], 3)
+        self.assertEqual(response.data["stories_count"], 4)
         self.assertEqual(response.data["audiobooks_count"], 1)
+        self.assertEqual(response.data["watchable_count"], 1)
         self.assertEqual(response.data["quick_read_count"], 1)
+
+
+class VideoWatchProgressApiTests(APITestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(
+            email="watcher@example.com", username="watcher", password="test-password"
+        )
+        self.story = Story.objects.create(
+            title="Watchable", slug="watchable", is_published=True
+        )
+        self.video = Video.objects.create(
+            story=self.story,
+            title="Narration 1",
+            slug="narration-1",
+            order=1,
+            youtube_url="https://youtu.be/dQw4w9WgXcQ",
+            youtube_id="dQw4w9WgXcQ",
+        )
+        self.url = reverse("video-watch-progress", args=[self.story.slug])
+
+    def test_put_creates_and_get_returns_progress(self):
+        self.client.force_authenticate(self.user)
+
+        put = self.client.put(
+            self.url,
+            {
+                "video_slug": "narration-1",
+                "progress": 0.4,
+                "position_seconds": 120,
+                "duration_seconds": 300,
+            },
+            format="json",
+        )
+        self.assertEqual(put.status_code, 200)
+        self.assertEqual(put.data["overall_progress"], 0.4)
+
+        get = self.client.get(self.url)
+        self.assertEqual(get.status_code, 200)
+        self.assertEqual(get.data["video_slug"], "narration-1")
+        self.assertEqual(get.data["position_seconds"], 120)
+
+    def test_progress_only_moves_forward(self):
+        self.client.force_authenticate(self.user)
+        VideoWatchProgress.objects.create(
+            user=self.user, story=self.story, video=self.video, progress=0.8
+        )
+
+        put = self.client.put(
+            self.url,
+            {"video_slug": "narration-1", "progress": 0.2},
+            format="json",
+        )
+        self.assertEqual(put.status_code, 200)
+        self.video.video_watch_progress.get(user=self.user).refresh_from_db()
+        self.assertEqual(
+            VideoWatchProgress.objects.get(user=self.user, video=self.video).progress, 0.8
+        )
+
+    def test_requires_authentication(self):
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, 401)
 
 
 class ComputeStreakTests(SimpleTestCase):

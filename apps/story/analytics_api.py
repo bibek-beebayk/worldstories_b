@@ -19,6 +19,7 @@ from rest_framework.views import APIView
 from apps.stats.models import (
     AnalyticsEvent,
     AudioReadingProgress,
+    VideoWatchProgress,
     BlogReadingProgress,
     ChapterReadingProgress,
     ReadingProgress,
@@ -122,6 +123,7 @@ def build_content_data(days):
     # — a story counts as an audiobook/Quick Read if it has narration
     # audio / a summary, matching how those are surfaced to readers.
     audiobooks_count = Story.objects.published().filter(audios__isnull=False).distinct().count()
+    watchable_count = Story.objects.published().filter(videos__isnull=False).distinct().count()
     quick_read_count = (
         Story.objects.published().exclude(Q(summary__isnull=True) | Q(summary__exact="")).count()
     )
@@ -157,6 +159,7 @@ def build_content_data(days):
         "blog_posts_count": blog_posts_count,
         "stories_count": stories_count,
         "audiobooks_count": audiobooks_count,
+        "watchable_count": watchable_count,
         "quick_read_count": quick_read_count,
     }
 
@@ -185,6 +188,10 @@ def build_engagement_data(days):
 
     audio_listen_through = AudioReadingProgress.objects.filter(updated_at__gte=cutoff).aggregate(
         avg_progress=Avg("progress"), listeners=Count("user", distinct=True)
+    )
+
+    video_watch_through = VideoWatchProgress.objects.filter(updated_at__gte=cutoff).aggregate(
+        avg_progress=Avg("progress"), watchers=Count("user", distinct=True)
     )
 
     favorites_over_time = (
@@ -226,6 +233,10 @@ def build_engagement_data(days):
         "audio_listen_through": {
             "avg_progress": round(audio_listen_through["avg_progress"] or 0, 3),
             "listeners": audio_listen_through["listeners"] or 0,
+        },
+        "video_watch_through": {
+            "avg_progress": round(video_watch_through["avg_progress"] or 0, 3),
+            "watchers": video_watch_through["watchers"] or 0,
         },
         "favorites_over_time": [{"day": row["day"], "count": row["count"]} for row in favorites_over_time],
         "rating_distribution": list(rating_distribution),
@@ -415,6 +426,7 @@ def build_audience_data(days):
                 "completions": 0,
                 "reading_minutes": 0,
                 "listening_minutes": 0,
+                "watching_minutes": 0,
             },
         )
         event_type = row["event_type"]
@@ -428,6 +440,8 @@ def build_audience_data(days):
             entry["reading_minutes"] = round((row["duration_seconds"] or 0) / 60, 1)
         elif event_type == AnalyticsEvent.EVENT_LISTENING_SESSION:
             entry["listening_minutes"] = round((row["duration_seconds"] or 0) / 60, 1)
+        elif event_type == AnalyticsEvent.EVENT_WATCHING_SESSION:
+            entry["watching_minutes"] = round((row["duration_seconds"] or 0) / 60, 1)
 
     visit_events = AnalyticsEvent.objects.filter(event_type=AnalyticsEvent.EVENT_VISIT)
     authenticated_first = {
@@ -519,6 +533,7 @@ def build_audience_data(days):
         event_type__in=[
             AnalyticsEvent.EVENT_READING_SESSION,
             AnalyticsEvent.EVENT_LISTENING_SESSION,
+            AnalyticsEvent.EVENT_WATCHING_SESSION,
         ]
     )
     reading_seconds = sessions.filter(
@@ -526,6 +541,9 @@ def build_audience_data(days):
     ).aggregate(total=Sum("duration_seconds"))["total"] or 0
     listening_seconds = sessions.filter(
         event_type=AnalyticsEvent.EVENT_LISTENING_SESSION
+    ).aggregate(total=Sum("duration_seconds"))["total"] or 0
+    watching_seconds = sessions.filter(
+        event_type=AnalyticsEvent.EVENT_WATCHING_SESSION
     ).aggregate(total=Sum("duration_seconds"))["total"] or 0
     # Additive breakdowns, not carve-outs — reading_seconds above already
     # sums every reading_session regardless of content (blog and quick
@@ -604,6 +622,12 @@ def build_audience_data(days):
         .annotate(duration_seconds=Sum("duration_seconds"), sessions=Count("id"))
         .order_by("-duration_seconds")[:10]
     )
+    top_watched = list(
+        events.filter(event_type=AnalyticsEvent.EVENT_WATCHING_SESSION, story_id__isnull=False)
+        .values("story_id", "story__title", "story__slug")
+        .annotate(duration_seconds=Sum("duration_seconds"), sessions=Count("id"))
+        .order_by("-duration_seconds")[:10]
+    )
     top_blogs_read = list(
         events.filter(event_type=AnalyticsEvent.EVENT_READING_SESSION, blog_id__isnull=False)
         .values("blog_id", "blog__title", "blog__slug")
@@ -641,10 +665,11 @@ def build_audience_data(days):
             else 0,
             "reading_minutes": round(reading_seconds / 60, 1),
             "listening_minutes": round(listening_seconds / 60, 1),
+            "watching_minutes": round(watching_seconds / 60, 1),
             "blog_reading_minutes": round(blog_reading_seconds / 60, 1),
             "quick_read_reading_minutes": round(quick_read_reading_seconds / 60, 1),
             "avg_session_minutes": round(
-                (reading_seconds + listening_seconds) / total_session_count / 60, 1
+                (reading_seconds + listening_seconds + watching_seconds) / total_session_count / 60, 1
             )
             if total_session_count
             else 0,
@@ -709,6 +734,16 @@ def build_audience_data(days):
                 "minutes": round((row["duration_seconds"] or 0) / 60, 1),
             }
             for row in top_listened
+        ],
+        "top_watched": [
+            {
+                "story_id": row["story_id"],
+                "title": row["story__title"],
+                "slug": row["story__slug"],
+                "sessions": row["sessions"],
+                "minutes": round((row["duration_seconds"] or 0) / 60, 1),
+            }
+            for row in top_watched
         ],
         "top_blogs_read": [
             {
@@ -835,6 +870,7 @@ SECTION_TABLE_KEYS = {
         "referral_sources",
         "top_downloads",
         "top_listened",
+        "top_watched",
         "top_blogs_read",
         "top_pages",
     },
@@ -1020,6 +1056,19 @@ def build_story_detail_data(story, days):
             "listening_minutes": round(listening_seconds / 60, 1),
         }
 
+    has_video = story.videos.exists()
+    video_data = None
+    if has_video:
+        video_progress_qs = VideoWatchProgress.objects.filter(story=story, updated_at__gte=cutoff)
+        watching_seconds = events.filter(event_type=AnalyticsEvent.EVENT_WATCHING_SESSION).aggregate(
+            total=Sum("duration_seconds")
+        )["total"] or 0
+        video_data = {
+            "watchers": video_progress_qs.values("user_id").distinct().count(),
+            "avg_progress": round(video_progress_qs.aggregate(avg=Avg("progress"))["avg"] or 0, 3),
+            "watching_minutes": round(watching_seconds / 60, 1),
+        }
+
     return {
         "range_days": days,
         "story": {"id": story.id, "title": story.title, "slug": story.slug},
@@ -1047,6 +1096,8 @@ def build_story_detail_data(story, days):
         ],
         "has_audio": has_audio,
         "audio": audio_data,
+        "has_video": has_video,
+        "video": video_data,
     }
 
 

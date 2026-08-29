@@ -9,6 +9,7 @@ from datetime import date
 from core.libs.images import get_cover_image_url
 from .models import (
     Audio,
+    Video,
     Story,
     Genre,
     Category,
@@ -29,6 +30,7 @@ from .models import (
 )
 from . import reading_time
 from .audio_processing import normalize_uploaded_audio
+from .youtube import parse_youtube_id, parse_duration_seconds
 from .excerpts import excerpt_at_query
 
 CARD_COVER_SIZE = "480x640"
@@ -315,6 +317,7 @@ class StoryListSerializer(serializers.ModelSerializer):
             "rating",
             "views",
             "has_audio",
+            "has_video",
             "genres",
             "categories",
             "author",
@@ -397,6 +400,12 @@ class AudioListSerializer(serializers.ModelSerializer):
         fields = ["id", "title", "slug", "order"]
 
 
+class VideoSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Video
+        fields = ["id", "title", "slug", "youtube_id", "order", "duration_seconds"]
+
+
 def similar_stories_candidates(story):
     """Shared 'similar to `story`' candidate query — genre/author/
     story_type/language overlap, excluding its own translation group. Used
@@ -457,9 +466,11 @@ class StoryDetailSerializer(serializers.ModelSerializer):
     favorites_count = serializers.SerializerMethodField()
     chapters = ChapterListSerializer(many=True, read_only=True)
     audios = AudioSerializer(many=True, read_only=True)
+    videos = VideoSerializer(many=True, read_only=True)
     translations = serializers.SerializerMethodField()
     reading_time_minutes = serializers.SerializerMethodField()
     listening_time_minutes = serializers.SerializerMethodField()
+    watch_time_minutes = serializers.SerializerMethodField()
     published_date_label = serializers.SerializerMethodField()
     pdf_size_bytes = serializers.SerializerMethodField()
     epub_size_bytes = serializers.SerializerMethodField()
@@ -494,6 +505,9 @@ class StoryDetailSerializer(serializers.ModelSerializer):
 
     def get_listening_time_minutes(self, obj):
         return reading_time.story_listening_minutes(obj.audios.all())
+
+    def get_watch_time_minutes(self, obj):
+        return reading_time.story_watch_minutes(obj.videos.all())
 
     def get_translations(self, obj):
         siblings = (
@@ -595,8 +609,12 @@ class StoryDetailSerializer(serializers.ModelSerializer):
             "chapter_count",
             "chapters",
             "audios",
+            "videos",
+            "has_audio",
+            "has_video",
             "reading_time_minutes",
             "listening_time_minutes",
+            "watch_time_minutes",
             "similar_stories",
         ]
 
@@ -761,12 +779,16 @@ class StoryAdminSerializer(serializers.ModelSerializer):
     published_date_label = serializers.SerializerMethodField(read_only=True)
     chapter_count = serializers.SerializerMethodField(read_only=True)
     audio_count = serializers.SerializerMethodField(read_only=True)
+    video_count = serializers.SerializerMethodField(read_only=True)
 
     def get_chapter_count(self, obj):
         return obj.chapters.count()
 
     def get_audio_count(self, obj):
         return obj.audios.count()
+
+    def get_video_count(self, obj):
+        return obj.videos.count()
 
     def get_published_date_label(self, obj):
         original = obj.original_published_date_display()
@@ -854,6 +876,7 @@ class StoryAdminSerializer(serializers.ModelSerializer):
             "publish_at",
             "chapter_count",
             "audio_count",
+            "video_count",
             "cover_image",
             "cover_image_file",
             "remove_cover_image_file",
@@ -1337,6 +1360,67 @@ class AudioAdminSerializer(serializers.ModelSerializer):
         model = Audio
         fields = ["id", "story", "title", "slug", "audio_file", "order", "duration_seconds", "file_size_bytes"]
         read_only_fields = ["duration_seconds", "file_size_bytes"]
+
+
+class FlexibleDurationField(serializers.Field):
+    """Reads back a float of seconds; accepts either a number of seconds or a
+    "mm:ss" / "hh:mm:ss" string on write."""
+
+    def to_representation(self, value):
+        return value
+
+    def to_internal_value(self, data):
+        if data in (None, ""):
+            return None
+        seconds = parse_duration_seconds(data)
+        if seconds is None or seconds < 0:
+            raise serializers.ValidationError("Enter a duration in seconds or mm:ss.")
+        return seconds
+
+
+class VideoAdminSerializer(serializers.ModelSerializer):
+    # Accepts a URL or bare id on write; the parsed 11-char id is returned.
+    youtube_url = serializers.CharField()
+    duration_seconds = FlexibleDurationField(required=False, allow_null=True)
+
+    def _build_unique_slug(self, story, title: str, instance=None) -> str:
+        base_slug = slugify(title) or "video"
+        slug = base_slug
+        suffix = 2
+        queryset = Video.objects.filter(story=story)
+        if instance is not None:
+            queryset = queryset.exclude(pk=instance.pk)
+        while queryset.filter(slug=slug).exists():
+            slug = f"{base_slug}-{suffix}"
+            suffix += 1
+        return slug
+
+    def validate_youtube_url(self, value):
+        video_id = parse_youtube_id(value)
+        if not video_id:
+            raise serializers.ValidationError(
+                "Enter a valid YouTube video URL or id."
+            )
+        self._parsed_youtube_id = video_id
+        return value.strip()
+
+    def validate(self, attrs):
+        story = attrs.get("story") or getattr(self.instance, "story", None)
+        title = attrs.get("title") or getattr(self.instance, "title", "")
+        slug = attrs.get("slug")
+
+        if story and title and (slug is None or str(slug).strip() == ""):
+            attrs["slug"] = self._build_unique_slug(story, title, self.instance)
+
+        parsed_id = getattr(self, "_parsed_youtube_id", None)
+        if parsed_id:
+            attrs["youtube_id"] = parsed_id
+        return attrs
+
+    class Meta:
+        model = Video
+        fields = ["id", "story", "title", "slug", "youtube_url", "youtube_id", "order", "duration_seconds"]
+        read_only_fields = ["youtube_id"]
 
 
 class SubmissionAdminSerializer(serializers.ModelSerializer):

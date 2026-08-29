@@ -50,6 +50,7 @@ from apps.story.excerpts import _excerpt_from_text
 from apps.story.epub_import_jobs import run_epub_import
 from apps.story.models import (
     Audio,
+    Video,
     Author,
     Blog,
     BookFetchJob,
@@ -425,7 +426,7 @@ class ScheduledPublishingTests(SimpleTestCase):
     @patch("apps.story.api.Story.objects.published")
     def test_public_queryset_is_built_for_each_request(self, published):
         queryset = MagicMock()
-        queryset.select_related.return_value.order_by.return_value = queryset
+        queryset.select_related.return_value.prefetch_related.return_value.order_by.return_value = queryset
         published.return_value = queryset
         view = StoryViewSet()
         view.action = "retrieve"
@@ -433,6 +434,9 @@ class ScheduledPublishingTests(SimpleTestCase):
         self.assertIs(view.get_queryset(), queryset)
         published.assert_called_once_with()
         queryset.select_related.assert_called_once_with("author")
+        queryset.select_related.return_value.prefetch_related.assert_called_once_with(
+            "genres", "audios", "videos"
+        )
 
     @patch("django.db.models.Model.save")
     def test_scheduled_story_uses_schedule_date_as_site_date(self, model_save):
@@ -1096,6 +1100,31 @@ class PublicAuthorApiTests(APITestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual([story["slug"] for story in response.data["results"]], ["story-with-audio"])
+
+    def test_story_list_can_filter_by_has_video(self):
+        with_video = Story.objects.create(
+            title="Story With Video",
+            slug="story-with-video",
+            is_published=True,
+        )
+        Video.objects.create(
+            story=with_video,
+            title="Narration 1",
+            slug="narration-1",
+            order=1,
+            youtube_url="https://youtu.be/dQw4w9WgXcQ",
+            youtube_id="dQw4w9WgXcQ",
+        )
+        Story.objects.create(
+            title="Story Without Video",
+            slug="story-without-video",
+            is_published=True,
+        )
+
+        response = self.client.get(reverse("story-list"), {"has_video": "true"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([story["slug"] for story in response.data["results"]], ["story-with-video"])
 
     def test_story_list_can_filter_by_has_summary(self):
         Story.objects.create(

@@ -10,6 +10,7 @@ class StoryFilter(filters.FilterSet):
     story_type = filters.CharFilter(method="filter_story_type", label="Story type")
     country = filters.CharFilter(method="filter_country", label="Country")
     has_audio = filters.CharFilter(method="filter_has_audio", label="Has audio")
+    has_video = filters.CharFilter(method="filter_has_video", label="Has video")
     has_summary = filters.CharFilter(method="filter_has_summary", label="Has summary")
     sort = filters.CharFilter(method="filter_sort", label="Sort")
     q = filters.CharFilter(method="filter_q", label="Query")
@@ -51,6 +52,13 @@ class StoryFilter(filters.FilterSet):
             return queryset.filter(audios__isnull=True)
         return queryset
 
+    def filter_has_video(self, queryset, name, value):
+        if value.lower() == "true":
+            return queryset.filter(videos__isnull=False).distinct()
+        if value.lower() == "false":
+            return queryset.filter(videos__isnull=True)
+        return queryset
+
     def filter_has_summary(self, queryset, name, value):
         no_summary = Q(summary__isnull=True) | Q(summary__exact="")
         if value.lower() == "true":
@@ -86,4 +94,4 @@ class StoryFilter(filters.FilterSet):
 
     class Meta:
         model = Story
-        fields = ["status", "genres", "categories", "language", "story_type", "country", "has_audio", "has_summary", "sort", "q"]
+        fields = ["status", "genres", "categories", "language", "story_type", "country", "has_audio", "has_video", "has_summary", "sort", "q"]

@@ -2,11 +2,12 @@ import json
 
 from rest_framework import serializers
 
-from apps.story.models import Chapter, Audio, Story, Blog
+from apps.story.models import Chapter, Audio, Video, Story, Blog
 from apps.stats.models import (
     AnalyticsEvent,
     ReadingProgress,
     AudioReadingProgress,
+    VideoWatchProgress,
     BlogReadingProgress,
     FileReadingProgress,
 )
@@ -153,6 +154,65 @@ class AudioReadingProgressWriteSerializer(serializers.Serializer):
                     {"audio_slug": "Invalid audio for this story."}
                 )
         attrs["audio"] = audio
+        return attrs
+
+
+class VideoWatchProgressSerializer(serializers.ModelSerializer):
+    video_slug = serializers.SerializerMethodField()
+    overall_progress = serializers.SerializerMethodField()
+    video_progresses = serializers.SerializerMethodField()
+
+    class Meta:
+        model = VideoWatchProgress
+        fields = [
+            "video_slug",
+            "progress",
+            "position_seconds",
+            "duration_seconds",
+            "overall_progress",
+            "video_progresses",
+            "updated_at",
+        ]
+
+    def get_video_slug(self, obj):
+        return obj.video.slug if obj.video else None
+
+    def get_overall_progress(self, obj):
+        return self.context.get("overall_progress", 0.0)
+
+    def get_video_progresses(self, obj):
+        video_progress_map = self.context.get("video_progress_map", {})
+        return [
+            {
+                "video_slug": video_slug,
+                "progress": values["progress"],
+                "position_seconds": values["position_seconds"],
+                "duration_seconds": values["duration_seconds"],
+            }
+            for video_slug, values in video_progress_map.items()
+        ]
+
+
+class VideoWatchProgressWriteSerializer(serializers.Serializer):
+    video_slug = serializers.CharField(required=False, allow_blank=True)
+    progress = serializers.FloatField(min_value=0.0, max_value=1.0)
+    position_seconds = serializers.FloatField(required=False, min_value=0.0, default=0.0)
+    duration_seconds = serializers.FloatField(required=False, min_value=0.0, default=0.0)
+
+    def validate_video_slug(self, value):
+        return value.strip()
+
+    def validate(self, attrs):
+        story = self.context["story"]
+        video_slug = attrs.get("video_slug")
+        video = None
+        if video_slug:
+            video = Video.objects.filter(story=story, slug=video_slug).first()
+            if not video:
+                raise serializers.ValidationError(
+                    {"video_slug": "Invalid video for this story."}
+                )
+        attrs["video"] = video
         return attrs
 
 

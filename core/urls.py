@@ -30,6 +30,7 @@ router.register("blog", story_api.BlogViewSet, basename="blog")
 router.register("admin/stories", story_api.StoryAdminViewSet, basename="admin-story")
 router.register("admin/chapters", story_api.ChapterAdminViewSet, basename="admin-chapter")
 router.register("admin/audios", story_api.AudioAdminViewSet, basename="admin-audio")
+router.register("admin/videos", story_api.VideoAdminViewSet, basename="admin-video")
 router.register("admin/submissions", story_api.SubmissionAdminViewSet, basename="admin-submission")
 router.register("admin/authors", story_api.AuthorAdminViewSet, basename="admin-author")
 router.register("admin/categories", story_api.CategoryAdminViewSet, basename="admin-category")
@@ -55,6 +56,7 @@ def sitemap(request):
             "/discover",
             "/story-map",
             "/audiobooks",
+            "/watch",
             "/authors",
             "/tags",
             "/themes",
@@ -243,6 +245,11 @@ urlpatterns = [
         "api/audio-progress/<slug:story_slug>/",
         stats_views.AudioReadingProgressAPIView.as_view(),
         name="audio-reading-progress",
+    ),
+    path(
+        "api/video-progress/<slug:story_slug>/",
+        stats_views.VideoWatchProgressAPIView.as_view(),
+        name="video-watch-progress",
     ),
     path(
         "api/file-reading-progress/<slug:story_slug>/<str:file_format>/",

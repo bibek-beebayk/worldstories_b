@@ -2,7 +2,7 @@ from django.conf import settings
 from django.db import models
 import uuid
 
-from apps.story.models import Story, Chapter, Audio, Blog
+from apps.story.models import Story, Chapter, Audio, Video, Blog
 
 
 class ReadingProgress(models.Model):
@@ -184,11 +184,44 @@ class AudioReadingProgress(models.Model):
         return f"{self.user} - {self.audio} ({self.progress:.2%})"
 
 
+class VideoWatchProgress(models.Model):
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="video_watch_progress",
+    )
+    story = models.ForeignKey(
+        Story,
+        on_delete=models.CASCADE,
+        related_name="video_watch_progress",
+    )
+    video = models.ForeignKey(
+        Video,
+        on_delete=models.CASCADE,
+        related_name="video_watch_progress",
+    )
+    progress = models.FloatField(default=0.0)
+    position_seconds = models.FloatField(default=0.0)
+    duration_seconds = models.FloatField(default=0.0)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = ("user", "video")
+        indexes = [
+            models.Index(fields=["user", "story"]),
+            models.Index(fields=["user", "video"]),
+        ]
+
+    def __str__(self):
+        return f"{self.user} - {self.video} ({self.progress:.2%})"
+
+
 class AnalyticsEvent(models.Model):
     EVENT_VISIT = "visit"
     EVENT_AD_IMPRESSION = "ad_impression"
     EVENT_READING_SESSION = "reading_session"
     EVENT_LISTENING_SESSION = "listening_session"
+    EVENT_WATCHING_SESSION = "watching_session"
     EVENT_COMPLETION = "completion"
     EVENT_DOWNLOAD = "download"
     EVENT_CHOICES = [
@@ -196,6 +229,7 @@ class AnalyticsEvent(models.Model):
         (EVENT_AD_IMPRESSION, "Ad impression"),
         (EVENT_READING_SESSION, "Reading session"),
         (EVENT_LISTENING_SESSION, "Listening session"),
+        (EVENT_WATCHING_SESSION, "Watching session"),
         (EVENT_COMPLETION, "Completion"),
         (EVENT_DOWNLOAD, "Download"),
     ]
