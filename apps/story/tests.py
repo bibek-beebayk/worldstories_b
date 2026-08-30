@@ -66,7 +66,13 @@ from apps.story.models import (
     Tag,
     Theme,
 )
-from apps.story.serializers import AudioAdminSerializer, StoryAdminSerializer, SubmissionSerializer
+from apps.story.serializers import (
+    AudioAdminSerializer,
+    AudioListSerializer,
+    AudioSerializer,
+    StoryAdminSerializer,
+    SubmissionSerializer,
+)
 from apps.story import reading_time
 from apps.users.models import User
 from core.urls import sitemap
@@ -161,6 +167,222 @@ class AudioAdminSerializerDurationProbeTests(SimpleTestCase):
         probe_bytes.assert_not_called()
         existing_instance.save.assert_not_called()
         self.assertEqual(result.duration_seconds, 42.0)
+
+
+class AudioTranscriptSerializerTests(TestCase):
+    def setUp(self):
+        self.story = Story.objects.create(title="Transcript Story", slug="transcript-story")
+
+    def test_create_persists_rich_text_transcript(self):
+        serializer = AudioAdminSerializer()
+        transcript = "<h2>Opening</h2><p>A <strong>formatted</strong> transcript.</p>"
+
+        with patch.object(serializer, "_probe_duration_from_upload", return_value=None):
+            audio = serializer.create(
+                {
+                    "story": self.story,
+                    "title": "Chapter One Audio",
+                    "slug": "chapter-one-audio",
+                    "audio_file": "story_audios/chapter-one.mp3",
+                    "order": 1,
+                    "transcript": transcript,
+                }
+            )
+
+        audio.refresh_from_db()
+        self.assertEqual(audio.transcript, transcript)
+
+    def test_existing_audio_defaults_to_blank_transcript_without_changing_file(self):
+        audio = Audio.objects.create(
+            story=self.story,
+            title="Existing Audio",
+            slug="existing-audio",
+            audio_file="story_audios/existing.mp3",
+            order=1,
+        )
+
+        audio.refresh_from_db()
+        self.assertEqual(audio.transcript, "")
+        self.assertEqual(audio.audio_file.name, "story_audios/existing.mp3")
+
+    def test_update_and_explicit_clear_are_persisted(self):
+        audio = Audio.objects.create(
+            story=self.story,
+            title="Editable Audio",
+            slug="editable-audio",
+            audio_file="story_audios/editable.mp3",
+            transcript="<p>Original</p>",
+            order=1,
+        )
+
+        update = AudioAdminSerializer(audio, data={"transcript": "<p>Updated</p>"}, partial=True)
+        self.assertTrue(update.is_valid(), update.errors)
+        update.save()
+        audio.refresh_from_db()
+        self.assertEqual(audio.transcript, "<p>Updated</p>")
+
+        clear = AudioAdminSerializer(audio, data={"transcript": ""}, partial=True)
+        self.assertTrue(clear.is_valid(), clear.errors)
+        clear.save()
+        audio.refresh_from_db()
+        self.assertEqual(audio.transcript, "")
+
+    def test_chapter_html_is_an_independent_snapshot_after_copy_result_is_saved(self):
+        chapter = Chapter.objects.create(
+            story=self.story,
+            title="Source Chapter",
+            slug="source-chapter",
+            content="<p>Original chapter text.</p>",
+            order=1,
+        )
+        audio = Audio.objects.create(
+            story=self.story,
+            title="Copied Audio",
+            slug="copied-audio",
+            audio_file="story_audios/copied.mp3",
+            order=1,
+        )
+
+        serializer = AudioAdminSerializer(audio, data={"transcript": chapter.content}, partial=True)
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        serializer.save()
+        chapter.content = "<p>Chapter changed later.</p>"
+        chapter.save(update_fields=["content"])
+
+        audio.refresh_from_db()
+        self.assertEqual(audio.transcript, "<p>Original chapter text.</p>")
+
+
+class ReadAlongAPITests(APITestCase):
+    def setUp(self):
+        self.story = Story.objects.create(title="Read Along Story", slug="read-along-story")
+        self.first = Audio.objects.create(
+            story=self.story,
+            title="First Track",
+            slug="first-track",
+            audio_file="story_audios/first.mp3",
+            transcript="<p>First transcript.</p>",
+            order=1,
+            duration_seconds=10,
+            file_size_bytes=100,
+        )
+        self.current = Audio.objects.create(
+            story=self.story,
+            title="Current Track",
+            slug="current-track",
+            audio_file="story_audios/current.mp3",
+            transcript='<script>alert("unsafe")</script><h2>Current</h2><p>Safe text.</p>',
+            order=2,
+            duration_seconds=20,
+            file_size_bytes=200,
+        )
+        self.without_transcript = Audio.objects.create(
+            story=self.story,
+            title="Audio Only",
+            slug="audio-only",
+            audio_file="story_audios/audio-only.mp3",
+            transcript="",
+            order=3,
+        )
+        self.last = Audio.objects.create(
+            story=self.story,
+            title="Last Track",
+            slug="last-track",
+            audio_file="story_audios/last.mp3",
+            transcript="<p>Last transcript.</p>",
+            order=4,
+        )
+
+    def read_along_url(self, story_slug=None, audio_slug=None):
+        return reverse(
+            "story-read-along",
+            kwargs={
+                "slug": story_slug or self.story.slug,
+                "audio_slug": audio_slug or self.current.slug,
+            },
+        )
+
+    def test_success_returns_metadata_sanitized_transcript_and_compatible_navigation(self):
+        response = self.client.get(self.read_along_url())
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["story"]["slug"], self.story.slug)
+        self.assertEqual(response.data["audio"]["slug"], self.current.slug)
+        self.assertTrue(response.data["audio"]["read_along_available"])
+        self.assertFalse(response.data["audio"]["transcript_synchronized"])
+        self.assertEqual(response.data["transcript"]["state"], "unsynchronized")
+        self.assertEqual(response.data["transcript"]["cues"], [])
+        self.assertIn("<h2>Current</h2>", response.data["transcript"]["html"])
+        self.assertNotIn("<script", response.data["transcript"]["html"])
+        self.assertNotIn("alert", response.data["transcript"]["html"])
+        self.assertTrue(response.data["audio"]["stream_url"].endswith(
+            "/api/stories/read-along-story/audios/current-track/stream/"
+        ))
+        self.assertEqual(
+            response.data["navigation"],
+            {"previous_audio_slug": "first-track", "next_audio_slug": "last-track"},
+        )
+
+    def test_audio_serializers_expose_flags_without_transcript_body(self):
+        detailed = AudioSerializer(self.current).data
+        listed = AudioListSerializer(self.current).data
+
+        for payload in (detailed, listed):
+            self.assertTrue(payload["has_transcript"])
+            self.assertTrue(payload["read_along_available"])
+            self.assertFalse(payload["transcript_synchronized"])
+            self.assertNotIn("transcript", payload)
+
+        unavailable = AudioSerializer(self.without_transcript).data
+        self.assertFalse(unavailable["has_transcript"])
+        self.assertFalse(unavailable["read_along_available"])
+
+    def test_unpublished_story_is_not_available(self):
+        self.story.is_published = False
+        self.story.save(update_fields=["is_published"])
+
+        response = self.client.get(self.read_along_url())
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_future_scheduled_story_is_not_available(self):
+        self.story.publish_at = timezone.now() + timedelta(days=1)
+        self.story.save(update_fields=["publish_at"])
+
+        response = self.client.get(self.read_along_url())
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_audio_from_another_story_is_rejected(self):
+        other_story = Story.objects.create(title="Other Story", slug="other-story")
+        other_audio = Audio.objects.create(
+            story=other_story,
+            title="Other Audio",
+            slug="other-audio",
+            audio_file="story_audios/other.mp3",
+            transcript="<p>Other transcript.</p>",
+            order=1,
+        )
+
+        response = self.client.get(self.read_along_url(audio_slug=other_audio.slug))
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.data["detail"], "Audio track not found.")
+
+    def test_blank_transcript_returns_clear_unavailable_response(self):
+        response = self.client.get(self.read_along_url(audio_slug=self.without_transcript.slug))
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.data["transcript_state"], "empty")
+        self.assertFalse(response.data["read_along_available"])
+
+    def test_success_query_count_is_constant(self):
+        # Three SELECTs (story, requested audio, navigation) plus the
+        # SAVEPOINT/RELEASE pair added by this project's ATOMIC_REQUESTS.
+        with self.assertNumQueries(5):
+            response = self.client.get(self.read_along_url())
+
+        self.assertEqual(response.status_code, 200)
 
 
 class StoryAdminSerializerFileReadingCacheTests(SimpleTestCase):

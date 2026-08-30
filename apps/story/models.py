@@ -667,6 +667,10 @@ class Audio(models.Model):
             FileSizeValidator(MAX_AUDIO_UPLOAD_SIZE),
         ],
     )
+    # Independently editable rich-text content owned by this audio track.
+    # Admins may author it directly or copy a chapter into it as a snapshot;
+    # there is intentionally no persistent Audio -> Chapter relationship.
+    transcript = CKEditor5Field("Transcript", config_name="extends", blank=True)
     uploaded_at = models.DateTimeField(auto_now_add=True)
     order = models.PositiveIntegerField(default=1)
 

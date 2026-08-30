@@ -5,6 +5,7 @@ from django.core.files.base import ContentFile
 from django.db.models import Case, Count, IntegerField, Q, Value, When
 from django.http import QueryDict
 from django.utils.text import slugify
+from django.urls import reverse
 from datetime import date
 from core.libs.images import get_cover_image_url
 from .models import (
@@ -32,6 +33,7 @@ from . import reading_time
 from .audio_processing import normalize_uploaded_audio
 from .youtube import parse_youtube_id, parse_duration_seconds
 from .excerpts import excerpt_at_query
+from .rich_text import rich_text_has_content, sanitize_reader_html
 
 CARD_COVER_SIZE = "480x640"
 LARGE_COVER_SIZE = "900x1200"
@@ -388,16 +390,114 @@ class ChapterSerializer(serializers.ModelSerializer):
 
 class AudioSerializer(serializers.ModelSerializer):
     download_size_bytes = serializers.IntegerField(source="file_size_bytes", read_only=True)
+    has_transcript = serializers.SerializerMethodField()
+    read_along_available = serializers.SerializerMethodField()
+    transcript_synchronized = serializers.SerializerMethodField()
+
+    def get_has_transcript(self, obj):
+        return rich_text_has_content(obj.transcript)
+
+    def get_read_along_available(self, obj):
+        return bool(obj.audio_file) and self.get_has_transcript(obj)
+
+    def get_transcript_synchronized(self, obj):
+        # Timed cue storage is introduced in Milestone 7. Basic rich-text
+        # transcripts are deliberately exposed as unsynchronized until then.
+        return False
 
     class Meta:
         model = Audio
-        fields = ["id", "title", "slug", "audio_file", "order", "download_size_bytes"]
+        fields = [
+            "id", "title", "slug", "audio_file", "order", "download_size_bytes",
+            "has_transcript", "read_along_available", "transcript_synchronized",
+        ]
 
 
 class AudioListSerializer(serializers.ModelSerializer):
+    has_transcript = serializers.SerializerMethodField()
+    read_along_available = serializers.SerializerMethodField()
+    transcript_synchronized = serializers.SerializerMethodField()
+
+    def get_has_transcript(self, obj):
+        return rich_text_has_content(obj.transcript)
+
+    def get_read_along_available(self, obj):
+        return bool(obj.audio_file) and self.get_has_transcript(obj)
+
+    def get_transcript_synchronized(self, obj):
+        return False
+
     class Meta:
         model = Audio
-        fields = ["id", "title", "slug", "order"]
+        fields = [
+            "id", "title", "slug", "order", "has_transcript",
+            "read_along_available", "transcript_synchronized",
+        ]
+
+
+class ReadAlongSerializer(serializers.BaseSerializer):
+    """Dedicated representation; complete transcript HTML never enters normal story payloads."""
+
+    def to_representation(self, audio):
+        request = self.context.get("request")
+        story = self.context["story"]
+
+        audio_file_url = None
+        if audio.audio_file:
+            try:
+                audio_file_url = audio.audio_file.url
+            except (AttributeError, ValueError):
+                audio_file_url = None
+            if audio_file_url and request:
+                audio_file_url = request.build_absolute_uri(audio_file_url)
+
+        stream_path = reverse(
+            "story-audio-stream",
+            kwargs={"slug": story.slug, "audio_slug": audio.slug},
+        )
+        stream_url = request.build_absolute_uri(stream_path) if request else stream_path
+        transcript_html = sanitize_reader_html(audio.transcript)
+
+        return {
+            "story": {
+                "id": story.id,
+                "title": story.title,
+                "slug": story.slug,
+                "language": story.language,
+                "story_type": story.story_type.name,
+                "cover_image": get_cover_image_url(
+                    story.cover_image_file, story.cover_image, request, size=LARGE_COVER_SIZE
+                ),
+                "author": (
+                    {"id": story.author.id, "name": story.author.name}
+                    if story.author_id
+                    else None
+                ),
+            },
+            "audio": {
+                "id": audio.id,
+                "title": audio.title,
+                "slug": audio.slug,
+                "order": audio.order,
+                "audio_file": audio_file_url,
+                "stream_url": stream_url,
+                "duration_seconds": audio.duration_seconds,
+                "download_size_bytes": audio.file_size_bytes,
+                "has_transcript": True,
+                "read_along_available": True,
+                "transcript_synchronized": False,
+            },
+            "transcript": {
+                "html": transcript_html,
+                "state": "unsynchronized",
+                "synchronized": False,
+                "cues": [],
+            },
+            "navigation": {
+                "previous_audio_slug": self.context.get("previous_audio_slug"),
+                "next_audio_slug": self.context.get("next_audio_slug"),
+            },
+        }
 
 
 class VideoSerializer(serializers.ModelSerializer):
@@ -1358,7 +1458,17 @@ class AudioAdminSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Audio
-        fields = ["id", "story", "title", "slug", "audio_file", "order", "duration_seconds", "file_size_bytes"]
+        fields = [
+            "id",
+            "story",
+            "title",
+            "slug",
+            "audio_file",
+            "transcript",
+            "order",
+            "duration_seconds",
+            "file_size_bytes",
+        ]
         read_only_fields = ["duration_seconds", "file_size_bytes"]
 
 

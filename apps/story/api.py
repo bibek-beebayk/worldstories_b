@@ -49,6 +49,7 @@ from .models import (
     COUNTRY_CHOICES,
 )
 from .epub_import_jobs import executor as epub_import_executor, run_epub_import
+from .rich_text import rich_text_has_content
 from .book_fetch import DEFAULT_BOOK_FETCH_COUNT, MAX_BOOK_FETCH_COUNT
 from .book_fetch_jobs import executor as book_fetch_executor, run_book_fetch
 from .queue_import import MAX_IMPORT_ROWS, ImportFileError, build_preview, confirm_import
@@ -83,6 +84,7 @@ from .serializers import (
     StoryDetailSerializer,
     ChapterSerializer,
     AudioSerializer,
+    ReadAlongSerializer,
     VideoSerializer,
     ReviewSerializer,
     ReviewWriteSerializer,
@@ -365,6 +367,27 @@ class StoryViewSet(ReadOnlyModelViewSet):
     pagination_class = CataloguePagination
 
     def get_queryset(self):
+        if self.action == "read_along":
+            # Avoid the much heavier story-detail prefetches. Only the
+            # requested audio query carries transcript HTML; navigation
+            # selects slugs and ordering fields only.
+            return (
+                Story.objects.published()
+                .select_related("author", "story_type")
+                .only(
+                    "id",
+                    "title",
+                    "slug",
+                    "language",
+                    "cover_image",
+                    "cover_image_file",
+                    "author_id",
+                    "author__id",
+                    "author__name",
+                    "story_type_id",
+                    "story_type__name",
+                )
+            )
         queryset = (
             Story.objects.published()
             .select_related("author")
@@ -475,6 +498,66 @@ class StoryViewSet(ReadOnlyModelViewSet):
             {"detail": "Invalid chapter type. Use type=text or type=audio."},
             status=status.HTTP_400_BAD_REQUEST,
         )
+
+    @action(detail=True, methods=["get"], url_path=r"read-along/(?P<audio_slug>[^/.]+)")
+    def read_along(self, request, slug=None, audio_slug=None):
+        story = self.get_object()
+        audio = (
+            Audio.objects.filter(story_id=story.id, slug=audio_slug)
+            .only(
+                "id",
+                "story_id",
+                "title",
+                "slug",
+                "order",
+                "audio_file",
+                "transcript",
+                "duration_seconds",
+                "file_size_bytes",
+            )
+            .first()
+        )
+        if audio is None:
+            return Response(
+                {"detail": "Audio track not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        if not audio.audio_file or not rich_text_has_content(audio.transcript):
+            return Response(
+                {
+                    "detail": "Read Along is unavailable because this audio track has no transcript.",
+                    "transcript_state": "empty",
+                    "read_along_available": False,
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        compatible_tracks = list(
+            Audio.objects.filter(story_id=story.id)
+            .exclude(audio_file="")
+            .exclude(transcript="")
+            .only("id", "slug", "order")
+            .order_by("order", "id")
+        )
+        compatible_slugs = [track.slug for track in compatible_tracks]
+        current_index = compatible_slugs.index(audio.slug)
+        previous_slug = compatible_slugs[current_index - 1] if current_index > 0 else None
+        next_slug = (
+            compatible_slugs[current_index + 1]
+            if current_index + 1 < len(compatible_slugs)
+            else None
+        )
+
+        serializer = ReadAlongSerializer(
+            audio,
+            context={
+                "request": request,
+                "story": story,
+                "previous_audio_slug": previous_slug,
+                "next_audio_slug": next_slug,
+            },
+        )
+        return Response(serializer.data)
 
     @action(detail=True, methods=["get", "post"], url_path="reviews")
     def reviews(self, request, slug=None):

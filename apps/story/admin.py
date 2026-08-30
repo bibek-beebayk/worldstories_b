@@ -32,7 +32,7 @@ class AudioInline(admin.StackedInline):
     model = Audio
     extra = 0
     classes = ("collapse",)
-    fields = ("title", "slug", "order", "audio_file")
+    fields = ("title", "slug", "order", "audio_file", "transcript")
 
 
 class VideoInline(admin.StackedInline):
