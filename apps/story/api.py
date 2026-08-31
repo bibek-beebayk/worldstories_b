@@ -6,7 +6,7 @@ import uuid
 from rest_framework.viewsets import ReadOnlyModelViewSet, ModelViewSet
 from rest_framework.views import APIView
 from django.core.exceptions import ValidationError as DjangoValidationError
-from django.db.models import Sum, Avg, Count, F, Prefetch
+from django.db.models import Sum, Avg, Count, Exists, F, OuterRef, Prefetch
 from django.db.models import Q
 from django.http import FileResponse, HttpResponse, StreamingHttpResponse
 from django.db import transaction
@@ -29,6 +29,7 @@ from .models import (
     Story,
     Chapter,
     Audio,
+    AudioTranscriptCue,
     Video,
     Author,
     Review,
@@ -50,6 +51,12 @@ from .models import (
 )
 from .epub_import_jobs import executor as epub_import_executor, run_epub_import
 from .rich_text import rich_text_has_content
+from .transcripts import (
+    SUPPORTED_FORMATS,
+    TranscriptParseError,
+    format_from_filename,
+    parse_transcript,
+)
 from .book_fetch import DEFAULT_BOOK_FETCH_COUNT, MAX_BOOK_FETCH_COUNT
 from .book_fetch_jobs import executor as book_fetch_executor, run_book_fetch
 from .queue_import import MAX_IMPORT_ROWS, ImportFileError, build_preview, confirm_import
@@ -84,6 +91,7 @@ from .serializers import (
     StoryDetailSerializer,
     ChapterSerializer,
     AudioSerializer,
+    AudioTranscriptCueSerializer,
     ReadAlongSerializer,
     VideoSerializer,
     ReviewSerializer,
@@ -220,6 +228,28 @@ class BlogPagination(PageNumberPagination):
 class IsSuperUser(BasePermission):
     def has_permission(self, request, view):
         return bool(request.user and request.user.is_authenticated and request.user.is_superuser)
+
+
+MAX_TRANSCRIPT_UPLOAD_BYTES = 5 * 1024 * 1024
+
+
+def flatten_drf_errors(detail) -> str:
+    """Collapse a DRF error structure (dict / list / str) into one human string."""
+    if isinstance(detail, dict):
+        return "; ".join(flatten_drf_errors(value) for value in detail.values())
+    if isinstance(detail, (list, tuple)):
+        return "; ".join(flatten_drf_errors(item) for item in detail)
+    return str(detail)
+
+
+def derive_transcript_state(audio, cue_count: int) -> str:
+    if not rich_text_has_content(audio.transcript):
+        return "empty"
+    return "synchronized" if cue_count > 0 else "unsynchronized"
+
+
+def audio_duration_ms(audio):
+    return round(audio.duration_seconds * 1000) if audio.duration_seconds is not None else None
 
 
 class AuthorViewSet(ReadOnlyModelViewSet):
@@ -391,7 +421,20 @@ class StoryViewSet(ReadOnlyModelViewSet):
         queryset = (
             Story.objects.published()
             .select_related("author")
-            .prefetch_related("genres", "audios", "videos")
+            .prefetch_related(
+                "genres",
+                # Annotate the timed-cue flag on the prefetch so
+                # AudioSerializer.transcript_synchronized doesn't N+1 on story detail.
+                Prefetch(
+                    "audios",
+                    queryset=Audio.objects.annotate(
+                        _has_timed_cues=Exists(
+                            AudioTranscriptCue.objects.filter(audio=OuterRef("pk"))
+                        )
+                    ),
+                ),
+                "videos",
+            )
             .order_by("-id")
         )
         # Only the "list" action (the public browse/search listing) collapses
@@ -515,6 +558,14 @@ class StoryViewSet(ReadOnlyModelViewSet):
                 "duration_seconds",
                 "file_size_bytes",
             )
+            .prefetch_related(
+                Prefetch(
+                    "transcript_cues",
+                    queryset=AudioTranscriptCue.objects.only(
+                        "id", "audio_id", "order", "start_ms", "end_ms", "text"
+                    ).order_by("order"),
+                )
+            )
             .first()
         )
         if audio is None:
@@ -522,31 +573,31 @@ class StoryViewSet(ReadOnlyModelViewSet):
                 {"detail": "Audio track not found."},
                 status=status.HTTP_404_NOT_FOUND,
             )
-        if not audio.audio_file or not rich_text_has_content(audio.transcript):
-            return Response(
-                {
-                    "detail": "Read Along is unavailable because this audio track has no transcript.",
-                    "transcript_state": "empty",
-                    "read_along_available": False,
-                },
-                status=status.HTTP_404_NOT_FOUND,
-            )
-
-        compatible_tracks = list(
+        candidate_tracks = list(
             Audio.objects.filter(story_id=story.id)
             .exclude(audio_file="")
-            .exclude(transcript="")
-            .only("id", "slug", "order")
+            .only("id", "slug", "order", "transcript")
             .order_by("order", "id")
         )
+        # Rich-text editors can save visually blank markup such as
+        # ``<p><br></p>``. Database string checks cannot distinguish that from
+        # readable text, so use the same content predicate as the availability
+        # serializers before exposing previous/next navigation.
+        compatible_tracks = [
+            track for track in candidate_tracks if rich_text_has_content(track.transcript)
+        ]
         compatible_slugs = [track.slug for track in compatible_tracks]
-        current_index = compatible_slugs.index(audio.slug)
-        previous_slug = compatible_slugs[current_index - 1] if current_index > 0 else None
-        next_slug = (
-            compatible_slugs[current_index + 1]
-            if current_index + 1 < len(compatible_slugs)
-            else None
-        )
+        if audio.slug in compatible_slugs:
+            current_index = compatible_slugs.index(audio.slug)
+            previous_slug = compatible_slugs[current_index - 1] if current_index > 0 else None
+            next_slug = (
+                compatible_slugs[current_index + 1]
+                if current_index + 1 < len(compatible_slugs)
+                else None
+            )
+        else:
+            previous_slug = None
+            next_slug = None
 
         serializer = ReadAlongSerializer(
             audio,
@@ -1247,11 +1298,131 @@ class AudioAdminViewSet(ModelViewSet):
     search_fields = ["title", "slug", "story__title"]
 
     def get_queryset(self):
-        queryset = super().get_queryset()
+        queryset = super().get_queryset().annotate(
+            _cue_count=Count("transcript_cues"),
+            _has_timed_cues=Exists(
+                AudioTranscriptCue.objects.filter(audio=OuterRef("pk"))
+            ),
+        )
         story_id = self.request.query_params.get("story")
         if story_id:
             queryset = queryset.filter(story_id=story_id).order_by("order", "id")
         return queryset
+
+    def _validated_cues(self, audio, cue_dicts):
+        """Run cue dicts through the shared serializer (per-cue + sequence rules).
+        Returns validated data or raises a 400-ready message string."""
+        serializer = AudioTranscriptCueSerializer(
+            data=cue_dicts,
+            many=True,
+            context={"audio_duration_ms": audio_duration_ms(audio)},
+        )
+        if not serializer.is_valid():
+            raise TranscriptParseError(flatten_drf_errors(serializer.errors))
+        return serializer.validated_data
+
+    def _replace_cues(self, audio, validated_cues):
+        audio.transcript_cues.all().delete()
+        if validated_cues:
+            AudioTranscriptCue.objects.bulk_create(
+                [AudioTranscriptCue(audio=audio, **dict(row)) for row in validated_cues]
+            )
+
+    def _transcript_payload(self, audio, cue_count):
+        return {
+            "transcript_state": derive_transcript_state(audio, cue_count),
+            "cue_count": cue_count,
+            "transcript": audio.transcript,
+        }
+
+    @action(detail=True, methods=["post"], url_path="import-transcript")
+    def import_transcript(self, request, pk=None):
+        audio = self.get_object()
+
+        upload = request.FILES.get("file")
+        if upload is not None:
+            if upload.size and upload.size > MAX_TRANSCRIPT_UPLOAD_BYTES:
+                return Response(
+                    {"detail": "Transcript file is too large (5 MB max)."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            fmt = format_from_filename(upload.name)
+            if fmt is None:
+                return Response(
+                    {"detail": "Upload a .vtt, .srt, or .txt file."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            content = upload.read().decode("utf-8", errors="replace")
+        else:
+            content = request.data.get("content")
+            fmt = request.data.get("format")
+            if not content or fmt not in SUPPORTED_FORMATS:
+                return Response(
+                    {"detail": "Provide a transcript file, or content plus a valid format."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        try:
+            result = parse_transcript(content, fmt)
+            cue_dicts = [
+                {"order": c.order, "start_ms": c.start_ms, "end_ms": c.end_ms, "text": c.text}
+                for c in result.cues
+            ]
+            validated = self._validated_cues(audio, cue_dicts)
+        except TranscriptParseError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Every check has passed before anything is written, so a failure above
+        # leaves the previous cues + transcript fully intact.
+        seed_transcript = (not result.is_timed) or (not rich_text_has_content(audio.transcript))
+        with transaction.atomic():
+            self._replace_cues(audio, validated)
+            if seed_transcript:
+                audio.transcript = result.transcript_html
+                audio.save(update_fields=["transcript"])
+
+        return Response(self._transcript_payload(audio, len(validated)))
+
+    @action(detail=True, methods=["get", "put"], url_path="transcript-cues")
+    def transcript_cues(self, request, pk=None):
+        audio = self.get_object()
+
+        if request.method == "GET":
+            cues = list(
+                audio.transcript_cues.values("id", "order", "start_ms", "end_ms", "text")
+            )
+            return Response(
+                {
+                    "cues": cues,
+                    "cue_count": len(cues),
+                    "transcript_state": derive_transcript_state(audio, len(cues)),
+                }
+            )
+
+        try:
+            validated = self._validated_cues(audio, request.data.get("cues", []))
+        except TranscriptParseError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        if validated and not rich_text_has_content(audio.transcript):
+            return Response(
+                {"detail": "Add or import transcript text before saving timed cues."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        with transaction.atomic():
+            self._replace_cues(audio, validated)
+
+        return Response(self._transcript_payload(audio, len(validated)))
+
+    @action(detail=True, methods=["post"], url_path="clear-transcript")
+    def clear_transcript(self, request, pk=None):
+        audio = self.get_object()
+        with transaction.atomic():
+            audio.transcript_cues.all().delete()
+            audio.transcript = ""
+            audio.save(update_fields=["transcript"])
+        return Response({"transcript_state": "empty", "cue_count": 0, "transcript": ""})
 
 
 class VideoAdminViewSet(ModelViewSet):

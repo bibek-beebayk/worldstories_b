@@ -10,6 +10,7 @@ from datetime import date
 from core.libs.images import get_cover_image_url
 from .models import (
     Audio,
+    AudioTranscriptCue,
     Video,
     Story,
     Genre,
@@ -388,6 +389,81 @@ class ChapterSerializer(serializers.ModelSerializer):
         fields = ["id", "title", "order", "content", "slug"]
 
 
+# Timed cues may legitimately run a little past the probed audio duration
+# (encoder padding, a trailing "[music]" cue). Anything beyond this margin is
+# treated as a broken import and rejected.
+CUE_DURATION_GRACE_MS = 2000
+
+
+def validate_cue_sequence(cues, *, audio_duration_ms=None):
+    """Validate an ordered list of cue dicts (each with order/start_ms/end_ms).
+
+    Individual field checks (end > start, non-empty text) live on
+    ``AudioTranscriptCueSerializer``; this covers the cross-cue invariants:
+    strictly ascending unique order, no unexpected overlaps, and cues not
+    running substantially beyond the known audio duration.
+    """
+    if not cues:
+        return
+
+    orders = [cue["order"] for cue in cues]
+    if len(set(orders)) != len(orders):
+        raise serializers.ValidationError("Cue order values must be unique.")
+
+    previous_order = None
+    previous_end = None
+    for cue in cues:
+        if previous_order is not None and cue["order"] <= previous_order:
+            raise serializers.ValidationError("Cues must be provided in ascending order.")
+        if previous_end is not None and cue["start_ms"] < previous_end:
+            raise serializers.ValidationError(
+                f"Cue {cue['order']} overlaps the previous cue."
+            )
+        previous_order = cue["order"]
+        previous_end = cue["end_ms"]
+
+    if audio_duration_ms is not None:
+        last_end = cues[-1]["end_ms"]
+        if last_end > audio_duration_ms + CUE_DURATION_GRACE_MS:
+            raise serializers.ValidationError(
+                "Cues extend substantially beyond the audio track's duration."
+            )
+
+
+class AudioTranscriptCueListSerializer(serializers.ListSerializer):
+    def validate(self, cues):
+        validate_cue_sequence(cues, audio_duration_ms=self.context.get("audio_duration_ms"))
+        return cues
+
+
+class AudioTranscriptCueSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = AudioTranscriptCue
+        fields = ["order", "start_ms", "end_ms", "text"]
+        list_serializer_class = AudioTranscriptCueListSerializer
+
+    def validate_text(self, value):
+        if not value.strip():
+            raise serializers.ValidationError("Cue text cannot be empty.")
+        return value
+
+    def validate(self, attrs):
+        start_ms = attrs.get("start_ms", getattr(self.instance, "start_ms", None))
+        end_ms = attrs.get("end_ms", getattr(self.instance, "end_ms", None))
+        if start_ms is not None and end_ms is not None and end_ms <= start_ms:
+            raise serializers.ValidationError({"end_ms": "End time must be after start time."})
+        return attrs
+
+
+def _resolve_transcript_synchronized(obj):
+    """Story-detail querysets annotate ``_has_timed_cues`` to avoid an N+1;
+    other call sites fall back to a direct existence check."""
+    if not rich_text_has_content(obj.transcript):
+        return False
+    cached = getattr(obj, "_has_timed_cues", None)
+    return cached if cached is not None else obj.transcript_cues.exists()
+
+
 class AudioSerializer(serializers.ModelSerializer):
     download_size_bytes = serializers.IntegerField(source="file_size_bytes", read_only=True)
     has_transcript = serializers.SerializerMethodField()
@@ -401,9 +477,7 @@ class AudioSerializer(serializers.ModelSerializer):
         return bool(obj.audio_file) and self.get_has_transcript(obj)
 
     def get_transcript_synchronized(self, obj):
-        # Timed cue storage is introduced in Milestone 7. Basic rich-text
-        # transcripts are deliberately exposed as unsynchronized until then.
-        return False
+        return _resolve_transcript_synchronized(obj)
 
     class Meta:
         model = Audio
@@ -425,7 +499,7 @@ class AudioListSerializer(serializers.ModelSerializer):
         return bool(obj.audio_file) and self.get_has_transcript(obj)
 
     def get_transcript_synchronized(self, obj):
-        return False
+        return _resolve_transcript_synchronized(obj)
 
     class Meta:
         model = Audio
@@ -451,12 +525,27 @@ class ReadAlongSerializer(serializers.BaseSerializer):
             if audio_file_url and request:
                 audio_file_url = request.build_absolute_uri(audio_file_url)
 
-        stream_path = reverse(
-            "story-audio-stream",
-            kwargs={"slug": story.slug, "audio_slug": audio.slug},
-        )
-        stream_url = request.build_absolute_uri(stream_path) if request else stream_path
-        transcript_html = sanitize_reader_html(audio.transcript)
+        stream_url = None
+        if audio.audio_file:
+            stream_path = reverse(
+                "story-audio-stream",
+                kwargs={"slug": story.slug, "audio_slug": audio.slug},
+            )
+            stream_url = request.build_absolute_uri(stream_path) if request else stream_path
+        has_transcript = rich_text_has_content(audio.transcript)
+        transcript_html = sanitize_reader_html(audio.transcript) if has_transcript else ""
+
+        # `transcript_cues` is prefetched (ordered) by the read_along view.
+        cue_payload = [
+            {
+                "id": cue.id,
+                "start_seconds": round(cue.start_ms / 1000, 3),
+                "end_seconds": round(cue.end_ms / 1000, 3),
+                "text": cue.text,
+            }
+            for cue in audio.transcript_cues.all()
+        ]
+        synchronized = has_transcript and bool(cue_payload)
 
         return {
             "story": {
@@ -483,15 +572,19 @@ class ReadAlongSerializer(serializers.BaseSerializer):
                 "stream_url": stream_url,
                 "duration_seconds": audio.duration_seconds,
                 "download_size_bytes": audio.file_size_bytes,
-                "has_transcript": True,
-                "read_along_available": True,
-                "transcript_synchronized": False,
+                "has_transcript": has_transcript,
+                "read_along_available": bool(audio.audio_file) and has_transcript,
+                "transcript_synchronized": synchronized,
             },
             "transcript": {
                 "html": transcript_html,
-                "state": "unsynchronized",
-                "synchronized": False,
-                "cues": [],
+                "state": (
+                    "empty"
+                    if not has_transcript
+                    else "synchronized" if synchronized else "unsynchronized"
+                ),
+                "synchronized": synchronized,
+                "cues": cue_payload,
             },
             "navigation": {
                 "previous_audio_slug": self.context.get("previous_audio_slug"),
@@ -1397,6 +1490,16 @@ class BlogAdminSerializer(serializers.ModelSerializer):
 
 
 class AudioAdminSerializer(serializers.ModelSerializer):
+    transcript_synchronized = serializers.SerializerMethodField()
+    cue_count = serializers.SerializerMethodField()
+
+    def get_transcript_synchronized(self, obj):
+        return _resolve_transcript_synchronized(obj)
+
+    def get_cue_count(self, obj):
+        cached = getattr(obj, "_cue_count", None)
+        return cached if cached is not None else obj.transcript_cues.count()
+
     def _build_unique_slug(self, story, title: str, instance=None) -> str:
         base_slug = slugify(title) or "audio"
         slug = base_slug
@@ -1465,11 +1568,18 @@ class AudioAdminSerializer(serializers.ModelSerializer):
             "slug",
             "audio_file",
             "transcript",
+            "transcript_synchronized",
+            "cue_count",
             "order",
             "duration_seconds",
             "file_size_bytes",
         ]
-        read_only_fields = ["duration_seconds", "file_size_bytes"]
+        read_only_fields = [
+            "transcript_synchronized",
+            "cue_count",
+            "duration_seconds",
+            "file_size_bytes",
+        ]
 
 
 class FlexibleDurationField(serializers.Field):

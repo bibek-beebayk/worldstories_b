@@ -4,7 +4,7 @@ from django.utils.html import strip_tags
 from django.utils import timezone
 from django.utils.text import slugify
 from solo.admin import SingletonModelAdmin
-from .models import Audio, Video, Blog, Story, Genre, Category, StoryType, Tag, Theme, Author, Chapter, PromptSettings, Review, Submission, StoryView
+from .models import Audio, AudioTranscriptCue, Video, Blog, Story, Genre, Category, StoryType, Tag, Theme, Author, Chapter, PromptSettings, Review, Submission, StoryView
 
 admin.site.register(PromptSettings, SingletonModelAdmin)
 
@@ -33,6 +33,13 @@ class AudioInline(admin.StackedInline):
     extra = 0
     classes = ("collapse",)
     fields = ("title", "slug", "order", "audio_file", "transcript")
+
+
+class TranscriptCueInline(admin.TabularInline):
+    model = AudioTranscriptCue
+    extra = 0
+    fields = ("order", "start_ms", "end_ms", "text")
+    ordering = ("order",)
 
 
 class VideoInline(admin.StackedInline):
@@ -380,6 +387,42 @@ class ChapterAdmin(admin.ModelAdmin):
         if story_id:
             initial["story"] = story_id
         return initial
+
+
+@admin.register(Audio)
+class AudioAdmin(admin.ModelAdmin):
+    list_display = ("title", "story", "order", "slug", "has_timed_cues")
+    search_fields = ("title", "slug", "story__title")
+    list_filter = ("story",)
+    list_select_related = ("story",)
+    autocomplete_fields = ("story",)
+    ordering = ("story__title", "order")
+    inlines = [TranscriptCueInline]
+
+    def get_changeform_initial_data(self, request):
+        initial = super().get_changeform_initial_data(request)
+        story_id = request.GET.get("story")
+        if story_id:
+            initial["story"] = story_id
+        return initial
+
+    @admin.display(boolean=True, description="Timed cues")
+    def has_timed_cues(self, obj):
+        return obj.transcript_cues.exists()
+
+
+@admin.register(AudioTranscriptCue)
+class AudioTranscriptCueAdmin(admin.ModelAdmin):
+    list_display = ("audio", "order", "start_ms", "end_ms", "text_preview")
+    search_fields = ("text", "audio__title", "audio__story__title")
+    list_filter = ("audio__story",)
+    list_select_related = ("audio", "audio__story")
+    autocomplete_fields = ("audio",)
+    ordering = ("audio", "order")
+
+    @admin.display(description="Text")
+    def text_preview(self, obj):
+        return f"{obj.text[:80]}..." if len(obj.text) > 80 else obj.text
 
 
 @admin.register(Review)

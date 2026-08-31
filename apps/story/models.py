@@ -684,10 +684,56 @@ class Audio(models.Model):
 
     def __str__(self):
         return f"Audio for {self.story.title} uploaded at {self.uploaded_at}"
-    
+
     class Meta:
         unique_together = ("story", "order")
         ordering = ["order"]
+
+
+class AudioTranscriptCue(models.Model):
+    """Optional timing overlay for an Audio track's transcript.
+
+    `Audio.transcript` stays the canonical, editable transcript document; cues
+    carry only start/end timing and the plain-text spoken segment, used to drive
+    synchronized highlighting. Populated in bulk from an imported VTT/SRT file
+    (Milestone 7) and rebuilt wholesale on re-import; absent for unsynchronized
+    transcripts. Deleting a track's cues leaves its transcript untouched.
+    """
+
+    audio = models.ForeignKey(Audio, on_delete=models.CASCADE, related_name="transcript_cues")
+    order = models.PositiveIntegerField()
+    start_ms = models.PositiveIntegerField()
+    end_ms = models.PositiveIntegerField()
+    text = models.TextField()
+
+    def __str__(self):
+        return f"Cue {self.order} for audio {self.audio_id} ({self.start_ms}-{self.end_ms}ms)"
+
+    def clean(self):
+        # DRF serializers never call full_clean(), so this only guards the Django
+        # admin inline; the CheckConstraint below is the real backstop.
+        from django.core.exceptions import ValidationError
+
+        errors = {}
+        if self.start_ms is not None and self.end_ms is not None and self.end_ms <= self.start_ms:
+            errors["end_ms"] = "End time must be after start time."
+        if not (self.text or "").strip():
+            errors["text"] = "Cue text cannot be empty."
+        if errors:
+            raise ValidationError(errors)
+
+    class Meta:
+        unique_together = ("audio", "order")
+        ordering = ["audio", "order"]
+        indexes = [
+            models.Index(fields=["audio", "start_ms"], name="story_cue_audio_start_idx"),
+        ]
+        constraints = [
+            models.CheckConstraint(
+                check=models.Q(end_ms__gt=models.F("start_ms")),
+                name="story_cue_end_after_start",
+            ),
+        ]
 
 
 class Video(models.Model):

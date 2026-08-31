@@ -5,7 +5,9 @@ from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.db import IntegrityError, transaction
 from django.http import QueryDict
 from django.test import RequestFactory, SimpleTestCase, TestCase, TransactionTestCase
 from django.urls import reverse
@@ -50,6 +52,7 @@ from apps.story.excerpts import _excerpt_from_text
 from apps.story.epub_import_jobs import run_epub_import
 from apps.story.models import (
     Audio,
+    AudioTranscriptCue,
     Video,
     Author,
     Blog,
@@ -70,10 +73,17 @@ from apps.story.serializers import (
     AudioAdminSerializer,
     AudioListSerializer,
     AudioSerializer,
+    AudioTranscriptCueSerializer,
     StoryAdminSerializer,
     SubmissionSerializer,
+    validate_cue_sequence,
 )
 from apps.story import reading_time
+from apps.story.transcripts import (
+    TranscriptParseError,
+    format_from_filename,
+    parse_transcript,
+)
 from apps.users.models import User
 from core.urls import sitemap
 
@@ -281,7 +291,7 @@ class ReadAlongAPITests(APITestCase):
             title="Audio Only",
             slug="audio-only",
             audio_file="story_audios/audio-only.mp3",
-            transcript="",
+            transcript="<p><br></p>",
             order=3,
         )
         self.last = Audio.objects.create(
@@ -372,17 +382,494 @@ class ReadAlongAPITests(APITestCase):
     def test_blank_transcript_returns_clear_unavailable_response(self):
         response = self.client.get(self.read_along_url(audio_slug=self.without_transcript.slug))
 
-        self.assertEqual(response.status_code, 404)
-        self.assertEqual(response.data["transcript_state"], "empty")
-        self.assertFalse(response.data["read_along_available"])
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["transcript"]["state"], "empty")
+        self.assertEqual(response.data["transcript"]["html"], "")
+        self.assertFalse(response.data["audio"]["read_along_available"])
+        self.assertEqual(
+            response.data["navigation"],
+            {"previous_audio_slug": None, "next_audio_slug": None},
+        )
+
+    def test_missing_audio_file_returns_readable_transcript_with_audio_unavailable(self):
+        text_only = Audio.objects.create(
+            story=self.story,
+            title="Transcript Only",
+            slug="transcript-only",
+            audio_file="",
+            transcript="<p>Readable without audio.</p>",
+            order=5,
+        )
+
+        response = self.client.get(self.read_along_url(audio_slug=text_only.slug))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(response.data["audio"]["stream_url"])
+        self.assertIsNone(response.data["audio"]["audio_file"])
+        self.assertFalse(response.data["audio"]["read_along_available"])
+        self.assertEqual(response.data["transcript"]["state"], "unsynchronized")
 
     def test_success_query_count_is_constant(self):
-        # Three SELECTs (story, requested audio, navigation) plus the
-        # SAVEPOINT/RELEASE pair added by this project's ATOMIC_REQUESTS.
-        with self.assertNumQueries(5):
+        # Four SELECTs (story, requested audio, its prefetched transcript cues,
+        # navigation) plus the SAVEPOINT/RELEASE pair added by this project's
+        # ATOMIC_REQUESTS.
+        with self.assertNumQueries(6):
             response = self.client.get(self.read_along_url())
 
         self.assertEqual(response.status_code, 200)
+
+    def test_timed_cues_produce_a_synchronized_response(self):
+        AudioTranscriptCue.objects.bulk_create(
+            [
+                AudioTranscriptCue(audio=self.current, order=1, start_ms=0, end_ms=1500, text="Line one."),
+                AudioTranscriptCue(audio=self.current, order=2, start_ms=1500, end_ms=3200, text="Line two."),
+                AudioTranscriptCue(audio=self.current, order=3, start_ms=3200, end_ms=4000, text="Line three."),
+            ]
+        )
+
+        response = self.client.get(self.read_along_url())
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.data["audio"]["transcript_synchronized"])
+        self.assertEqual(response.data["transcript"]["state"], "synchronized")
+        self.assertTrue(response.data["transcript"]["synchronized"])
+        cues = response.data["transcript"]["cues"]
+        self.assertEqual([cue["text"] for cue in cues], ["Line one.", "Line two.", "Line three."])
+        self.assertEqual(cues[1]["start_seconds"], 1.5)
+        self.assertEqual(cues[1]["end_seconds"], 3.2)
+        self.assertIn("id", cues[0])
+
+    def test_large_cue_set_serializes_in_stable_order(self):
+        AudioTranscriptCue.objects.bulk_create(
+            AudioTranscriptCue(
+                audio=self.first, order=index, start_ms=index * 1000, end_ms=index * 1000 + 800,
+                text=f"Cue {index}",
+            )
+            for index in range(1, 401)
+        )
+
+        response = self.client.get(self.read_along_url(audio_slug=self.first.slug))
+
+        orders_from_text = [int(cue["text"].split()[1]) for cue in response.data["transcript"]["cues"]]
+        self.assertEqual(orders_from_text, list(range(1, 401)))
+
+    def test_story_detail_reflects_transcript_synchronized_without_n_plus_one(self):
+        AudioTranscriptCue.objects.create(
+            audio=self.current, order=1, start_ms=0, end_ms=1000, text="Timed."
+        )
+        url = reverse("story-detail", kwargs={"slug": self.story.slug})
+
+        response = self.client.get(url)
+
+        self.assertEqual(response.status_code, 200)
+        flags = {audio["slug"]: audio["transcript_synchronized"] for audio in response.data["audios"]}
+        self.assertTrue(flags["current-track"])
+        self.assertFalse(flags["first-track"])
+
+
+class AudioTranscriptCueModelTests(TestCase):
+    def setUp(self):
+        self.story = Story.objects.create(title="Cue Story", slug="cue-story")
+        self.audio = Audio.objects.create(
+            story=self.story, title="Track", slug="track",
+            audio_file="story_audios/track.mp3", transcript="<p>Transcript.</p>", order=1,
+        )
+
+    def test_unique_audio_order(self):
+        AudioTranscriptCue.objects.create(audio=self.audio, order=1, start_ms=0, end_ms=1000, text="A")
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                AudioTranscriptCue.objects.create(
+                    audio=self.audio, order=1, start_ms=1000, end_ms=2000, text="B"
+                )
+
+    def test_check_constraint_rejects_non_positive_span(self):
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                AudioTranscriptCue.objects.create(
+                    audio=self.audio, order=1, start_ms=2000, end_ms=2000, text="Zero span"
+                )
+
+    def test_clean_rejects_bad_span_and_empty_text(self):
+        with self.assertRaises(DjangoValidationError):
+            AudioTranscriptCue(audio=self.audio, order=1, start_ms=1000, end_ms=500, text="x").full_clean()
+        with self.assertRaises(DjangoValidationError):
+            AudioTranscriptCue(audio=self.audio, order=1, start_ms=0, end_ms=1000, text="   ").full_clean()
+
+    def test_deleting_audio_removes_its_cues_and_leaves_transcript_alone(self):
+        AudioTranscriptCue.objects.create(audio=self.audio, order=1, start_ms=0, end_ms=1000, text="A")
+        other = Audio.objects.create(
+            story=self.story, title="Other", slug="other",
+            audio_file="story_audios/other.mp3", transcript="<p>Other.</p>", order=2,
+        )
+        AudioTranscriptCue.objects.create(audio=other, order=1, start_ms=0, end_ms=1000, text="B")
+
+        self.audio.delete()
+
+        self.assertFalse(AudioTranscriptCue.objects.filter(audio_id=self.audio.id).exists())
+        self.assertEqual(AudioTranscriptCue.objects.filter(audio=other).count(), 1)
+        other.refresh_from_db()
+        self.assertEqual(other.transcript, "<p>Other.</p>")
+
+    def test_default_ordering_is_by_order(self):
+        for order in (3, 1, 2):
+            AudioTranscriptCue.objects.create(
+                audio=self.audio, order=order, start_ms=order * 10, end_ms=order * 10 + 5, text=str(order)
+            )
+        self.assertEqual(
+            list(self.audio.transcript_cues.values_list("order", flat=True)), [1, 2, 3]
+        )
+
+
+class AudioTranscriptCueSerializerTests(TestCase):
+    def _cue(self, **overrides):
+        cue = {"order": 1, "start_ms": 0, "end_ms": 1000, "text": "Line"}
+        cue.update(overrides)
+        return cue
+
+    def test_single_cue_field_validation(self):
+        serializer = AudioTranscriptCueSerializer(data=self._cue(start_ms=1000, end_ms=1000))
+        self.assertFalse(serializer.is_valid())
+        self.assertIn("end_ms", serializer.errors)
+
+        serializer = AudioTranscriptCueSerializer(data=self._cue(text="  "))
+        self.assertFalse(serializer.is_valid())
+        self.assertIn("text", serializer.errors)
+
+    def test_sequence_rejects_bad_ordering_and_overlap(self):
+        with self.assertRaises(ValidationError):
+            validate_cue_sequence([
+                self._cue(order=2, start_ms=0, end_ms=1000),
+                self._cue(order=1, start_ms=1000, end_ms=2000),
+            ])
+        with self.assertRaises(ValidationError):
+            validate_cue_sequence([
+                self._cue(order=1, start_ms=0, end_ms=1500),
+                self._cue(order=2, start_ms=1000, end_ms=2000),
+            ])
+
+    def test_sequence_rejects_cues_far_beyond_duration(self):
+        cues = [self._cue(order=1, start_ms=0, end_ms=60_000)]
+        with self.assertRaises(ValidationError):
+            validate_cue_sequence(cues, audio_duration_ms=10_000)
+        # Small overrun within the grace margin is fine.
+        validate_cue_sequence(
+            [self._cue(order=1, start_ms=0, end_ms=11_000)], audio_duration_ms=10_000
+        )
+
+    def test_valid_sequence_passes_through_list_serializer(self):
+        serializer = AudioTranscriptCueSerializer(
+            data=[
+                self._cue(order=1, start_ms=0, end_ms=1000, text="One"),
+                self._cue(order=2, start_ms=1000, end_ms=2000, text="Two"),
+            ],
+            many=True,
+            context={"audio_duration_ms": 3000},
+        )
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+
+
+VALID_VTT = """WEBVTT
+Kind: captions
+Language: en
+
+NOTE This is a note block
+that spans two lines.
+
+STYLE
+::cue { color: white }
+
+intro
+00:00:00.000 --> 00:00:01.500 align:start position:0%
+<v Narrator>Once upon a time &amp; long ago</v>
+
+00:01.500 --> 00:03.200
+The second cue
+wraps across lines
+"""
+
+VALID_SRT = """7
+00:00:00,000 --> 00:00:02,000  X1:040 X2:600
+<i>Italic</i> {\\an8}opening
+
+7
+00:00:02,000 --> 00:00:05,500
+Second block
+second line
+"""
+
+
+class TranscriptParserTests(SimpleTestCase):
+    def test_webvtt_happy_path(self):
+        result = parse_transcript(VALID_VTT, "vtt")
+
+        self.assertTrue(result.is_timed)
+        self.assertEqual([c.order for c in result.cues], [1, 2])
+        first, second = result.cues
+        self.assertEqual((first.start_ms, first.end_ms), (0, 1500))
+        self.assertEqual(first.text, "Once upon a time & long ago")
+        self.assertEqual((second.start_ms, second.end_ms), (1500, 3_200))
+        self.assertEqual(second.text, "The second cue wraps across lines")
+        self.assertEqual(
+            result.transcript_html,
+            "<p>Once upon a time &amp; long ago</p><p>The second cue wraps across lines</p>",
+        )
+
+    def test_webvtt_tolerates_leading_bom(self):
+        result = parse_transcript("﻿" + VALID_VTT, "vtt")
+        self.assertEqual(len(result.cues), 2)
+
+    def test_webvtt_missing_header_raises(self):
+        with self.assertRaises(TranscriptParseError):
+            parse_transcript("00:00:00.000 --> 00:00:01.000\nHi\n", "vtt")
+
+    def test_webvtt_malformed_timestamp_reports_line(self):
+        with self.assertRaises(TranscriptParseError) as ctx:
+            parse_transcript("WEBVTT\n\n00:00:99.000 --> 00:00:01.000\nHi\n", "vtt")
+        self.assertIn("Line 3", str(ctx.exception))
+
+    def test_webvtt_header_only_raises(self):
+        with self.assertRaises(TranscriptParseError) as ctx:
+            parse_transcript("WEBVTT\n\nNOTE nothing here\n", "vtt")
+        self.assertIn("No subtitle cues", str(ctx.exception))
+
+    def test_srt_uses_position_not_index_and_strips_tags(self):
+        result = parse_transcript(VALID_SRT, "srt")
+
+        self.assertEqual([c.order for c in result.cues], [1, 2])
+        self.assertEqual(result.cues[0].text, "Italic opening")
+        self.assertEqual(result.cues[0].end_ms, 2000)
+        self.assertEqual(result.cues[1].text, "Second block second line")
+
+    def test_srt_block_without_timing_line_raises(self):
+        with self.assertRaises(TranscriptParseError):
+            parse_transcript("1\nJust text, no timing\n", "srt")
+
+    def test_end_not_after_start_raises(self):
+        with self.assertRaises(TranscriptParseError):
+            parse_transcript("WEBVTT\n\n00:00:02.000 --> 00:00:01.000\nHi\n", "vtt")
+
+    def test_plain_text_produces_paragraphs_no_cues(self):
+        result = parse_transcript("First paragraph.\n\nSecond <b>paragraph</b> & more.", "text")
+
+        self.assertEqual(result.cues, [])
+        self.assertFalse(result.is_timed)
+        self.assertEqual(
+            result.transcript_html,
+            "<p>First paragraph.</p><p>Second &lt;b&gt;paragraph&lt;/b&gt; &amp; more.</p>",
+        )
+
+    def test_plain_text_whitespace_only(self):
+        self.assertEqual(parse_transcript("   \n\n  ", "text").transcript_html, "")
+
+    def test_format_from_filename(self):
+        self.assertEqual(format_from_filename("Clip.VTT"), "vtt")
+        self.assertEqual(format_from_filename("clip.srt"), "srt")
+        self.assertEqual(format_from_filename("notes.txt"), "text")
+        self.assertIsNone(format_from_filename("clip.pdf"))
+
+
+class AudioTranscriptAdminApiTests(APITestCase):
+    def _make_superuser(self):
+        return User.objects.create(
+            email="transcriptadmin@example.com",
+            username="transcriptadmin",
+            is_superuser=True,
+            is_staff=True,
+            is_active=True,
+        )
+
+    def setUp(self):
+        self.client.force_authenticate(user=self._make_superuser())
+        self.story = Story.objects.create(title="Import Story", slug="import-story")
+        self.audio = Audio.objects.create(
+            story=self.story,
+            title="Track",
+            slug="track",
+            audio_file="story_audios/track.mp3",
+            transcript="",
+            order=1,
+            duration_seconds=12.0,
+        )
+        AudioTranscriptCue.objects.bulk_create(
+            [
+                AudioTranscriptCue(audio=self.audio, order=1, start_ms=0, end_ms=500, text="old one"),
+                AudioTranscriptCue(audio=self.audio, order=2, start_ms=500, end_ms=1000, text="old two"),
+            ]
+        )
+
+    def _url(self, suffix):
+        return f"/api/admin/audios/{self.audio.id}/{suffix}/"
+
+    def test_import_vtt_replaces_cues_and_seeds_empty_transcript(self):
+        upload = SimpleUploadedFile("clip.vtt", VALID_VTT.encode("utf-8"), content_type="text/vtt")
+        response = self.client.post(self._url("import-transcript"), {"file": upload}, format="multipart")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["transcript_state"], "synchronized")
+        self.assertEqual(response.data["cue_count"], 2)
+        self.audio.refresh_from_db()
+        self.assertEqual(
+            list(self.audio.transcript_cues.values_list("text", flat=True)),
+            ["Once upon a time & long ago", "The second cue wraps across lines"],
+        )
+        self.assertEqual(self.audio.transcript, response.data["transcript"])
+        self.assertIn("<p>", self.audio.transcript)
+
+    def test_import_via_json_content(self):
+        response = self.client.put(
+            self._url("transcript-cues"), {"cues": []}, format="json"
+        )
+        self.assertEqual(response.status_code, 200)
+        response = self.client.post(
+            self._url("import-transcript"),
+            {"content": VALID_SRT, "format": "srt"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["cue_count"], 2)
+
+    def test_import_leaves_existing_transcript_when_present(self):
+        self.audio.transcript = "<p>Hand written transcript.</p>"
+        self.audio.save(update_fields=["transcript"])
+
+        upload = SimpleUploadedFile("clip.vtt", VALID_VTT.encode("utf-8"), content_type="text/vtt")
+        response = self.client.post(self._url("import-transcript"), {"file": upload}, format="multipart")
+
+        self.assertEqual(response.status_code, 200)
+        self.audio.refresh_from_db()
+        self.assertEqual(self.audio.transcript, "<p>Hand written transcript.</p>")
+        self.assertEqual(self.audio.transcript_cues.count(), 2)
+
+    def test_import_plain_text_overwrites_transcript_with_no_cues(self):
+        self.audio.transcript = "<p>Old.</p>"
+        self.audio.save(update_fields=["transcript"])
+        upload = SimpleUploadedFile("t.txt", b"Line one.\n\nLine two.", content_type="text/plain")
+
+        response = self.client.post(self._url("import-transcript"), {"file": upload}, format="multipart")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["transcript_state"], "unsynchronized")
+        self.assertEqual(response.data["cue_count"], 0)
+        self.audio.refresh_from_db()
+        self.assertEqual(self.audio.transcript, "<p>Line one.</p><p>Line two.</p>")
+        self.assertEqual(self.audio.transcript_cues.count(), 0)
+
+    def test_malformed_import_is_atomic(self):
+        upload = SimpleUploadedFile("bad.vtt", b"00:00:00.000 --> 00:00:01.000\nHi", content_type="text/vtt")
+        response = self.client.post(self._url("import-transcript"), {"file": upload}, format="multipart")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("detail", response.data)
+        self.assertEqual(self.audio.transcript_cues.count(), 2)
+
+    def test_cues_beyond_duration_are_rejected_without_touching_existing(self):
+        far = "WEBVTT\n\n00:00:00.000 --> 00:01:00.000\nToo long\n"
+        upload = SimpleUploadedFile("far.vtt", far.encode("utf-8"), content_type="text/vtt")
+
+        response = self.client.post(self._url("import-transcript"), {"file": upload}, format="multipart")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(self.audio.transcript_cues.count(), 2)
+
+    def test_bad_extension_rejected(self):
+        upload = SimpleUploadedFile("clip.pdf", b"whatever", content_type="application/pdf")
+        response = self.client.post(self._url("import-transcript"), {"file": upload}, format="multipart")
+        self.assertEqual(response.status_code, 400)
+
+    def test_non_superuser_forbidden(self):
+        self.client.force_authenticate(
+            user=User.objects.create(email="plain@example.com", username="plain", is_active=True)
+        )
+        response = self.client.post(
+            self._url("import-transcript"), {"content": VALID_SRT, "format": "srt"}, format="json"
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_clear_transcript_removes_cues_and_text(self):
+        self.audio.transcript = "<p>Something.</p>"
+        self.audio.save(update_fields=["transcript"])
+
+        response = self.client.post(self._url("clear-transcript"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["transcript_state"], "empty")
+        self.audio.refresh_from_db()
+        self.assertEqual(self.audio.transcript, "")
+        self.assertEqual(self.audio.transcript_cues.count(), 0)
+
+    def test_put_transcript_cues_replaces(self):
+        self.audio.transcript = "<p>A B</p>"
+        self.audio.save(update_fields=["transcript"])
+        response = self.client.put(
+            self._url("transcript-cues"),
+            {"cues": [
+                {"order": 1, "start_ms": 0, "end_ms": 1000, "text": "A"},
+                {"order": 2, "start_ms": 1000, "end_ms": 2000, "text": "B"},
+            ]},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["cue_count"], 2)
+        self.assertEqual(response.data["transcript"], "<p>A B</p>")
+        self.assertEqual(
+            list(self.audio.transcript_cues.values_list("text", flat=True)), ["A", "B"]
+        )
+
+    def test_put_transcript_cues_rejects_overlap_and_keeps_existing(self):
+        self.audio.transcript = "<p>A B</p>"
+        self.audio.save(update_fields=["transcript"])
+        response = self.client.put(
+            self._url("transcript-cues"),
+            {"cues": [
+                {"order": 1, "start_ms": 0, "end_ms": 1500, "text": "A"},
+                {"order": 2, "start_ms": 1000, "end_ms": 2000, "text": "B"},
+            ]},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(self.audio.transcript_cues.count(), 2)
+
+    def test_put_timed_cues_requires_transcript_text(self):
+        response = self.client.put(
+            self._url("transcript-cues"),
+            {"cues": [{"order": 1, "start_ms": 0, "end_ms": 1000, "text": "A"}]},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("transcript text", response.data["detail"])
+        self.assertEqual(self.audio.transcript_cues.count(), 2)
+
+    def test_get_transcript_cues(self):
+        response = self.client.get(self._url("transcript-cues"))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["cue_count"], 2)
+        self.assertEqual([c["order"] for c in response.data["cues"]], [1, 2])
+
+    def test_admin_list_exposes_transcript_state_per_row(self):
+        self.audio.transcript = "<p>Timed text.</p>"
+        self.audio.save(update_fields=["transcript"])
+        Audio.objects.create(
+            story=self.story, title="Other", slug="other",
+            audio_file="story_audios/other.mp3", transcript="<p>Text.</p>", order=2,
+        )
+        Audio.objects.create(
+            story=self.story, title="Third", slug="third",
+            audio_file="story_audios/third.mp3", transcript="", order=3,
+        )
+
+        # Two data queries (count + page) regardless of row count — the flags
+        # come from an annotation on the queryset, not a per-row lookup — plus
+        # the ATOMIC_REQUESTS savepoint/release pair.
+        with self.assertNumQueries(4):
+            response = self.client.get(f"/api/admin/audios/?story={self.story.id}")
+
+        rows = {row["slug"]: row for row in response.data["results"]}
+        self.assertTrue(rows["track"]["transcript_synchronized"])
+        self.assertEqual(rows["track"]["cue_count"], 2)
+        self.assertFalse(rows["other"]["transcript_synchronized"])
+        self.assertEqual(rows["other"]["cue_count"], 0)
 
 
 class StoryAdminSerializerFileReadingCacheTests(SimpleTestCase):
@@ -656,9 +1143,13 @@ class ScheduledPublishingTests(SimpleTestCase):
         self.assertIs(view.get_queryset(), queryset)
         published.assert_called_once_with()
         queryset.select_related.assert_called_once_with("author")
-        queryset.select_related.return_value.prefetch_related.assert_called_once_with(
-            "genres", "audios", "videos"
-        )
+        prefetch_related = queryset.select_related.return_value.prefetch_related
+        prefetch_related.assert_called_once()
+        prefetch_args = prefetch_related.call_args.args
+        # The middle arg is a Prefetch("audios", ...) that annotates the
+        # timed-cue flag; the outer strings are still plain lookups.
+        self.assertEqual((prefetch_args[0], prefetch_args[2]), ("genres", "videos"))
+        self.assertEqual(prefetch_args[1].prefetch_through, "audios")
 
     @patch("django.db.models.Model.save")
     def test_scheduled_story_uses_schedule_date_as_site_date(self, model_save):

@@ -62,6 +62,33 @@ class AnalyticsEventApiTests(APITestCase):
         event = AnalyticsEvent.objects.get(event_id=event_id)
         self.assertEqual(event.metadata.get("referral_source"), "facebook")
 
+    def test_read_along_interaction_events_are_accepted_with_metadata(self):
+        for event_type, metadata in (
+            (
+                AnalyticsEvent.EVENT_READ_ALONG_CUE_SEEK,
+                {"format": "read_along", "audio_slug": "track-1", "target_seconds": 12.5},
+            ),
+            (
+                AnalyticsEvent.EVENT_READ_ALONG_FOLLOW_TOGGLE,
+                {"format": "read_along", "audio_slug": "track-1", "enabled": False},
+            ),
+        ):
+            response = self.client.post(
+                reverse("analytics-events"),
+                {
+                    "event_id": str(uuid4()),
+                    "event_type": event_type,
+                    "visitor_id": "read-along-visitor",
+                    "story_slug": self.story.slug,
+                    "metadata": metadata,
+                },
+                format="json",
+            )
+
+            self.assertEqual(response.status_code, 201)
+            event = AnalyticsEvent.objects.get(event_id=response.data["event_id"])
+            self.assertEqual(event.metadata, metadata)
+
     def test_authenticated_event_uses_the_request_user(self):
         user = User.objects.create_user(
             email="reader@example.com", username="reader", password="test-password"
@@ -287,6 +314,89 @@ class AdminAudienceAnalyticsApiTests(APITestCase):
         self.assertTrue(
             any(day["watching_minutes"] for day in response.data["daily_activity"])
         )
+
+    def test_read_along_listening_is_split_out_without_carve_out(self):
+        # The setUp listening_session (180s, no format) is plain audiobook.
+        # Add a read-along one on the same story.
+        AnalyticsEvent.objects.create(
+            event_type=AnalyticsEvent.EVENT_LISTENING_SESSION,
+            visitor_id="returning-browser",
+            story=self.story,
+            duration_seconds=120,
+            metadata={"format": "read_along"},
+        )
+        AnalyticsEvent.objects.create(
+            event_type=AnalyticsEvent.EVENT_COMPLETION,
+            visitor_id="returning-browser",
+            story=self.story,
+            metadata={"content_type": "read_along"},
+        )
+        cache.clear()
+        self.client.force_authenticate(self.admin)
+
+        response = self.client.get(reverse("admin-analytics-audience"), {"days": 30})
+
+        self.assertEqual(response.status_code, 200)
+        summary = response.data["summary"]
+        # 180 + 120 = 300s = 5.0min total listening; 2.0 of it is read-along.
+        self.assertEqual(summary["listening_minutes"], 5)
+        self.assertEqual(summary["read_along_listening_minutes"], 2)
+        self.assertEqual(summary["read_along_sessions"], 1)
+
+        # Additive, not a carve-out: the read-along minutes are also inside the
+        # same day's listening_minutes, and read_along_minutes is on every row.
+        today_rows = [
+            day for day in response.data["daily_activity"] if day["read_along_minutes"]
+        ]
+        self.assertEqual(len(today_rows), 1)
+        self.assertEqual(today_rows[0]["read_along_minutes"], 2)
+        self.assertGreaterEqual(today_rows[0]["listening_minutes"], 2)
+        self.assertTrue(
+            all("read_along_minutes" in day for day in response.data["daily_activity"])
+        )
+
+        self.assertEqual(response.data["top_read_along"][0]["slug"], self.story.slug)
+        self.assertEqual(response.data["top_read_along"][0]["minutes"], 2)
+
+        completion_types = {
+            row["content_type"]: row["count"] for row in response.data["completion_types"]
+        }
+        self.assertEqual(completion_types.get("read_along"), 1)
+
+    def test_top_read_along_is_empty_without_read_along_sessions(self):
+        cache.clear()
+        self.client.force_authenticate(self.admin)
+
+        response = self.client.get(reverse("admin-analytics-audience"), {"days": 30})
+
+        self.assertEqual(response.data["summary"]["read_along_listening_minutes"], 0)
+        self.assertEqual(response.data["top_read_along"], [])
+
+    def test_story_detail_audio_block_splits_read_along_listening(self):
+        Audio.objects.create(
+            story=self.story, title="Track", slug="track",
+            audio_file="story_audios/t.mp3", order=1,
+        )
+        AnalyticsEvent.objects.create(
+            event_type=AnalyticsEvent.EVENT_LISTENING_SESSION,
+            visitor_id="returning-browser", story=self.story, duration_seconds=120,
+        )
+        AnalyticsEvent.objects.create(
+            event_type=AnalyticsEvent.EVENT_LISTENING_SESSION,
+            visitor_id="returning-browser", story=self.story, duration_seconds=60,
+            metadata={"format": "read_along"},
+        )
+        cache.clear()
+        self.client.force_authenticate(self.admin)
+
+        response = self.client.get(
+            reverse("admin-analytics-story-detail", args=[self.story.slug]), {"days": 30}
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.data["has_audio"])
+        self.assertEqual(response.data["audio"]["listening_minutes"], 6)  # (180 setUp + 120 + 60) / 60
+        self.assertEqual(response.data["audio"]["read_along_listening_minutes"], 1)  # 60 / 60
 
     def test_non_superuser_is_forbidden(self):
         self.client.force_authenticate(self.reader)

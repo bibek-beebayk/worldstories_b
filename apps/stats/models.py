@@ -224,6 +224,8 @@ class AnalyticsEvent(models.Model):
     EVENT_WATCHING_SESSION = "watching_session"
     EVENT_COMPLETION = "completion"
     EVENT_DOWNLOAD = "download"
+    EVENT_READ_ALONG_CUE_SEEK = "read_along_cue_seek"
+    EVENT_READ_ALONG_FOLLOW_TOGGLE = "read_along_follow_toggle"
     EVENT_CHOICES = [
         (EVENT_VISIT, "Visit"),
         (EVENT_AD_IMPRESSION, "Ad impression"),
@@ -232,6 +234,8 @@ class AnalyticsEvent(models.Model):
         (EVENT_WATCHING_SESSION, "Watching session"),
         (EVENT_COMPLETION, "Completion"),
         (EVENT_DOWNLOAD, "Download"),
+        (EVENT_READ_ALONG_CUE_SEEK, "Read Along cue seek"),
+        (EVENT_READ_ALONG_FOLLOW_TOGGLE, "Read Along follow toggle"),
     ]
 
     event_id = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
