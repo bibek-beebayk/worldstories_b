@@ -152,3 +152,41 @@ class AudioReadAlongOffsetMigrationTests(TransactionTestCase):
         audio = Audio.objects.get(pk=self.audio_id)
         self.assertEqual(audio.read_along_offset_ms, 0)
         self.assertEqual(audio.transcript, "<p>Kept.</p>")
+
+
+class StoryIsOriginalMigrationTests(TransactionTestCase):
+    """`Story.is_original` is an additive BooleanField — proves it applies over
+    an existing story row and defaults to False."""
+
+    serialized_rollback = True
+    migrate_from = ("story", "0070_audio_read_along_offset_ms")
+    migrate_to = ("story", "0071_story_is_original")
+
+    def setUp(self):
+        super().setUp()
+        executor = MigrationExecutor(connection)
+        executor.migrate([self.migrate_from])
+        old_apps = executor.loader.project_state([self.migrate_from]).apps
+
+        StoryType = old_apps.get_model("story", "StoryType")
+        Story = old_apps.get_model("story", "Story")
+        story_type = StoryType.objects.create(name="Original Migration Type")
+        self.story_id = Story.objects.create(
+            title="Existing Story",
+            slug="existing-story-before-original",
+            story_type_id=story_type.pk,
+        ).pk
+
+        executor = MigrationExecutor(connection)
+        executor.migrate([self.migrate_to])
+        self.apps = executor.loader.project_state([self.migrate_to]).apps
+
+    def tearDown(self):
+        executor = MigrationExecutor(connection)
+        executor.migrate(executor.loader.graph.leaf_nodes())
+        super().tearDown()
+
+    def test_existing_story_is_not_flagged_original(self):
+        Story = self.apps.get_model("story", "Story")
+        story = Story.objects.get(pk=self.story_id)
+        self.assertFalse(story.is_original)

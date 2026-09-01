@@ -896,6 +896,10 @@ class StoryAdminViewSet(ModelViewSet):
         if is_completed in {"true", "false"}:
             queryset = queryset.filter(is_completed=is_completed == "true")
 
+        is_original = params.get("is_original")
+        if is_original in {"true", "false"}:
+            queryset = queryset.filter(is_original=is_original == "true")
+
         has_summary = params.get("has_summary")
         if has_summary in {"true", "false"}:
             no_summary = Q(summary__isnull=True) | Q(summary__exact="")
@@ -1815,6 +1819,10 @@ class HomeDataAPIView(APIView):
             base_qs.exclude(Q(summary__isnull=True) | Q(summary__exact=""))
             .order_by("-site_published_date", "-id")[:8]
         )
+        originals = list(
+            with_preferred_translation_only(base_qs.filter(is_original=True))
+            .order_by("-site_published_date", "-id")[:12]
+        )
 
         readers_count = (
             Story.objects.published().aggregate(total_readers=Sum("views")).get("total_readers") or 0
@@ -1836,6 +1844,9 @@ class HomeDataAPIView(APIView):
                 ).data,
                 "quick_reads": StoryListSerializer(
                     quick_reads, many=True, context={"request": request}
+                ).data,
+                "originals": StoryListSerializer(
+                    originals, many=True, context={"request": request}
                 ).data,
                 "tabs": {
                     "recommended": StoryListSerializer(
@@ -1895,20 +1906,6 @@ class TrendingDataAPIView(APIView):
                     many=True,
                     context={"request": request},
                 ).data,
-            }
-        )
-
-
-class OriginalsDataAPIView(APIView):
-    def get(self, request):
-        base_qs = Story.objects.published().select_related("author").prefetch_related("genres", "audios", "videos")
-        return Response(
-            {
-                "stories": StoryListSerializer(
-                    base_qs.order_by("-id", "-rating")[:20],
-                    many=True,
-                    context={"request": request},
-                ).data
             }
         )
 

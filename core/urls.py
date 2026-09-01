@@ -180,7 +180,6 @@ urlpatterns = [
     path("api/auth/refresh/", TokenRefreshView.as_view(), name="token_refresh"),
     path("api/home/", story_api.HomeDataAPIView.as_view(), name="home-data"),
     path("api/trending/", story_api.TrendingDataAPIView.as_view(), name="trending-data"),
-    path("api/originals/", story_api.OriginalsDataAPIView.as_view(), name="originals-data"),
     path("api/discover/", story_api.DiscoverDataAPIView.as_view(), name="discover-data"),
     path("api/story-map/", story_api.StoryMapAPIView.as_view(), name="story-map-data"),
     path(

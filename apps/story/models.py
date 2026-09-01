@@ -349,6 +349,7 @@ class Story(models.Model):
     # live instead since chapter content is already in Postgres.
     cached_file_reading_minutes = models.PositiveIntegerField(blank=True, null=True)
     is_completed = models.BooleanField(default=False)
+    is_original = models.BooleanField(default=False, db_index=True)
     # related_name explicit to match genres/categories below — without it
     # the reverse accessor defaults to tag.story_set, but TagSerializer /
     # TagViewSet / the sitemap all assume tag.stories, same as genres/categories.

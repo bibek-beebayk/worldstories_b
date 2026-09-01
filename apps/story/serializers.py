@@ -328,6 +328,7 @@ class StoryListSerializer(serializers.ModelSerializer):
             "reviews_count",
             "is_favorite",
             "favorites_count",
+            "is_original",
         ]
 
 
@@ -793,6 +794,7 @@ class StoryDetailSerializer(serializers.ModelSerializer):
             "pdf_size_bytes",
             "epub_size_bytes",
             "is_completed",
+            "is_original",
             "tags",
             "themes",
             "rating",
@@ -1083,6 +1085,7 @@ class StoryAdminSerializer(serializers.ModelSerializer):
             "epub_file_url",
             "cached_file_reading_minutes",
             "is_completed",
+            "is_original",
             "genres",
             "categories",
             "tags",

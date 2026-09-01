@@ -1107,6 +1107,24 @@ class HomeDataQuickReadsTests(APITestCase):
         self.assertEqual(quick_read_slugs, ["has-summary"])
         self.assertIsNotNone(response.data["quick_reads"][0]["summary_reading_minutes"])
 
+    def test_originals_section_only_lists_flagged_published_stories(self):
+        original = Story.objects.create(
+            title="An Original", slug="an-original", is_published=True, is_original=True
+        )
+        Story.objects.create(
+            title="Regular", slug="regular", is_published=True, is_original=False
+        )
+        Story.objects.create(
+            title="Draft Original", slug="draft-original", is_published=False, is_original=True
+        )
+
+        response = self.client.get(reverse("home-data"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("originals", response.data)
+        self.assertEqual([s["slug"] for s in response.data["originals"]], ["an-original"])
+        self.assertTrue(response.data["originals"][0]["is_original"])
+
 
 class AudioStreamRangeTests(SimpleTestCase):
     def make_view(self, payload=b"0123456789"):
@@ -1846,6 +1864,25 @@ class PublicAuthorApiTests(APITestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual([story["slug"] for story in response.data["results"]], ["published-novel"])
 
+    def test_story_list_can_filter_by_is_original(self):
+        Story.objects.create(
+            title="Flagship", slug="flagship", is_published=True, is_original=True
+        )
+        Story.objects.create(
+            title="Community Story", slug="community-story", is_published=True, is_original=False
+        )
+
+        response = self.client.get(reverse("story-list"), {"is_original": "true"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([s["slug"] for s in response.data["results"]], ["flagship"])
+        self.assertTrue(response.data["results"][0]["is_original"])
+
+        response = self.client.get(reverse("story-list"), {"is_original": "false"})
+        false_slugs = [s["slug"] for s in response.data["results"]]
+        self.assertIn("community-story", false_slugs)
+        self.assertNotIn("flagship", false_slugs)
+
     def test_story_list_can_filter_by_has_audio(self):
         with_audio = Story.objects.create(
             title="Story With Audio",
@@ -2028,6 +2065,37 @@ class StoryAdminListFilterTests(APITestCase):
         )
 
         self.assertEqual(response.data["results"], [])
+
+    def test_filters_by_is_original(self):
+        self.published_completed_with_summary.is_original = True
+        self.published_completed_with_summary.save(update_fields=["is_original"])
+
+        response = self.client.get(reverse("admin-story-list"), {"is_original": "true"})
+        slugs = [story["slug"] for story in response.data["results"]]
+        self.assertEqual(slugs, [self.published_completed_with_summary.slug])
+
+    def test_create_and_update_persist_is_original(self):
+        response = self.client.post(
+            reverse("admin-story-list"),
+            {
+                "title": "Fresh Original",
+                "story_type": StoryType.objects.get(name="Short Story").id,
+                "is_original": "true",
+            },
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        story = Story.objects.get(slug=response.data["slug"])
+        self.assertTrue(story.is_original)
+
+        patch = self.client.patch(
+            reverse("admin-story-detail", args=[story.id]),
+            {"is_original": "false"},
+            format="multipart",
+        )
+        self.assertEqual(patch.status_code, 200, patch.data)
+        story.refresh_from_db()
+        self.assertFalse(story.is_original)
 
     def test_requires_superuser(self):
         regular_user = User.objects.create_user(
