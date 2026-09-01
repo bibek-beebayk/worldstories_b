@@ -557,6 +557,7 @@ class StoryViewSet(ReadOnlyModelViewSet):
                 "transcript",
                 "duration_seconds",
                 "file_size_bytes",
+                "read_along_offset_ms",
             )
             .prefetch_related(
                 Prefetch(

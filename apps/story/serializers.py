@@ -585,6 +585,7 @@ class ReadAlongSerializer(serializers.BaseSerializer):
                 ),
                 "synchronized": synchronized,
                 "cues": cue_payload,
+                "default_offset_seconds": round(audio.read_along_offset_ms / 1000, 3),
             },
             "navigation": {
                 "previous_audio_slug": self.context.get("previous_audio_slug"),
@@ -1573,6 +1574,7 @@ class AudioAdminSerializer(serializers.ModelSerializer):
             "order",
             "duration_seconds",
             "file_size_bytes",
+            "read_along_offset_ms",
         ]
         read_only_fields = [
             "transcript_synchronized",

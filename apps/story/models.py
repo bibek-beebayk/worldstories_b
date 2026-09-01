@@ -682,6 +682,15 @@ class Audio(models.Model):
     # does not issue one remote object-storage HEAD request per chapter.
     file_size_bytes = models.PositiveBigIntegerField(default=0, editable=False)
 
+    # Default Read Along highlight offset in milliseconds; positive delays the
+    # highlight relative to the audio. Corrects timed cues that drift against
+    # the recording for every reader at once. Superuser-editable from the Read
+    # Along page; a reader may still layer a personal per-track override on top.
+    read_along_offset_ms = models.IntegerField(
+        default=0,
+        validators=[MinValueValidator(-5000), MaxValueValidator(5000)],
+    )
+
     def __str__(self):
         return f"Audio for {self.story.title} uploaded at {self.uploaded_at}"
 

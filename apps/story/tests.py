@@ -418,6 +418,22 @@ class ReadAlongAPITests(APITestCase):
 
         self.assertEqual(response.status_code, 200)
 
+    def test_default_offset_seconds_reflects_audio_read_along_offset(self):
+        response = self.client.get(self.read_along_url())
+        self.assertEqual(response.data["transcript"]["default_offset_seconds"], 0)
+
+        self.current.read_along_offset_ms = 500
+        self.current.save(update_fields=["read_along_offset_ms"])
+        self.current.refresh_from_db()
+
+        response = self.client.get(self.read_along_url())
+        self.assertEqual(response.data["transcript"]["default_offset_seconds"], 0.5)
+
+        self.current.read_along_offset_ms = -300
+        self.current.save(update_fields=["read_along_offset_ms"])
+        response = self.client.get(self.read_along_url())
+        self.assertEqual(response.data["transcript"]["default_offset_seconds"], -0.3)
+
     def test_timed_cues_produce_a_synchronized_response(self):
         AudioTranscriptCue.objects.bulk_create(
             [
@@ -870,6 +886,46 @@ class AudioTranscriptAdminApiTests(APITestCase):
         self.assertEqual(rows["track"]["cue_count"], 2)
         self.assertFalse(rows["other"]["transcript_synchronized"])
         self.assertEqual(rows["other"]["cue_count"], 0)
+
+    def test_superuser_patches_read_along_offset(self):
+        response = self.client.patch(
+            f"/api/admin/audios/{self.audio.id}/",
+            {"read_along_offset_ms": 750},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.audio.refresh_from_db()
+        self.assertEqual(self.audio.read_along_offset_ms, 750)
+
+    def test_read_along_offset_out_of_range_is_rejected(self):
+        response = self.client.patch(
+            f"/api/admin/audios/{self.audio.id}/",
+            {"read_along_offset_ms": 9000},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.audio.refresh_from_db()
+        self.assertEqual(self.audio.read_along_offset_ms, 0)
+
+    def test_non_superuser_cannot_patch_read_along_offset(self):
+        self.client.force_authenticate(user=None)
+        response = self.client.patch(
+            f"/api/admin/audios/{self.audio.id}/",
+            {"read_along_offset_ms": 250},
+            format="json",
+        )
+        self.assertIn(response.status_code, (401, 403))
+
+        reader = User.objects.create(
+            email="reader@example.com", username="reader", is_active=True
+        )
+        self.client.force_authenticate(user=reader)
+        response = self.client.patch(
+            f"/api/admin/audios/{self.audio.id}/",
+            {"read_along_offset_ms": 250},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 403)
 
 
 class StoryAdminSerializerFileReadingCacheTests(SimpleTestCase):
