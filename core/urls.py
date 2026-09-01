@@ -196,6 +196,11 @@ urlpatterns = [
         name="admin-analytics-content",
     ),
     path(
+        "api/admin/analytics/content-rankings/",
+        story_analytics_api.AdminAnalyticsContentRankingsAPIView.as_view(),
+        name="admin-analytics-content-rankings",
+    ),
+    path(
         "api/admin/analytics/engagement/",
         story_analytics_api.AdminAnalyticsEngagementAPIView.as_view(),
         name="admin-analytics-engagement",

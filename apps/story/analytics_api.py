@@ -29,9 +29,10 @@ from apps.users.models import User, UserLoginLocation
 from .api import IsSuperUser
 from .models import Blog, Favorite, Genre, Review, Story, StoryView, Submission, published_blog_q, published_story_q
 
-ALLOWED_RANGE_DAYS = (7, 30, 90, 365)
+ALLOWED_RANGE_DAYS = (1, 7, 30, 90, 365)
 DEFAULT_RANGE_DAYS = 30
 CACHE_SECONDS = 60 * 5
+CONTENT_RANKING_PAGE_SIZE = 25
 
 
 def get_range_days(request):
@@ -44,6 +45,236 @@ def get_range_days(request):
 
 def get_cutoff(days):
     return timezone.now() - timedelta(days=days)
+
+
+def _content_identity(user_id, visitor_id):
+    return f"u:{user_id}" if user_id else f"v:{visitor_id}"
+
+
+def build_content_rankings(days, kind):
+    """Return comparable, interval-scoped metrics for every published title.
+
+    The score intentionally uses understandable raw weights rather than a
+    hidden statistical model: a view is 1 point, a read is 2, an interaction
+    is 3, and each engaged minute is 1. Raw values are returned alongside it
+    so admins can judge performance without relying on the score alone.
+    """
+    cutoff = get_cutoff(days)
+    is_story = kind in {"story", "audiobook"}
+    title_queryset = Story.objects.published() if is_story else Blog.objects.published()
+    if kind == "audiobook":
+        title_queryset = title_queryset.filter(audios__isnull=False).distinct()
+    titles = list(title_queryset.values("id", "title", "slug").order_by("title"))
+    title_ids = [row["id"] for row in titles]
+    metrics = {
+        title_id: {
+            "views": 0,
+            "reads": 0,
+            "reader_ids": set(),
+            "listens": 0,
+            "listener_ids": set(),
+            "reading_seconds": 0,
+            "listening_seconds": 0,
+            "watching_seconds": 0,
+            "completions": 0,
+            "downloads": 0,
+            "event_interactions": 0,
+        }
+        for title_id in title_ids
+    }
+
+    if is_story:
+        for row in (
+            StoryView.objects.filter(story_id__in=title_ids, created_at__gte=cutoff)
+            .values("story_id")
+            .annotate(count=Count("id"))
+        ):
+            metrics[row["story_id"]]["views"] = row["count"]
+
+    events = AnalyticsEvent.objects.filter(created_at__gte=cutoff)
+    events = events.filter(story_id__in=title_ids) if is_story else events.filter(blog_id__in=title_ids)
+    id_field = "story_id" if is_story else "blog_id"
+    event_interaction_types = {
+        AnalyticsEvent.EVENT_COMPLETION,
+        AnalyticsEvent.EVENT_DOWNLOAD,
+        AnalyticsEvent.EVENT_READ_ALONG_CUE_SEEK,
+        AnalyticsEvent.EVENT_READ_ALONG_FOLLOW_TOGGLE,
+    }
+    for title_id, event_type, user_id, visitor_id, duration in events.values_list(
+        id_field, "event_type", "user_id", "visitor_id", "duration_seconds"
+    ):
+        row = metrics[title_id]
+        duration = duration or 0
+        if not is_story and event_type == AnalyticsEvent.EVENT_VISIT:
+            row["views"] += 1
+        elif event_type == AnalyticsEvent.EVENT_READING_SESSION:
+            row["reads"] += 1
+            row["reader_ids"].add(_content_identity(user_id, visitor_id))
+            row["reading_seconds"] += duration
+        elif event_type == AnalyticsEvent.EVENT_LISTENING_SESSION:
+            row["listens"] += 1
+            row["listener_ids"].add(_content_identity(user_id, visitor_id))
+            row["listening_seconds"] += duration
+        elif event_type == AnalyticsEvent.EVENT_WATCHING_SESSION:
+            row["watching_seconds"] += duration
+        if event_type == AnalyticsEvent.EVENT_COMPLETION:
+            row["completions"] += 1
+        if event_type == AnalyticsEvent.EVENT_DOWNLOAD:
+            row["downloads"] += 1
+        if event_type in event_interaction_types:
+            row["event_interactions"] += 1
+
+    favorites = {}
+    reviews = {}
+    if is_story:
+        favorites = dict(
+            Favorite.objects.filter(story_id__in=title_ids, created_at__gte=cutoff)
+            .values_list("story_id")
+            .annotate(count=Count("id"))
+        )
+        reviews = dict(
+            Review.objects.filter(story_id__in=title_ids, created_at__gte=cutoff)
+            .values_list("story_id")
+            .annotate(count=Count("id"))
+        )
+
+    result = []
+    for title in titles:
+        row = metrics[title["id"]]
+        favorite_count = favorites.get(title["id"], 0)
+        review_count = reviews.get(title["id"], 0)
+        interactions = row["event_interactions"] + favorite_count + review_count
+        engagement_seconds = (
+            row["reading_seconds"] + row["listening_seconds"] + row["watching_seconds"]
+        )
+        engagement_minutes = round(engagement_seconds / 60, 1)
+        listening_minutes = round(row["listening_seconds"] / 60, 1)
+        performance_score = (
+            row["views"] + row["listens"] * 2 + interactions * 3 + listening_minutes
+            if kind == "audiobook"
+            else row["views"] + row["reads"] * 2 + interactions * 3 + engagement_minutes
+        )
+        result.append(
+            {
+                **title,
+                "content_type": kind,
+                "views": row["views"],
+                "reads": row["reads"],
+                "unique_readers": len(row["reader_ids"]),
+                "listens": row["listens"],
+                "unique_listeners": len(row["listener_ids"]),
+                "reading_minutes": round(row["reading_seconds"] / 60, 1),
+                "listening_minutes": listening_minutes,
+                "watching_minutes": round(row["watching_seconds"] / 60, 1),
+                "engagement_minutes": engagement_minutes,
+                "interactions": interactions,
+                "completions": row["completions"],
+                "downloads": row["downloads"],
+                "favorites": favorite_count,
+                "reviews": review_count,
+                "performance_score": round(performance_score, 1),
+            }
+        )
+    return result
+
+
+CONTENT_RANKING_SORTS = {
+    "performance_score",
+    "views",
+    "reads",
+    "unique_readers",
+    "listens",
+    "unique_listeners",
+    "reading_minutes",
+    "listening_minutes",
+    "engagement_minutes",
+    "interactions",
+    "completions",
+}
+
+
+def sort_content_rankings(rows, sort):
+    sort = sort if sort in CONTENT_RANKING_SORTS else "performance_score"
+    return sorted(rows, key=lambda row: (-row[sort], row["title"].lower()))
+
+
+def build_detail_time_series(days, *, story=None, blog=None):
+    """Build exact rolling hourly/daily buckets for one title."""
+    now = timezone.now()
+    cutoff = get_cutoff(days)
+    interval = "hour" if days == 1 else "day"
+    step = timedelta(hours=1) if interval == "hour" else timedelta(days=1)
+    bucket_count = 24 if interval == "hour" else days
+    points = [
+        {
+            "period": (cutoff + step * index).isoformat(),
+            "views": 0,
+            "reads": 0,
+            "reading_minutes": 0.0,
+            "listens": 0,
+            "listening_minutes": 0.0,
+            "read_along_listens": 0,
+            "read_along_minutes": 0.0,
+            "interactions": 0,
+        }
+        for index in range(bucket_count)
+    ]
+
+    def bucket_for(created_at):
+        index = int((created_at - cutoff).total_seconds() // step.total_seconds())
+        return points[index] if 0 <= index < bucket_count else None
+
+    if story is not None:
+        for created_at in story.view_events.filter(
+            created_at__gte=cutoff, created_at__lte=now
+        ).values_list("created_at", flat=True):
+            bucket = bucket_for(created_at)
+            if bucket:
+                bucket["views"] += 1
+
+    events = AnalyticsEvent.objects.filter(created_at__gte=cutoff, created_at__lte=now)
+    events = events.filter(story=story) if story is not None else events.filter(blog=blog)
+    interaction_types = {
+        AnalyticsEvent.EVENT_COMPLETION,
+        AnalyticsEvent.EVENT_DOWNLOAD,
+        AnalyticsEvent.EVENT_READ_ALONG_CUE_SEEK,
+        AnalyticsEvent.EVENT_READ_ALONG_FOLLOW_TOGGLE,
+    }
+    for event_type, duration, metadata, created_at in events.values_list(
+        "event_type", "duration_seconds", "metadata", "created_at"
+    ):
+        bucket = bucket_for(created_at)
+        if not bucket:
+            continue
+        if blog is not None and event_type == AnalyticsEvent.EVENT_VISIT:
+            bucket["views"] += 1
+        if event_type == AnalyticsEvent.EVENT_READING_SESSION:
+            bucket["reads"] += 1
+            bucket["reading_minutes"] += (duration or 0) / 60
+        if event_type == AnalyticsEvent.EVENT_LISTENING_SESSION:
+            bucket["listens"] += 1
+            bucket["listening_minutes"] += (duration or 0) / 60
+            if (metadata or {}).get("format") == "read_along":
+                bucket["read_along_listens"] += 1
+                bucket["read_along_minutes"] += (duration or 0) / 60
+        if event_type in interaction_types:
+            bucket["interactions"] += 1
+
+    if story is not None:
+        for queryset in (
+            story.favorites.filter(created_at__gte=cutoff, created_at__lte=now),
+            story.reviews.filter(created_at__gte=cutoff, created_at__lte=now),
+        ):
+            for created_at in queryset.values_list("created_at", flat=True):
+                bucket = bucket_for(created_at)
+                if bucket:
+                    bucket["interactions"] += 1
+
+    for point in points:
+        point["reading_minutes"] = round(point["reading_minutes"], 1)
+        point["listening_minutes"] = round(point["listening_minutes"], 1)
+        point["read_along_minutes"] = round(point["read_along_minutes"], 1)
+    return {"interval": interval, "points": points}
 
 
 # Each of these build_*_data(days) functions holds the actual query logic
@@ -127,6 +358,11 @@ def build_content_data(days):
     quick_read_count = (
         Story.objects.published().exclude(Q(summary__isnull=True) | Q(summary__exact="")).count()
     )
+    top_stories = sort_content_rankings(build_content_rankings(days, "story"), "performance_score")[:5]
+    top_audiobooks = sort_content_rankings(
+        build_content_rankings(days, "audiobook"), "performance_score"
+    )[:5]
+    top_blogs = sort_content_rankings(build_content_rankings(days, "blog"), "performance_score")[:5]
 
     return {
         "range_days": days,
@@ -161,6 +397,9 @@ def build_content_data(days):
         "audiobooks_count": audiobooks_count,
         "watchable_count": watchable_count,
         "quick_read_count": quick_read_count,
+        "top_stories": top_stories,
+        "top_audiobooks": top_audiobooks,
+        "top_blogs": top_blogs,
     }
 
 
@@ -826,6 +1065,39 @@ class AdminAnalyticsContentAPIView(APIView):
         return Response(build_content_data(get_range_days(request)))
 
 
+class AdminAnalyticsContentRankingsAPIView(APIView):
+    permission_classes = [IsSuperUser]
+
+    @method_decorator(cache_page(CACHE_SECONDS))
+    def get(self, request):
+        days = get_range_days(request)
+        kind = request.query_params.get("kind", "story")
+        if kind not in {"story", "audiobook", "blog"}:
+            kind = "story"
+        sort = request.query_params.get("sort", "performance_score")
+        if sort not in CONTENT_RANKING_SORTS:
+            sort = "performance_score"
+        try:
+            page = max(1, int(request.query_params.get("page", 1)))
+        except (TypeError, ValueError):
+            page = 1
+        rows = sort_content_rankings(build_content_rankings(days, kind), sort)
+        count = len(rows)
+        start = (page - 1) * CONTENT_RANKING_PAGE_SIZE
+        end = start + CONTENT_RANKING_PAGE_SIZE
+        return Response(
+            {
+                "range_days": days,
+                "content_type": kind,
+                "sort": sort,
+                "count": count,
+                "page": page,
+                "page_size": CONTENT_RANKING_PAGE_SIZE,
+                "results": rows[start:end],
+            }
+        )
+
+
 class AdminAnalyticsEngagementAPIView(APIView):
     permission_classes = [IsSuperUser]
 
@@ -1135,6 +1407,7 @@ def build_story_detail_data(story, days):
     return {
         "range_days": days,
         "story": {"id": story.id, "title": story.title, "slug": story.slug},
+        "time_series": build_detail_time_series(days, story=story),
         "page_opens": page_opens,
         "started_reading": started_reading,
         "completed_reading": completed_reading,
@@ -1206,6 +1479,7 @@ def build_blog_detail_data(blog, days):
     return {
         "range_days": days,
         "blog": {"id": blog.id, "title": blog.title, "slug": blog.slug},
+        "time_series": build_detail_time_series(days, blog=blog),
         "page_opens": len(page_open_identities),
         "started_reading": len(reader_identities),
         "reading_minutes": round(reading_seconds / 60, 1),

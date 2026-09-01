@@ -7,7 +7,7 @@ from django.urls import reverse
 from django.utils import timezone
 from rest_framework.test import APITestCase
 
-from apps.story.models import Audio, Video, Blog, Story
+from apps.story.models import Audio, Video, Blog, Story, StoryView
 from apps.users.models import User
 
 from .models import AnalyticsEvent, VideoWatchProgress
@@ -398,6 +398,15 @@ class AdminAudienceAnalyticsApiTests(APITestCase):
         self.assertEqual(response.data["audio"]["listening_minutes"], 6)  # (180 setUp + 120 + 60) / 60
         self.assertEqual(response.data["audio"]["read_along_listening_minutes"], 1)  # 60 / 60
 
+        hourly = self.client.get(
+            reverse("admin-analytics-story-detail", args=[self.story.slug]), {"days": 1}
+        )
+        self.assertEqual(hourly.data["time_series"]["interval"], "hour")
+        self.assertEqual(len(hourly.data["time_series"]["points"]), 24)
+        self.assertEqual(
+            sum(point["listens"] for point in hourly.data["time_series"]["points"]), 3
+        )
+
     def test_non_superuser_is_forbidden(self):
         self.client.force_authenticate(self.reader)
 
@@ -416,7 +425,7 @@ class AdminContentAnalyticsApiTests(APITestCase):
             is_superuser=True,
             is_staff=True,
         )
-        Blog.objects.create(title="Published One", slug="published-one", content="<p>x</p>")
+        self.blog = Blog.objects.create(title="Published One", slug="published-one", content="<p>x</p>")
         Blog.objects.create(title="Published Two", slug="published-two", content="<p>x</p>")
         Blog.objects.create(
             title="Draft", slug="draft-post", content="<p>x</p>", is_published=False
@@ -466,6 +475,52 @@ class AdminContentAnalyticsApiTests(APITestCase):
         self.assertEqual(response.data["audiobooks_count"], 1)
         self.assertEqual(response.data["watchable_count"], 1)
         self.assertEqual(response.data["quick_read_count"], 1)
+        self.assertEqual(response.data["top_audiobooks"][0]["id"], self.audiobook_story.id)
+
+        last_day = self.client.get(reverse("admin-analytics-content"), {"days": 1})
+        self.assertEqual(last_day.status_code, 200)
+        self.assertEqual(last_day.data["range_days"], 1)
+
+    def test_content_analytics_includes_ranked_story_and_blog_metrics(self):
+        StoryView.objects.create(story=self.plain_story, ip_address="127.0.0.1")
+        AnalyticsEvent.objects.create(
+            event_type=AnalyticsEvent.EVENT_READING_SESSION,
+            visitor_id="story-reader",
+            story=self.plain_story,
+            duration_seconds=120,
+        )
+        AnalyticsEvent.objects.create(
+            event_type=AnalyticsEvent.EVENT_VISIT,
+            visitor_id="blog-reader",
+            blog=self.blog,
+            metadata={"path": f"/blog/{self.blog.slug}"},
+        )
+        AnalyticsEvent.objects.create(
+            event_type=AnalyticsEvent.EVENT_READING_SESSION,
+            visitor_id="blog-reader",
+            blog=self.blog,
+            duration_seconds=60,
+        )
+        self.client.force_authenticate(self.admin)
+
+        response = self.client.get(reverse("admin-analytics-content"), {"days": 30})
+
+        self.assertEqual(response.status_code, 200)
+        story = next(row for row in response.data["top_stories"] if row["id"] == self.plain_story.id)
+        blog = next(row for row in response.data["top_blogs"] if row["id"] == self.blog.id)
+        self.assertEqual(story["views"], 1)
+        self.assertEqual(story["reads"], 1)
+        self.assertEqual(story["reading_minutes"], 2)
+        self.assertEqual(blog["views"], 1)
+        self.assertEqual(blog["reads"], 1)
+
+        ranking = self.client.get(
+            reverse("admin-analytics-content-rankings"),
+            {"kind": "blog", "days": 30, "sort": "reads"},
+        )
+        self.assertEqual(ranking.status_code, 200)
+        self.assertEqual(ranking.data["content_type"], "blog")
+        self.assertEqual(ranking.data["results"][0]["id"], self.blog.id)
 
 
 class VideoWatchProgressApiTests(APITestCase):
