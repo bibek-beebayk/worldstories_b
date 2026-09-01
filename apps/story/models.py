@@ -350,6 +350,11 @@ class Story(models.Model):
     cached_file_reading_minutes = models.PositiveIntegerField(blank=True, null=True)
     is_completed = models.BooleanField(default=False)
     is_original = models.BooleanField(default=False, db_index=True)
+    # Manual homepage-hero position (1-5, superuser-set). Null = not manually
+    # featured — HomeDataAPIView backfills any remaining hero slots with its
+    # existing automatic top-by-views/rating pick. Unique so two stories can
+    # never claim the same slot; multiple NULLs are fine in Postgres.
+    featured_rank = models.PositiveSmallIntegerField(null=True, blank=True, unique=True)
     # related_name explicit to match genres/categories below — without it
     # the reverse accessor defaults to tag.story_set, but TagSerializer /
     # TagViewSet / the sitemap all assume tag.stories, same as genres/categories.

@@ -87,6 +87,7 @@ from .serializers import (
     AdminAuthorSerializer,
     StoryListSerializer,
     FeaturedStorySerializer,
+    FeaturedStoryAdminSerializer,
     ChapterSearchResultSerializer,
     StoryDetailSerializer,
     ChapterSerializer,
@@ -936,6 +937,61 @@ class StoryAdminViewSet(ModelViewSet):
         response = HttpResponse(csv_text, content_type="text/csv")
         response["Content-Disposition"] = 'attachment; filename="stories-export.csv"'
         return response
+
+    @action(detail=False, methods=["get", "put"], url_path="featured")
+    def featured(self, request):
+        """The homepage hero's manually-curated lead stories — an ordered,
+        at-most-5 list. PUT replaces the whole set atomically (same
+        validate-then-replace shape as AudioAdminViewSet.transcript_cues):
+        a bad payload leaves the existing set untouched. HomeDataAPIView
+        reads featured_rank directly and backfills any empty slots."""
+        if request.method == "GET":
+            stories = (
+                Story.objects.filter(featured_rank__isnull=False)
+                .select_related("author")
+                .order_by("featured_rank")
+            )
+            return Response(
+                FeaturedStoryAdminSerializer(stories, many=True, context={"request": request}).data
+            )
+
+        story_ids = request.data.get("story_ids", [])
+        if not isinstance(story_ids, list) or not all(isinstance(i, int) for i in story_ids):
+            return Response(
+                {"detail": "story_ids must be a list of story IDs."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if len(story_ids) > 5:
+            return Response(
+                {"detail": "You can feature at most 5 stories."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if len(story_ids) != len(set(story_ids)):
+            return Response(
+                {"detail": "The same story can't be featured twice."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        found = set(Story.objects.filter(id__in=story_ids).values_list("id", flat=True))
+        missing = [i for i in story_ids if i not in found]
+        if missing:
+            return Response(
+                {"detail": f"Story id(s) not found: {missing}"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        with transaction.atomic():
+            Story.objects.filter(featured_rank__isnull=False).update(featured_rank=None)
+            for index, story_id in enumerate(story_ids, start=1):
+                Story.objects.filter(pk=story_id).update(featured_rank=index)
+
+        stories = (
+            Story.objects.filter(featured_rank__isnull=False)
+            .select_related("author")
+            .order_by("featured_rank")
+        )
+        return Response(
+            FeaturedStoryAdminSerializer(stories, many=True, context={"request": request}).data
+        )
 
     @action(detail=False, methods=["post"], url_path="bulk-taxonomy-preview")
     def bulk_taxonomy_preview(self, request):
@@ -1803,7 +1859,18 @@ class HomeDataAPIView(APIView):
                     break
             return results
 
-        featured_stories = take(base_qs.order_by("-views", "-rating", "-id"), 5)
+        # Manually-curated hero picks (superuser-set, see StoryAdminViewSet.featured)
+        # replace the hero entirely, in their chosen order, however many there
+        # are (1-5) — no backfill once at least one is picked. Only with zero
+        # manual picks does the hero fall back to the automatic top-by-views pick.
+        manual_featured = list(
+            base_qs.filter(featured_rank__isnull=False).order_by("featured_rank")[:5]
+        )
+        if manual_featured:
+            used_ids.update(story.id for story in manual_featured)
+            featured_stories = manual_featured
+        else:
+            featured_stories = take(base_qs.order_by("-views", "-rating", "-id"), 5)
         weekly_spotlight = take(base_qs.order_by("-rating", "-views", "-id"), 6)
         sidebar_recommended = take(base_qs.order_by("-rating", "-views", "-id"), 3)
         new_trending = take(base_qs.order_by("-views", "-site_published_date", "-id"), 5)

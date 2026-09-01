@@ -1107,6 +1107,37 @@ class HomeDataQuickReadsTests(APITestCase):
         self.assertEqual(quick_read_slugs, ["has-summary"])
         self.assertIsNotNone(response.data["quick_reads"][0]["summary_reading_minutes"])
 
+    def test_manual_featured_stories_replace_the_hero_with_no_backfill(self):
+        # Manual rank order beats view count — the low-view pick still leads.
+        second_pick = Story.objects.create(
+            title="Second Pick", slug="second-pick", is_published=True, views=1, featured_rank=2
+        )
+        first_pick = Story.objects.create(
+            title="First Pick", slug="first-pick", is_published=True, views=1000, featured_rank=1
+        )
+        for i, views in enumerate([500, 400, 300, 200], start=1):
+            Story.objects.create(
+                title=f"Not Featured {i}", slug=f"not-featured-{i}", is_published=True, views=views
+            )
+
+        response = self.client.get(reverse("home-data"))
+
+        self.assertEqual(response.status_code, 200)
+        slugs = [story["slug"] for story in response.data["featured_stories"]]
+        self.assertEqual(slugs, ["first-pick", "second-pick"])
+
+    def test_no_manual_featured_stories_falls_back_to_fully_automatic(self):
+        for i, views in enumerate([500, 400, 300, 200, 100, 50], start=1):
+            Story.objects.create(
+                title=f"Auto {i}", slug=f"auto-{i}", is_published=True, views=views
+            )
+
+        response = self.client.get(reverse("home-data"))
+
+        self.assertEqual(response.status_code, 200)
+        slugs = [story["slug"] for story in response.data["featured_stories"]]
+        self.assertEqual(slugs, ["auto-1", "auto-2", "auto-3", "auto-4", "auto-5"])
+
     def test_originals_section_only_lists_flagged_published_stories(self):
         original = Story.objects.create(
             title="An Original", slug="an-original", is_published=True, is_original=True
@@ -2105,6 +2136,101 @@ class StoryAdminListFilterTests(APITestCase):
 
         response = self.client.get(reverse("admin-story-list"))
 
+        self.assertEqual(response.status_code, 403)
+
+
+class StoryFeaturedApiTests(APITestCase):
+    def setUp(self):
+        self.admin = User.objects.create_user(
+            email="featured-admin@example.com",
+            username="featured-admin",
+            password="test-password",
+            is_superuser=True,
+            is_staff=True,
+        )
+        self.client.force_authenticate(self.admin)
+        self.a = Story.objects.create(title="Story A", slug="featured-a", is_published=True)
+        self.b = Story.objects.create(title="Story B", slug="featured-b", is_published=True)
+        self.c = Story.objects.create(title="Story C", slug="featured-c", is_published=True)
+
+    def test_get_is_empty_initially(self):
+        response = self.client.get(reverse("admin-story-featured"))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, [])
+
+    def test_put_sets_ranks_in_the_given_order(self):
+        response = self.client.put(
+            reverse("admin-story-featured"),
+            {"story_ids": [self.c.id, self.a.id]},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([s["slug"] for s in response.data], ["featured-c", "featured-a"])
+
+        self.c.refresh_from_db()
+        self.a.refresh_from_db()
+        self.assertEqual(self.c.featured_rank, 1)
+        self.assertEqual(self.a.featured_rank, 2)
+
+        get_response = self.client.get(reverse("admin-story-featured"))
+        self.assertEqual([s["slug"] for s in get_response.data], ["featured-c", "featured-a"])
+
+    def test_put_replaces_and_clears_removed_stories(self):
+        self.client.put(
+            reverse("admin-story-featured"),
+            {"story_ids": [self.a.id, self.b.id, self.c.id]},
+            format="json",
+        )
+        response = self.client.put(
+            reverse("admin-story-featured"), {"story_ids": [self.b.id]}, format="json"
+        )
+        self.assertEqual(response.status_code, 200)
+        self.a.refresh_from_db()
+        self.b.refresh_from_db()
+        self.c.refresh_from_db()
+        self.assertIsNone(self.a.featured_rank)
+        self.assertEqual(self.b.featured_rank, 1)
+        self.assertIsNone(self.c.featured_rank)
+
+    def test_put_rejects_more_than_five(self):
+        extra = [
+            Story.objects.create(title=f"Extra {i}", slug=f"featured-extra-{i}", is_published=True).id
+            for i in range(3)
+        ]
+        response = self.client.put(
+            reverse("admin-story-featured"),
+            {"story_ids": [self.a.id, self.b.id, self.c.id, *extra]},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(Story.objects.filter(featured_rank__isnull=False).exists())
+
+    def test_put_rejects_duplicate_story(self):
+        response = self.client.put(
+            reverse("admin-story-featured"),
+            {"story_ids": [self.a.id, self.a.id]},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_put_rejects_unknown_story_id(self):
+        response = self.client.put(
+            reverse("admin-story-featured"), {"story_ids": [999999]}, format="json"
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_requires_superuser(self):
+        self.client.force_authenticate(user=None)
+        response = self.client.get(reverse("admin-story-featured"))
+        self.assertIn(response.status_code, (401, 403))
+
+        regular_user = User.objects.create_user(
+            email="featured-regular@example.com", username="featured-regular", password="x"
+        )
+        self.client.force_authenticate(regular_user)
+        response = self.client.put(
+            reverse("admin-story-featured"), {"story_ids": [self.a.id]}, format="json"
+        )
         self.assertEqual(response.status_code, 403)
 
 

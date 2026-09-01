@@ -1320,6 +1320,26 @@ class LinkedStorySummarySerializer(serializers.ModelSerializer):
         fields = ["id", "slug", "title", "cover_image", "author", "story_type", "language"]
 
 
+class FeaturedStoryAdminSerializer(serializers.ModelSerializer):
+    """Light picker/list shape for the admin Featured Stories screen — not the
+    heavy StoryAdminSerializer, and not the public FeaturedStorySerializer
+    (which needs the full card fields for the homepage hero itself)."""
+
+    cover_image = serializers.SerializerMethodField()
+    author = serializers.SerializerMethodField()
+
+    def get_cover_image(self, obj):
+        request = self.context.get("request")
+        return get_cover_image_url(obj.cover_image_file, obj.cover_image, request, size=CARD_COVER_SIZE)
+
+    def get_author(self, obj):
+        return obj.author.name if obj.author_id else None
+
+    class Meta:
+        model = Story
+        fields = ["id", "title", "slug", "cover_image", "author", "is_published", "featured_rank"]
+
+
 class LinkedBlogSummarySerializer(serializers.ModelSerializer):
     cover_image = serializers.SerializerMethodField()
     published_at = serializers.DateTimeField(source="created_at", read_only=True)
