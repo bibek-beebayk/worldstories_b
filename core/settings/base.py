@@ -41,9 +41,14 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
+    # Must sit above SecurityMiddleware and CommonMiddleware: both of those can
+    # short-circuit a request with a redirect (SECURE_SSL_REDIRECT / APPEND_SLASH)
+    # before CorsMiddleware would run, and a redirected CORS preflight has no
+    # Access-Control-* headers, so the browser reports it as a CORS failure.
+    # django-cors-headers' own docs require it be as high as possible.
+    "corsheaders.middleware.CorsMiddleware",
     "django.middleware.security.SecurityMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
-    "corsheaders.middleware.CorsMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",

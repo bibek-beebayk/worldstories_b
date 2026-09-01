@@ -34,6 +34,20 @@ class StoryQuerySet(models.QuerySet):
     def published(self):
         return self.filter(published_story_q())
 
+    def for_card_list(self):
+        """Everything `StoryListSerializer` reads, resolved in a constant number
+        of queries instead of ~7 per row: the M2M/reverse relations it shows are
+        prefetched, and the review/favourite counts it renders are annotated
+        (as ``_reviews_count`` / ``_favorites_count``; the serializer falls back
+        to a live count when the annotation is absent). Apply this on any
+        queryset handed to that serializer with more than a couple of rows."""
+        return self.select_related("author", "story_type").prefetch_related(
+            "genres", "categories", "audios", "videos"
+        ).annotate(
+            _reviews_count=models.Count("reviews", distinct=True),
+            _favorites_count=models.Count("favorites", distinct=True),
+        )
+
 LANGUAGE_CHOICES = [
     ("en", "English"),
     ("es", "Spanish"),

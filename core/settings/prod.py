@@ -22,17 +22,28 @@ CSRF_COOKIE_SECURE = True
 # this. Bump toward 31536000 (1 year) once that's confirmed.
 SECURE_HSTS_SECONDS = 3600
 
-CSRF_TRUSTED_ORIGINS = [
-    "https://worldstories-b-production.up.railway.app", "https://worldstories-f.netlify.app", "http://localhost:8080", "http://127.0.0.1:8080", "https://worldstories.net", "https://www.worldstories.net"
+# Extra origins can be added at deploy time via the EXTRA_ALLOWED_ORIGINS env
+# var (comma-separated, e.g. "https://staging.worldstories.net,https://foo.bar")
+# so a new frontend domain doesn't require a code change + redeploy just to
+# clear its CORS/CSRF errors.
+_EXTRA_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get("EXTRA_ALLOWED_ORIGINS", "").split(",")
+    if origin.strip()
 ]
 
-CORS_ALLOWED_ORIGINS = [
-    "https://worldstories-b-production.up.railway.app", "https://worldstories-f.netlify.app", "http://localhost:8080", "http://127.0.0.1:8080", "https://worldstories.net", "https://www.worldstories.net"
-]
+_ALLOWED_ORIGINS = [
+    "https://worldstories-b-production.up.railway.app",
+    "https://worldstories-f.netlify.app",
+    "http://localhost:8080",
+    "http://127.0.0.1:8080",
+    "https://worldstories.net",
+    "https://www.worldstories.net",
+] + _EXTRA_ORIGINS
 
-CORS_ORIGIN_WHITELIST = [
-    "https://worldstories-b-production.up.railway.app", "https://worldstories-f.netlify.app", "http://localhost:8080", "http://127.0.0.1:8080", "https://worldstories.net", "https://www.worldstories.net"
-]
+CSRF_TRUSTED_ORIGINS = _ALLOWED_ORIGINS
+CORS_ALLOWED_ORIGINS = _ALLOWED_ORIGINS
+CORS_ORIGIN_WHITELIST = _ALLOWED_ORIGINS
 
 MIDDLEWARE += [
     "whitenoise.middleware.WhiteNoiseMiddleware",

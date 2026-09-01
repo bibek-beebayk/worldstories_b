@@ -12,6 +12,9 @@ from django.http import FileResponse, HttpResponse, StreamingHttpResponse
 from django.db import transaction
 from django.utils import timezone
 from django.utils.text import slugify
+from django.utils.decorators import method_decorator
+from django.views.decorators.cache import cache_page
+from django.views.decorators.vary import vary_on_headers
 from datetime import timedelta
 from storages.backends.s3 import S3Storage
 from rest_framework.parsers import FormParser, MultiPartParser, JSONParser
@@ -421,9 +424,10 @@ class StoryViewSet(ReadOnlyModelViewSet):
             )
         queryset = (
             Story.objects.published()
-            .select_related("author")
+            .select_related("author", "story_type")
             .prefetch_related(
                 "genres",
+                "categories",
                 # Annotate the timed-cue flag on the prefetch so
                 # AudioSerializer.transcript_synchronized doesn't N+1 on story detail.
                 Prefetch(
@@ -448,6 +452,19 @@ class StoryViewSet(ReadOnlyModelViewSet):
                 queryset,
                 preferred_language=self.request.query_params.get("language"),
             )
+            # StoryListSerializer reads these; keeps the browse grid off a
+            # per-row .count()/.exists() (see StoryQuerySet.for_card_list).
+            annotations = {
+                "_reviews_count": Count("reviews", distinct=True),
+                "_favorites_count": Count("favorites", distinct=True),
+            }
+            if self.request.user.is_authenticated:
+                annotations["_is_favorite"] = Exists(
+                    Favorite.objects.filter(
+                        story=OuterRef("pk"), user=self.request.user
+                    )
+                )
+            queryset = queryset.annotate(**annotations)
         return queryset
 
     def get_permissions(self):
@@ -1637,8 +1654,7 @@ class LibraryShelvesAPIView(APIView):
         for genre in page:
             preview_stories = (
                 preferred_stories.filter(genres=genre)
-                .select_related("author")
-                .prefetch_related("genres", "audios", "videos")
+                .for_card_list()
                 .order_by("-views", "-rating", "-id")[: self.PREVIEW_SIZE]
             )
             shelves.append(
@@ -1839,9 +1855,20 @@ class ThemeAdminViewSet(ModelViewSet):
         serializer.save(slug=_unique_theme_slug(name))
 
 
+# The discovery endpoints run many ordered queries + card serialization (with
+# per-row favourite/review counts) on every hit and are otherwise uncached, so
+# a cold DB makes the homepage's loader/hydration fetch crawl in production.
+# A short public cache absorbs traffic bursts and SSR without letting new
+# stories / counts go visibly stale. Varied on Authorization so a logged-in
+# reader never gets another visitor's cached "favourited" flags.
+DISCOVERY_CACHE_SECONDS = 60
+
+
+@method_decorator(cache_page(DISCOVERY_CACHE_SECONDS), name="get")
+@method_decorator(vary_on_headers("Authorization"), name="get")
 class HomeDataAPIView(APIView):
     def get(self, request):
-        base_qs = Story.objects.published().select_related("author").prefetch_related("genres", "audios", "videos")
+        base_qs = Story.objects.published().for_card_list()
         used_ids = set()
 
         def take(queryset, limit):
@@ -1940,17 +1967,13 @@ class HomeDataAPIView(APIView):
         )
 
 
+@method_decorator(cache_page(DISCOVERY_CACHE_SECONDS), name="get")
+@method_decorator(vary_on_headers("Authorization"), name="get")
 class TrendingDataAPIView(APIView):
     def get(self, request):
-        base_qs = (
-            Story.objects.published()
-            .select_related("author")
-            .prefetch_related("genres", "audios", "videos")
-            .annotate(
-                favorites_total=Count("favorites", distinct=True),
-                reviews_total=Count("reviews", distinct=True),
-            )
-        )
+        # for_card_list() already annotates _favorites_count / _reviews_count —
+        # reuse them for the "most X" orderings instead of a second pair.
+        base_qs = Story.objects.published().for_card_list()
         return Response(
             {
                 "most_viewed": StoryListSerializer(
@@ -1964,12 +1987,12 @@ class TrendingDataAPIView(APIView):
                     context={"request": request},
                 ).data,
                 "most_favorited": StoryListSerializer(
-                    base_qs.order_by("-favorites_total", "-id")[:10],
+                    base_qs.order_by("-_favorites_count", "-id")[:10],
                     many=True,
                     context={"request": request},
                 ).data,
                 "most_discussed": StoryListSerializer(
-                    base_qs.order_by("-reviews_total", "-id")[:10],
+                    base_qs.order_by("-_reviews_count", "-id")[:10],
                     many=True,
                     context={"request": request},
                 ).data,
@@ -1977,13 +2000,12 @@ class TrendingDataAPIView(APIView):
         )
 
 
+@method_decorator(cache_page(DISCOVERY_CACHE_SECONDS), name="get")
+@method_decorator(vary_on_headers("Authorization"), name="get")
 class DiscoverDataAPIView(APIView):
     def get(self, request):
-        base_qs = Story.objects.published().select_related("author").prefetch_related("genres", "audios", "videos")
-        trending_qs = base_qs.annotate(
-            favorites_total=Count("favorites", distinct=True),
-            reviews_total=Count("reviews", distinct=True),
-        )
+        base_qs = Story.objects.published().for_card_list()
+        trending_qs = base_qs
 
         story_types = (
             StoryType.objects.filter(published_story_q("stories"))
@@ -2050,12 +2072,12 @@ class DiscoverDataAPIView(APIView):
                     context={"request": request},
                 ).data,
                 "most_favorited": StoryListSerializer(
-                    trending_qs.order_by("-favorites_total", "-id")[:10],
+                    trending_qs.order_by("-_favorites_count", "-id")[:10],
                     many=True,
                     context={"request": request},
                 ).data,
                 "most_discussed": StoryListSerializer(
-                    trending_qs.order_by("-reviews_total", "-id")[:10],
+                    trending_qs.order_by("-_reviews_count", "-id")[:10],
                     many=True,
                     context={"request": request},
                 ).data,
@@ -2264,8 +2286,7 @@ class SearchStoryAPIView(APIView):
         if q:
             stories = (
                 Story.objects.published()
-                .select_related("author")
-                .prefetch_related("genres", "audios", "videos", "tags")
+                .for_card_list()
                 .filter(
                     Q(title__icontains=q)
                     | Q(about__icontains=q)

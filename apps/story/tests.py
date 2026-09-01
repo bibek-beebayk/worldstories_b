@@ -5,6 +5,7 @@ from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from django.core.cache import cache
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db import IntegrityError, transaction
@@ -63,6 +64,7 @@ from apps.story.models import (
     Favorite,
     Genre,
     PromptSettings,
+    Review,
     Story,
     StoryQueue,
     StoryType,
@@ -1080,6 +1082,50 @@ class SummaryReadingMinutesTests(SimpleTestCase):
 
 
 class HomeDataQuickReadsTests(APITestCase):
+    def setUp(self):
+        # /api/home/ is cache_page-wrapped; LocMemCache persists across tests
+        # in-process, so clear it or a later test sees an earlier one's payload.
+        cache.clear()
+
+    def _make_home_stories(self, count, *, prefix):
+        genre = Genre.objects.create(name=f"Genre {prefix}")
+        reviewer = User.objects.create(
+            email=f"{prefix}-reviewer@example.com", username=f"{prefix}-reviewer", is_active=True
+        )
+        for i in range(count):
+            story = Story.objects.create(
+                title=f"{prefix} Story {i}",
+                slug=f"{prefix}-story-{i}",
+                is_published=True,
+                views=i,
+                rating=(i % 5),
+            )
+            story.genres.add(genre)
+            Audio.objects.create(
+                story=story, title="Track", slug=f"{prefix}-audio-{i}",
+                audio_file="story_audios/x.mp3", order=1,
+            )
+            Review.objects.create(story=story, user=reviewer, rating=4)
+            Favorite.objects.create(story=story, user=reviewer)
+
+    def test_home_data_query_count_does_not_grow_with_the_catalogue(self):
+        # The hero + rails serialize dozens of story cards; a per-row
+        # count()/exists() there is what made /api/home/ crawl on a cold DB.
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        self._make_home_stories(8, prefix="small")
+        with CaptureQueriesContext(connection) as small:
+            self.assertEqual(self.client.get(reverse("home-data")).status_code, 200)
+
+        cache.clear()
+        self._make_home_stories(12, prefix="big")
+        with CaptureQueriesContext(connection) as big:
+            self.assertEqual(self.client.get(reverse("home-data")).status_code, 200)
+
+        # Same query count for a much larger catalogue → no per-row N+1.
+        self.assertEqual(len(big.captured_queries), len(small.captured_queries))
+
     def test_quick_reads_only_includes_published_stories_with_a_summary(self):
         Story.objects.create(
             title="Has Summary",
@@ -1247,14 +1293,17 @@ class ScheduledPublishingTests(SimpleTestCase):
 
         self.assertIs(view.get_queryset(), queryset)
         published.assert_called_once_with()
-        queryset.select_related.assert_called_once_with("author")
+        queryset.select_related.assert_called_once_with("author", "story_type")
         prefetch_related = queryset.select_related.return_value.prefetch_related
         prefetch_related.assert_called_once()
         prefetch_args = prefetch_related.call_args.args
-        # The middle arg is a Prefetch("audios", ...) that annotates the
-        # timed-cue flag; the outer strings are still plain lookups.
-        self.assertEqual((prefetch_args[0], prefetch_args[2]), ("genres", "videos"))
-        self.assertEqual(prefetch_args[1].prefetch_through, "audios")
+        # A Prefetch("audios", ...) that annotates the timed-cue flag sits
+        # among plain-string lookups.
+        self.assertEqual(
+            (prefetch_args[0], prefetch_args[1], prefetch_args[3]),
+            ("genres", "categories", "videos"),
+        )
+        self.assertEqual(prefetch_args[2].prefetch_through, "audios")
 
     @patch("django.db.models.Model.save")
     def test_scheduled_story_uses_schedule_date_as_site_date(self, model_save):
@@ -1691,6 +1740,7 @@ class BecauseFinishedApiTests(APITestCase):
 
 class PublicAuthorApiTests(APITestCase):
     def setUp(self):
+        cache.clear()  # /api/discover/ is cache_page-wrapped — see HomeDataQuickReadsTests
         self.visible_author = Author.objects.create(
             name="Visible Writer",
             bio="Writes public stories.",

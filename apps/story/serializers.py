@@ -60,7 +60,7 @@ class GenreDetailSerializer(GenreSerializer):
 
     def get_stories(self, obj):
         stories = with_preferred_translation_only(
-            obj.stories.published().select_related("author").order_by("-site_published_date", "-id")
+            obj.stories.published().for_card_list().order_by("-site_published_date", "-id")
         )
         return StoryListSerializer(stories, many=True, context=self.context).data
 
@@ -87,7 +87,7 @@ class CategoryDetailSerializer(CategorySerializer):
 
     def get_stories(self, obj):
         stories = with_preferred_translation_only(
-            obj.stories.published().select_related("author").order_by("-site_published_date", "-id")
+            obj.stories.published().for_card_list().order_by("-site_published_date", "-id")
         )
         return StoryListSerializer(stories, many=True, context=self.context).data
 
@@ -114,7 +114,7 @@ class TagDetailSerializer(TagSerializer):
 
     def get_stories(self, obj):
         stories = with_preferred_translation_only(
-            obj.stories.published().select_related("author").order_by("-site_published_date", "-id")
+            obj.stories.published().for_card_list().order_by("-site_published_date", "-id")
         )
         return StoryListSerializer(stories, many=True, context=self.context).data
 
@@ -141,7 +141,7 @@ class ThemeDetailSerializer(ThemeSerializer):
 
     def get_stories(self, obj):
         stories = with_preferred_translation_only(
-            obj.stories.published().select_related("author").order_by("-site_published_date", "-id")
+            obj.stories.published().for_card_list().order_by("-site_published_date", "-id")
         )
         return StoryListSerializer(stories, many=True, context=self.context).data
 
@@ -268,12 +268,37 @@ class StoryListSerializer(serializers.ModelSerializer):
     is_favorite = serializers.SerializerMethodField()
     favorites_count = serializers.SerializerMethodField()
     cover_image = serializers.SerializerMethodField()
+    # Declared explicitly (rather than letting ModelSerializer bind the model's
+    # has_audio()/has_video() methods, which call .exists() and N+1 per row).
+    has_audio = serializers.SerializerMethodField()
+    has_video = serializers.SerializerMethodField()
+
+    @staticmethod
+    def _prefetched(obj, relation):
+        cache = getattr(obj, "_prefetched_objects_cache", None)
+        return cache.get(relation) if cache is not None else None
 
     def get_genres(self, obj):
-        return list(obj.genres.values_list("name", flat=True)[:2])
+        prefetched = self._prefetched(obj, "genres")
+        rows = prefetched if prefetched is not None else obj.genres.all()
+        return [genre.name for genre in rows[:2]]
 
     def get_categories(self, obj):
-        return list(obj.categories.values_list("name", flat=True)[:2])
+        prefetched = self._prefetched(obj, "categories")
+        rows = prefetched if prefetched is not None else obj.categories.all()
+        return [category.name for category in rows[:2]]
+
+    def _has_related(self, obj, relation):
+        prefetched = self._prefetched(obj, relation)
+        if prefetched is not None:
+            return len(prefetched) > 0
+        return getattr(obj, relation).exists()
+
+    def get_has_audio(self, obj):
+        return self._has_related(obj, "audios")
+
+    def get_has_video(self, obj):
+        return self._has_related(obj, "videos")
 
     # Name only (not the full nested author object list responses use
     # elsewhere) — just enough for cards/fallback covers to credit the
@@ -290,16 +315,21 @@ class StoryListSerializer(serializers.ModelSerializer):
         return reading_time.summary_reading_minutes(obj.summary) if obj.summary else None
 
     def get_reviews_count(self, obj):
-        return obj.reviews.count()
+        annotated = getattr(obj, "_reviews_count", None)
+        return annotated if annotated is not None else obj.reviews.count()
 
     def get_is_favorite(self, obj):
         request = self.context.get("request")
         if not request or not request.user or not request.user.is_authenticated:
             return False
+        annotated = getattr(obj, "_is_favorite", None)
+        if annotated is not None:
+            return annotated
         return obj.favorites.filter(user=request.user).exists()
 
     def get_favorites_count(self, obj):
-        return obj.favorites.count()
+        annotated = getattr(obj, "_favorites_count", None)
+        return annotated if annotated is not None else obj.favorites.count()
 
     cover_image_size = CARD_COVER_SIZE
 
@@ -364,7 +394,7 @@ class AuthorDetailSerializer(AuthorSerializer):
     stories = serializers.SerializerMethodField()
 
     def get_stories(self, obj):
-        stories = obj.stories.published().select_related("author").order_by("-site_published_date", "-id")
+        stories = obj.stories.published().for_card_list().order_by("-site_published_date", "-id")
         stories = with_preferred_translation_only(stories)
         return StoryListSerializer(stories, many=True, context=self.context).data
 
@@ -617,12 +647,16 @@ def similar_stories_candidates(story):
     candidates = Story.objects.published().select_related("author").filter(matching).exclude(
         translation_group=story.translation_group
     )
-    candidates = with_preferred_translation_only(candidates).annotate(
+    candidates = with_preferred_translation_only(candidates).select_related(
+        "story_type"
+    ).prefetch_related("genres", "categories", "audios", "videos").annotate(
         shared_genres=Count(
             "genres",
             filter=Q(genres__id__in=genre_ids),
             distinct=True,
         ),
+        _reviews_count=Count("reviews", distinct=True),
+        _favorites_count=Count("favorites", distinct=True),
         same_author=Case(
             *(
                 [When(author_id=story.author_id, then=Value(1))]
