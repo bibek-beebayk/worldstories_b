@@ -98,6 +98,11 @@ AWS_DEFAULT_ACL = None
 AWS_QUERYSTRING_AUTH = False
 AWS_S3_FILE_OVERWRITE = False
 
+# Never make public API response time depend on a synchronous R2 HeadObject
+# request for each cover-image rendition. Renditions can be warmed separately;
+# list serializers fall back to the original public object URL.
+GENERATE_IMAGE_RENDITIONS_ON_REQUEST = False
+
 R2_PUBLIC_BASE_URL = os.environ.get("R2_PUBLIC_BASE_URL", "").rstrip("/")
 AWS_S3_CUSTOM_DOMAIN = os.environ.get("AWS_S3_CUSTOM_DOMAIN", "")
 if not AWS_S3_CUSTOM_DOMAIN and R2_PUBLIC_BASE_URL:

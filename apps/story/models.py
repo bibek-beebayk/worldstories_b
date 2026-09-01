@@ -41,11 +41,33 @@ class StoryQuerySet(models.QuerySet):
         (as ``_reviews_count`` / ``_favorites_count``; the serializer falls back
         to a live count when the annotation is absent). Apply this on any
         queryset handed to that serializer with more than a couple of rows."""
+        # Keep the two counts independent. Joining reviews and favourites into
+        # one aggregate query creates a reviews x favourites fan-out for every
+        # story, forcing PostgreSQL to de-duplicate a potentially large
+        # intermediate result before it can order or limit card lists.
+        review_count = (
+            Review.objects.filter(story_id=models.OuterRef("pk"))
+            .order_by()
+            .values("story_id")
+            .annotate(total=models.Count("pk"))
+            .values("total")[:1]
+        )
+        favorite_count = (
+            Favorite.objects.filter(story_id=models.OuterRef("pk"))
+            .order_by()
+            .values("story_id")
+            .annotate(total=models.Count("pk"))
+            .values("total")[:1]
+        )
         return self.select_related("author", "story_type").prefetch_related(
             "genres", "categories", "audios", "videos"
         ).annotate(
-            _reviews_count=models.Count("reviews", distinct=True),
-            _favorites_count=models.Count("favorites", distinct=True),
+            _reviews_count=models.functions.Coalesce(
+                models.Subquery(review_count, output_field=models.IntegerField()), 0
+            ),
+            _favorites_count=models.functions.Coalesce(
+                models.Subquery(favorite_count, output_field=models.IntegerField()), 0
+            ),
         )
 
 LANGUAGE_CHOICES = [
