@@ -6,7 +6,7 @@ import zipfile
 from datetime import datetime, timedelta
 
 from django.db.models import Avg, Count, Min, Q, Sum
-from django.db.models.functions import TruncDate
+from django.db.models.functions import TruncDate, TruncHour, TruncMonth, TruncWeek
 from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -45,6 +45,40 @@ def get_range_days(request):
 
 def get_cutoff(days):
     return timezone.now() - timedelta(days=days)
+
+
+def get_time_interval(days):
+    if days == 1:
+        return "hour"
+    if days == 90:
+        return "week"
+    if days == 365:
+        return "month"
+    return "day"
+
+
+def time_trunc(field, days, *, date_only=False):
+    interval = "day" if date_only and days == 1 else get_time_interval(days)
+    trunc = {
+        "hour": TruncHour,
+        "day": TruncDate,
+        "week": TruncWeek,
+        "month": TruncMonth,
+    }[interval]
+    return trunc(field)
+
+
+def python_time_bucket(value, days):
+    local = timezone.localtime(value)
+    interval = get_time_interval(days)
+    if interval == "hour":
+        return local.replace(minute=0, second=0, microsecond=0)
+    day = local.date()
+    if interval == "week":
+        return day - timedelta(days=day.weekday())
+    if interval == "month":
+        return day.replace(day=1)
+    return day
 
 
 def _content_identity(user_id, visitor_id):
@@ -290,7 +324,7 @@ def build_content_data(days):
 
     views_over_time = (
         StoryView.objects.filter(created_at__gte=cutoff)
-        .annotate(day=TruncDate("created_at"))
+        .annotate(day=time_trunc("created_at", days))
         .values("day")
         .annotate(count=Count("id"))
         .order_by("day")
@@ -333,9 +367,10 @@ def build_content_data(days):
 
     publishing_over_time = (
         Story.objects.filter(published_story_q(), site_published_date__gte=cutoff.date())
-        .values("site_published_date")
+        .annotate(day=time_trunc("site_published_date", days, date_only=True))
+        .values("day")
         .annotate(count=Count("id"))
-        .order_by("site_published_date")
+        .order_by("day")
     )
 
     # Blog has no site_published_date-style field — its own BlogSerializer
@@ -343,7 +378,7 @@ def build_content_data(days):
     # (published_at = source="created_at"), so this mirrors that.
     blog_publishing_over_time = (
         Blog.objects.filter(published_blog_q(), created_at__gte=cutoff)
-        .annotate(day=TruncDate("created_at"))
+        .annotate(day=time_trunc("created_at", days))
         .values("day")
         .annotate(count=Count("id"))
         .order_by("day")
@@ -366,6 +401,8 @@ def build_content_data(days):
 
     return {
         "range_days": days,
+        "time_interval": get_time_interval(days),
+        "publishing_interval": "day" if days == 1 else get_time_interval(days),
         "views_over_time": [{"day": row["day"], "count": row["count"]} for row in views_over_time],
         "genre_performance": genre_performance,
         "story_type_breakdown": [
@@ -387,7 +424,7 @@ def build_content_data(days):
             for row in completion_split
         ],
         "publishing_over_time": [
-            {"day": row["site_published_date"], "count": row["count"]} for row in publishing_over_time
+            {"day": row["day"], "count": row["count"]} for row in publishing_over_time
         ],
         "blog_publishing_over_time": [
             {"day": row["day"], "count": row["count"]} for row in blog_publishing_over_time
@@ -435,7 +472,7 @@ def build_engagement_data(days):
 
     favorites_over_time = (
         Favorite.objects.filter(created_at__gte=cutoff)
-        .annotate(day=TruncDate("created_at"))
+        .annotate(day=time_trunc("created_at", days))
         .values("day")
         .annotate(count=Count("id"))
         .order_by("day")
@@ -447,7 +484,7 @@ def build_engagement_data(days):
 
     rating_trend = (
         Review.objects.filter(created_at__gte=cutoff)
-        .annotate(day=TruncDate("created_at"))
+        .annotate(day=time_trunc("created_at", days))
         .values("day")
         .annotate(avg_rating=Avg("rating"), count=Count("id"))
         .order_by("day")
@@ -460,6 +497,7 @@ def build_engagement_data(days):
 
     return {
         "range_days": days,
+        "time_interval": get_time_interval(days),
         "reading_progress_buckets": reading_progress_buckets,
         "chapter_dropoff": [
             {
@@ -496,7 +534,7 @@ def build_users_data(days):
 
     signups_over_time = (
         User.objects.filter(date_joined__gte=cutoff)
-        .annotate(day=TruncDate("date_joined"))
+        .annotate(day=time_trunc("date_joined", days))
         .values("day")
         .annotate(count=Count("id"))
         .order_by("day")
@@ -518,6 +556,7 @@ def build_users_data(days):
 
     return {
         "range_days": days,
+        "time_interval": get_time_interval(days),
         "signups_over_time": [{"day": row["day"], "count": row["count"]} for row in signups_over_time],
         "total_users": User.objects.count(),
         "active_users": active_users,
@@ -550,7 +589,7 @@ def build_geography_data(days):
     )
 
     logins_over_time = (
-        logins.annotate(day=TruncDate("created_at"))
+        logins.annotate(day=time_trunc("created_at", days))
         .values("day")
         .annotate(count=Count("id"), users=Count("user", distinct=True))
         .order_by("day")
@@ -560,6 +599,7 @@ def build_geography_data(days):
 
     return {
         "range_days": days,
+        "time_interval": get_time_interval(days),
         "total_logins": total_logins,
         # Logins ip-api.com couldn't resolve (private/local IP,
         # provider timeout/outage) — surfaced so a suspiciously high
@@ -596,7 +636,7 @@ def build_submissions_data(days):
     submissions_qs = Submission.objects.filter(created_at__gte=cutoff)
 
     submissions_over_time = (
-        submissions_qs.annotate(day=TruncDate("created_at"))
+        submissions_qs.annotate(day=time_trunc("created_at", days))
         .values("day", "status")
         .annotate(count=Count("id"))
         .order_by("day")
@@ -633,6 +673,7 @@ def build_submissions_data(days):
 
     return {
         "range_days": days,
+        "time_interval": get_time_interval(days),
         "submissions_over_time": [
             {"day": row["day"], "status": row["status"], "count": row["count"]}
             for row in submissions_over_time
@@ -649,7 +690,7 @@ def build_audience_data(days):
     events = AnalyticsEvent.objects.filter(created_at__gte=cutoff)
 
     daily_events = (
-        events.annotate(day=TruncDate("created_at"))
+        events.annotate(day=time_trunc("created_at", days))
         .values("day", "event_type")
         .annotate(count=Count("id"), duration_seconds=Sum("duration_seconds"))
         .order_by("day")
@@ -691,7 +732,7 @@ def build_audience_data(days):
             event_type=AnalyticsEvent.EVENT_LISTENING_SESSION,
             metadata__format="read_along",
         )
-        .annotate(day=TruncDate("created_at"))
+        .annotate(day=time_trunc("created_at", days))
         .values("day")
         .annotate(duration_seconds=Sum("duration_seconds"))
     ):
@@ -738,7 +779,7 @@ def build_audience_data(days):
         event_type=AnalyticsEvent.EVENT_VISIT
     ).values_list("user_id", "visitor_id", "session_id", "created_at", "metadata"):
         identity = f"u:{user_id}" if user_id else f"v:{visitor_id}"
-        day = timezone.localtime(created_at).date()
+        day = python_time_bucket(created_at, days)
         visitor_days.setdefault(day, set()).add(identity)
 
         path = (metadata or {}).get("path") or "unknown"
@@ -787,7 +828,7 @@ def build_audience_data(days):
         for identity in visitor_days[day]:
             all_visitors.add(identity)
             first = first_seen.get(identity)
-            if first and timezone.localtime(first).date() < day:
+            if first and python_time_bucket(first, days) < day:
                 returning_ids.add(identity)
                 returning_visitors.add(identity)
             else:
@@ -931,6 +972,7 @@ def build_audience_data(days):
 
     return {
         "range_days": days,
+        "time_interval": get_time_interval(days),
         "summary": {
             "visitors": len(all_visitors),
             "returning_visitors": len(returning_visitors),

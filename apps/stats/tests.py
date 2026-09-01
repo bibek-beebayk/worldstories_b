@@ -480,6 +480,11 @@ class AdminContentAnalyticsApiTests(APITestCase):
         last_day = self.client.get(reverse("admin-analytics-content"), {"days": 1})
         self.assertEqual(last_day.status_code, 200)
         self.assertEqual(last_day.data["range_days"], 1)
+        self.assertEqual(last_day.data["time_interval"], "hour")
+        self.assertEqual(last_day.data["publishing_interval"], "day")
+
+        last_90_days = self.client.get(reverse("admin-analytics-content"), {"days": 90})
+        self.assertEqual(last_90_days.data["time_interval"], "week")
 
     def test_content_analytics_includes_ranked_story_and_blog_metrics(self):
         StoryView.objects.create(story=self.plain_story, ip_address="127.0.0.1")
