@@ -6,8 +6,9 @@ import uuid
 from rest_framework.viewsets import ReadOnlyModelViewSet, ModelViewSet
 from rest_framework.views import APIView
 from django.core.exceptions import ValidationError as DjangoValidationError
-from django.db.models import Sum, Avg, Count, Exists, F, OuterRef, Prefetch
+from django.db.models import Sum, Avg, Count, Exists, F, IntegerField, OuterRef, Prefetch, Subquery
 from django.db.models import Q
+from django.db.models.functions import Coalesce
 from django.http import FileResponse, HttpResponse, StreamingHttpResponse
 from django.db import transaction
 from django.utils import timezone
@@ -447,6 +448,37 @@ class StoryViewSet(ReadOnlyModelViewSet):
         # detail actions (chapter, favorite, reviews, etc.) must still resolve
         # any specific translation directly by its own slug, e.g. for the
         # Translations panel's "switch language" links to keep working.
+        if self.action == "retrieve":
+            # Story detail renders tags/themes as badges that link out only when
+            # the tag/theme has other published stories — annotate each with its
+            # published-story count so TagSerializer/ThemeSerializer read the
+            # annotation instead of one COUNT query per badge. A correlated
+            # Subquery rather than Count("stories", ...): the prefetch already
+            # joins the same M2M and restricts it to this story, which would
+            # collapse a plain relation Count to 1.
+            def _published_count(m2m_name):
+                return Coalesce(
+                    Subquery(
+                        Story.objects.filter(published_story_q(), **{m2m_name: OuterRef("pk")})
+                        .order_by()
+                        .values(m2m_name)
+                        .annotate(n=Count("pk"))
+                        .values("n"),
+                        output_field=IntegerField(),
+                    ),
+                    0,
+                )
+
+            queryset = queryset.prefetch_related(
+                Prefetch(
+                    "tags",
+                    queryset=Tag.objects.annotate(published_stories_count=_published_count("tags")),
+                ),
+                Prefetch(
+                    "themes",
+                    queryset=Theme.objects.annotate(published_stories_count=_published_count("themes")),
+                ),
+            )
         if self.action == "list":
             queryset = with_preferred_translation_only(
                 queryset,

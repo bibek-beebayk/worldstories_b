@@ -75,7 +75,7 @@ def sitemap(request):
         Story.objects.published()
         .exclude(story_type__name="Summary")
         .prefetch_related("chapters")
-        .only("slug", "site_published_date")
+        .only("slug", "site_published_date", "is_original")
     )
     for story in stories.iterator(chunk_size=2000):
         last_modified = (
@@ -87,6 +87,13 @@ def sitemap(request):
             f"<url><loc>{escape(f'{site_url}/story/{story.slug}')}</loc>"
             f"{last_modified}</url>"
         )
+        # Individual chapter pages: only WorldStories Originals get one. A PD
+        # title's chapters are largely duplicate text available on many other
+        # sites and carry little unique editorial value per page, so they're
+        # kept off the sitemap; Originals chapters are unique first-party
+        # fiction that exists nowhere else, so they stay indexed.
+        if not story.is_original:
+            continue
         for chapter in story.chapters.all():
             if not chapter.slug:
                 continue
@@ -108,13 +115,20 @@ def sitemap(request):
             f"<url><loc>{escape(f'{site_url}/authors/{author.id}')}</loc></url>"
         )
 
+    # Tag/theme pages were orphaned (unreachable from the site) and thin (no
+    # curated description). Now that story pages link out to them, they're only
+    # worth offering to search engines once they represent a real collection —
+    # 10+ published stories — rather than a one- or two-story landing page.
+    # Genres/categories keep the >0 threshold (they've always been surfaced).
+    TAXONOMY_SITEMAP_MIN_STORIES = 10
+
     tags = (
         Tag.objects.annotate(
             published_stories_count=Count(
                 "stories", filter=published_story_q("stories"), distinct=True
             )
         )
-        .filter(published_stories_count__gt=0)
+        .filter(published_stories_count__gte=TAXONOMY_SITEMAP_MIN_STORIES)
         .only("slug")
     )
     for tag in tags.iterator():
@@ -128,7 +142,7 @@ def sitemap(request):
                 "stories", filter=published_story_q("stories"), distinct=True
             )
         )
-        .filter(published_stories_count__gt=0)
+        .filter(published_stories_count__gte=TAXONOMY_SITEMAP_MIN_STORIES)
         .only("slug")
     )
     for theme in themes.iterator():

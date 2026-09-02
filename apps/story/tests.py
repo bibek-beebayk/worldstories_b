@@ -1287,6 +1287,8 @@ class ScheduledPublishingTests(SimpleTestCase):
     def test_public_queryset_is_built_for_each_request(self, published):
         queryset = MagicMock()
         queryset.select_related.return_value.prefetch_related.return_value.order_by.return_value = queryset
+        # The retrieve action adds a second prefetch_related() for tags/themes.
+        queryset.prefetch_related.return_value = queryset
         published.return_value = queryset
         view = StoryViewSet()
         view.action = "retrieve"
@@ -1304,6 +1306,11 @@ class ScheduledPublishingTests(SimpleTestCase):
             ("genres", "categories", "videos"),
         )
         self.assertEqual(prefetch_args[2].prefetch_through, "audios")
+        # retrieve-only: annotated Prefetch for tags + themes (story-detail badges).
+        tag_theme_args = queryset.prefetch_related.call_args.args
+        self.assertEqual(
+            {arg.prefetch_through for arg in tag_theme_args}, {"tags", "themes"}
+        )
 
     @patch("django.db.models.Model.save")
     def test_scheduled_story_uses_schedule_date_as_site_date(self, model_save):
@@ -1334,15 +1341,22 @@ class ScheduledPublishingTests(SimpleTestCase):
         self, published, blogs_published, authors_all, tags_annotate, themes_annotate, genres_annotate, categories_annotate
     ):
         chapter = SimpleNamespace(slug="chapter-one")
-        story = SimpleNamespace(
+        original = SimpleNamespace(
             slug="visible-story",
             site_published_date=date(2026, 8, 2),
+            is_original=True,
             chapters=SimpleNamespace(all=lambda: [chapter]),
+        )
+        pd_story = SimpleNamespace(
+            slug="public-domain-book",
+            site_published_date=date(2026, 8, 2),
+            is_original=False,
+            chapters=SimpleNamespace(all=lambda: [SimpleNamespace(slug="pd-chapter-one")]),
         )
         queryset = MagicMock()
         (
             queryset.exclude.return_value.prefetch_related.return_value.only.return_value.iterator.return_value
-        ) = iter([story])
+        ) = iter([original, pd_story])
         published.return_value = queryset
         blogs_published.return_value.only.return_value.iterator.return_value = iter([])
         authors_all.return_value.only.return_value.iterator.return_value = iter([])
@@ -1352,12 +1366,19 @@ class ScheduledPublishingTests(SimpleTestCase):
         response = sitemap(RequestFactory().get("/api/sitemap.xml"))
         xml = response.content.decode()
 
+        # Both stories get a /story/ entry; only the Originals title's chapter
+        # pages are listed — a public-domain title's are thin/duplicate content.
         self.assertContains(response, "/story/visible-story")
+        self.assertContains(response, "/story/public-domain-book")
         self.assertContains(response, "/read/visible-story/chapter-one")
+        self.assertNotIn("/read/public-domain-book/pd-chapter-one", xml)
         self.assertContains(response, "/story-map")
         self.assertIn("<lastmod>2026-08-02</lastmod>", xml)
         published.assert_called_once_with()
         queryset.exclude.assert_called_once_with(story_type__name="Summary")
+        queryset.exclude.return_value.prefetch_related.return_value.only.assert_called_once_with(
+            "slug", "site_published_date", "is_original"
+        )
 
 
 class BlogModelTests(TestCase):
@@ -1399,6 +1420,26 @@ class BlogModelTests(TestCase):
         self.assertContains(response, "/blog/live-post")
         self.assertNotContains(response, "/blog/draft-post")
         self.assertNotContains(response, "/blog/scheduled-post")
+
+    def test_sitemap_lists_chapter_pages_only_for_worldstories_originals(self):
+        pd_story = Story.objects.create(
+            title="A Public Domain Novel", slug="pd-novel", is_published=True, is_original=False
+        )
+        Chapter.objects.create(story=pd_story, title="Chapter 1", slug="pd-ch-1", content="<p>x</p>", order=1)
+        original = Story.objects.create(
+            title="The Repair Shop", slug="the-repair-shop", is_published=True, is_original=True
+        )
+        Chapter.objects.create(story=original, title="Chapter 1", slug="orig-ch-1", content="<p>x</p>", order=1)
+
+        response = sitemap(RequestFactory().get("/api/sitemap.xml"))
+        xml = response.content.decode()
+
+        # Story-level pages listed for both, regardless of flag.
+        self.assertIn("/story/pd-novel", xml)
+        self.assertIn("/story/the-repair-shop", xml)
+        # Chapter pages: Originals only.
+        self.assertIn("/read/the-repair-shop/orig-ch-1", xml)
+        self.assertNotIn("/read/pd-novel/pd-ch-1", xml)
 
 
 class BlogAdminApiTests(APITestCase):
@@ -1826,6 +1867,63 @@ class PublicAuthorApiTests(APITestCase):
         self.assertNotIn(current.slug, slugs)
         self.assertNotIn(draft.slug, slugs)
         self.assertNotIn(translation.slug, slugs)
+
+    def test_story_detail_serializes_tags_and_themes_with_published_counts(self):
+        current = Story.objects.get(slug="published-book")
+        shared_tag = Tag.objects.create(name="Adventure", slug="adventure")
+        solo_theme = Theme.objects.create(name="Coming of Age", slug="coming-of-age")
+        current.tags.add(shared_tag)
+        current.themes.add(solo_theme)
+        other = Story.objects.create(title="Also Adventure", slug="also-adventure", is_published=True)
+        other.tags.add(shared_tag)
+        draft = Story.objects.create(title="Draft Adventure", slug="draft-adv", is_published=False)
+        draft.tags.add(shared_tag)
+
+        response = self.client.get(reverse("story-detail", args=[current.slug]))
+
+        self.assertEqual(response.status_code, 200)
+        tags = {t["slug"]: t for t in response.data["tags"]}
+        themes = {t["slug"]: t for t in response.data["themes"]}
+        # shared_tag: this story + one other published (the draft doesn't count)
+        self.assertEqual(tags[shared_tag.slug]["stories_count"], 2)
+        # solo_theme: only this story
+        self.assertEqual(themes[solo_theme.slug]["stories_count"], 1)
+
+    def test_story_detail_query_count_is_flat_across_tag_and_theme_counts(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        current = Story.objects.get(slug="published-book")
+
+        def add_tags(count, prefix):
+            for i in range(count):
+                tag = Tag.objects.create(name=f"{prefix} Tag {i}", slug=f"{prefix}-tag-{i}")
+                theme = Theme.objects.create(name=f"{prefix} Theme {i}", slug=f"{prefix}-theme-{i}")
+                current.tags.add(tag)
+                current.themes.add(theme)
+                other = Story.objects.create(
+                    title=f"{prefix} {i}", slug=f"{prefix}-{i}", is_published=True
+                )
+                other.tags.add(tag)
+                other.themes.add(theme)
+
+        add_tags(3, "a")
+        with CaptureQueriesContext(connection) as few:
+            self.client.get(reverse("story-detail", args=[current.slug]))
+
+        add_tags(6, "b")
+        with CaptureQueriesContext(connection) as many:
+            response = self.client.get(reverse("story-detail", args=[current.slug]))
+
+        # Tripling the tag/theme count doesn't grow the query count — the
+        # prefetched Tag/Theme querysets carry published_stories_count, so
+        # there's no per-badge COUNT. (A tiny tolerance covers unrelated
+        # similar-stories prefetch variance; an N+1 would be ~+18 here.)
+        self.assertLessEqual(
+            len(many.captured_queries), len(few.captured_queries) + 3
+        )
+        self.assertEqual(len(response.data["tags"]), 9)
+        self.assertEqual(len(response.data["themes"]), 9)
 
     def test_search_returns_authors_and_titles_in_separate_sections(self):
         response = self.client.get(reverse("search-data"), {"q": "Visible Writer"})

@@ -687,6 +687,11 @@ class StoryDetailSerializer(serializers.ModelSerializer):
     story_type = serializers.CharField(source="story_type.name", read_only=True)
     genres = GenreSerializer(many=True, read_only=True)
     categories = CategorySerializer(many=True, read_only=True)
+    # Nested (with stories_count) rather than the default PK list: the story
+    # page renders these as badges that link out to /tag|/theme only when the
+    # tag/theme has other published stories (stories_count > 1).
+    tags = TagSerializer(many=True, read_only=True)
+    themes = ThemeSerializer(many=True, read_only=True)
     author = AuthorSerializer(read_only=True)
     submitted_by = serializers.SerializerMethodField()
     chapter_count = serializers.SerializerMethodField()
