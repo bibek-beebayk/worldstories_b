@@ -5,6 +5,7 @@ from rest_framework.response import Response
 from rest_framework import status
 from rest_framework.throttling import SimpleRateThrottle
 
+from apps.stats.achievements import evaluate as evaluate_achievements, serialize_earned
 from apps.stats.completion import record_completion_if_finished
 from apps.story.api import is_untracked_request
 from apps.story.models import Blog, Story
@@ -44,6 +45,9 @@ def annotate_completion(payload, completion):
     """
     payload["story_completed"] = bool(completion)
     payload["unlocked_country"] = getattr(completion, "unlocked_country", None)
+    payload["unlocked_achievements"] = serialize_earned(
+        getattr(completion, "unlocked_achievements", []) or []
+    )
     return payload
 
 
@@ -80,8 +84,20 @@ class AnalyticsEventCreateAPIView(APIView):
         )
         serializer.is_valid(raise_exception=True)
         event = serializer.save()
+
+        # The one event type that moves an achievement counter and has no
+        # server-side write of its own to hang off. Everything else is
+        # triggered where it happens — see apps/stats/achievements.py.
+        unlocked = []
+        if event.event_type == AnalyticsEvent.EVENT_QUICK_READ_COMPLETED:
+            unlocked = evaluate_achievements(request.user, "quick_read_completed")
+
         return Response(
-            {"event_id": str(event.event_id)}, status=status.HTTP_201_CREATED
+            {
+                "event_id": str(event.event_id),
+                "unlocked_achievements": serialize_earned(unlocked),
+            },
+            status=status.HTTP_201_CREATED,
         )
 
 

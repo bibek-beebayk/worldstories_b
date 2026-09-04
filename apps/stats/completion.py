@@ -150,4 +150,11 @@ def record_completion_if_finished(user, story):
         # this response, not of the row.
         completion.unlocked_country = unlocked
 
+    # Evaluated here rather than anywhere achievements are read: §6.3 forbids
+    # recalculating on page view, and this is the write that could have moved
+    # a reading, genre, country or streak counter.
+    from apps.stats.achievements import evaluate
+
+    completion.unlocked_achievements = evaluate(user, "story_completed")
+
     return completion

@@ -24,14 +24,17 @@ from apps.story.api import IsSuperUser
 from apps.story.models import Audio, Chapter, Favorite, Review, Story, Video
 from apps.story.serializers import StoryListSerializer
 from apps.stats.models import (
+    Achievement,
     AnalyticsEvent,
     StoryCompletion,
+    UserAchievement,
     ReadingProgress,
     ChapterReadingProgress,
     AudioReadingProgress,
     VideoWatchProgress,
     FileReadingProgress,
 )
+from apps.stats.achievements import evaluate as evaluate_achievements, serialize_earned
 from apps.stats.passport import COUNTRY_NAMES, passport_summary
 from apps.stats.streaks import compute_streak
 from apps.story.excerpts import excerpt_at_progress
@@ -147,6 +150,7 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
             "library_continue_reading",
             "library_completed_reading",
             "library_reading_history",
+            "achievements",
             "story_passport",
             "story_passport_country",
             "library_continue_listening",
@@ -560,7 +564,20 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
         ).values_list("created_at", flat=True)
         activity_dates = {timezone.localtime(created_at).date() for created_at in created_ats}
         current_streak, longest_streak = compute_streak(activity_dates, timezone.localdate())
-        return Response({"current_streak": current_streak, "longest_streak": longest_streak})
+
+        # The one measure with no write behind it — a streak grows because a
+        # day passed, not because anything was saved. Evaluated here, where it
+        # has just been computed anyway, and scoped to the two streak
+        # achievements rather than the whole catalogue (§6.3).
+        unlocked = evaluate_achievements(request.user, "streak_changed")
+
+        return Response(
+            {
+                "current_streak": current_streak,
+                "longest_streak": longest_streak,
+                "unlocked_achievements": serialize_earned(unlocked),
+            }
+        )
 
     @action(detail=False, methods=["get"], url_path="library/continue-reading")
     def library_continue_reading(self, request):
@@ -795,6 +812,52 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
             payload, many=True, context={"request": request}
         )
         return Response(serializer.data)
+
+    @action(detail=False, methods=["get"], url_path="achievements")
+    def achievements(self, request):
+        """The reader's achievements, earned and in progress.
+
+        A pure read: it reports the progress already recorded by the triggers
+        and never recalculates, which is what §6.3 rules out. A counter that
+        looks stale here means a trigger is missing, not that this endpoint
+        should start measuring.
+        """
+        rows = {
+            row.achievement_id: row
+            for row in UserAchievement.objects.filter(user=request.user)
+        }
+        catalogue = Achievement.objects.filter(active=True)
+
+        earned_ids = {
+            achievement_id for achievement_id, row in rows.items() if row.completed
+        }
+        results = [
+            {
+                "slug": achievement.slug,
+                "name": achievement.name,
+                "description": achievement.description,
+                "category": achievement.category,
+                "icon": achievement.icon,
+                "target_value": achievement.target_value,
+                "progress": min(
+                    getattr(rows.get(achievement.id), "progress", 0),
+                    achievement.target_value,
+                ),
+                "completed": achievement.id in earned_ids,
+                "completed_at": getattr(rows.get(achievement.id), "completed_at", None),
+            }
+            for achievement in catalogue
+            # A hidden achievement stays out of the list until it is earned.
+            if not achievement.hidden or achievement.id in earned_ids
+        ]
+
+        return Response(
+            {
+                "earned": len(earned_ids),
+                "total": len(results),
+                "results": results,
+            }
+        )
 
     @action(detail=False, methods=["get"], url_path="story-passport")
     def story_passport(self, request):

@@ -249,6 +249,9 @@ class AnalyticsEvent(models.Model):
     # completion that caused it, so it is exactly-once per reader per country.
     EVENT_COUNTRY_UNLOCKED = "country_unlocked"
     EVENT_PASSPORT_VIEWED = "passport_viewed"
+    # Raised by the server beside the award itself (apps/stats/achievements.py),
+    # so it inherits the conditional update that makes awarding once-only.
+    EVENT_ACHIEVEMENT_UNLOCKED = "achievement_unlocked"
     EVENT_CHOICES = [
         (EVENT_VISIT, "Visit"),
         (EVENT_AD_IMPRESSION, "Ad impression"),
@@ -269,6 +272,7 @@ class AnalyticsEvent(models.Model):
         (EVENT_NEXT_STORY_CLICKED, "Next story clicked"),
         (EVENT_COUNTRY_UNLOCKED, "Country unlocked"),
         (EVENT_PASSPORT_VIEWED, "Passport viewed"),
+        (EVENT_ACHIEVEMENT_UNLOCKED, "Achievement unlocked"),
     ]
 
     # visitor_id for an event the server raises itself rather than receiving
@@ -391,3 +395,112 @@ class StoryCompletion(models.Model):
 
     def __str__(self):
         return f"{self.user} completed {self.story} ({self.source})"
+
+
+class Achievement(models.Model):
+    """A goal a reader can reach, defined as data rather than code.
+
+    Everything about an achievement — what it measures, how far, whether it is
+    shown before it is earned — lives in a row, so the catalogue can grow
+    without a deploy. `target_type` names the measure and `target_value` the
+    threshold, which is what lets one evaluator serve every achievement
+    (see apps/stats/achievements.py) rather than a branch per badge.
+
+    Deliberately *not* points, coins or a currency: the source document rules
+    out generic gamification, and every target below is a count of real reading.
+    """
+
+    CATEGORY_READING = "reading"
+    CATEGORY_COUNTRIES = "countries"
+    CATEGORY_GENRE = "genre"
+    CATEGORY_STREAK = "streak"
+    CATEGORY_QUICK_READ = "quick_read"
+    CATEGORY_CHOICES = [
+        (CATEGORY_READING, "Reading"),
+        (CATEGORY_COUNTRIES, "Countries"),
+        (CATEGORY_GENRE, "Genre"),
+        (CATEGORY_STREAK, "Streak"),
+        (CATEGORY_QUICK_READ, "Quick Read"),
+    ]
+
+    # What the achievement counts. Each maps to one measure function in
+    # apps/stats/achievements.py; adding a type means adding that function.
+    TARGET_STORIES_COMPLETED = "stories_completed"
+    TARGET_COUNTRIES_EXPLORED = "countries_explored"
+    TARGET_GENRE_COMPLETED = "genre_completed"
+    TARGET_STREAK_DAYS = "streak_days"
+    TARGET_QUICK_READS_COMPLETED = "quick_reads_completed"
+    TARGET_TYPE_CHOICES = [
+        (TARGET_STORIES_COMPLETED, "Stories completed"),
+        (TARGET_COUNTRIES_EXPLORED, "Countries explored"),
+        (TARGET_GENRE_COMPLETED, "Stories completed in a genre"),
+        (TARGET_STREAK_DAYS, "Longest reading streak, in days"),
+        (TARGET_QUICK_READS_COMPLETED, "Quick Reads completed"),
+    ]
+
+    name = models.CharField(max_length=120)
+    slug = models.SlugField(max_length=140, unique=True)
+    description = models.CharField(max_length=280)
+    category = models.CharField(max_length=20, choices=CATEGORY_CHOICES, db_index=True)
+    # An emoji rather than an asset: a badge set is a design project, and this
+    # keeps the catalogue editable without one.
+    icon = models.CharField(max_length=8, blank=True)
+    target_type = models.CharField(max_length=32, choices=TARGET_TYPE_CHOICES, db_index=True)
+    target_value = models.PositiveIntegerField()
+    # Which genre a genre achievement counts, as a slug. A plain field rather
+    # than an FK because it is meaningless for every other target type, and an
+    # always-null FK on most rows would invite exactly the wrong queries.
+    target_key = models.CharField(max_length=140, blank=True)
+    active = models.BooleanField(default=True, db_index=True)
+    # Hidden achievements are not listed until earned. None are hidden today;
+    # the flag exists so a surprise can be added without a schema change.
+    hidden = models.BooleanField(default=False)
+    # Display order within a category — "10 stories" should sit above "25"
+    # regardless of name or creation order.
+    order = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        ordering = ["category", "order", "target_value"]
+        indexes = [
+            models.Index(fields=["active", "target_type"], name="stats_achievement_active_idx"),
+        ]
+
+    def __str__(self):
+        return f"{self.name} ({self.target_type} >= {self.target_value})"
+
+
+class UserAchievement(models.Model):
+    """One reader's progress toward one achievement.
+
+    A row exists as soon as there is progress worth recording, so the profile
+    can show "7 of 10" rather than only a binary earned/not. `completed_at` is
+    set exactly once, by the conditional update in
+    apps/stats/achievements.py::award — never by re-saving this model, which is
+    what keeps a re-run of a trigger from re-awarding.
+    """
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="achievements",
+    )
+    achievement = models.ForeignKey(
+        Achievement,
+        on_delete=models.CASCADE,
+        related_name="user_achievements",
+    )
+    progress = models.PositiveIntegerField(default=0)
+    completed = models.BooleanField(default=False)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = ("user", "achievement")
+        indexes = [
+            models.Index(fields=["user", "completed"], name="stats_userach_user_idx"),
+        ]
+        ordering = ["-completed_at", "achievement__order"]
+
+    def __str__(self):
+        state = "completed" if self.completed else f"{self.progress}/{self.achievement.target_value}"
+        return f"{self.user} — {self.achievement.name} ({state})"

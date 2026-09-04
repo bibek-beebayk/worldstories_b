@@ -7,17 +7,19 @@ from django.urls import reverse
 from django.utils import timezone
 from rest_framework.test import APIClient, APITestCase
 
-from apps.story.models import Audio, Chapter, Video, Blog, Story, StoryView, Submission
+from apps.story.models import Audio, Chapter, Genre, Video, Blog, Story, StoryView, Submission
 from apps.users.models import User
 
 from .completion import COMPLETION_THRESHOLD
 from .models import (
+    Achievement,
     AnalyticsEvent,
     AudioReadingProgress,
     ChapterReadingProgress,
     FileReadingProgress,
     ReadingProgress,
     StoryCompletion,
+    UserAchievement,
     VideoWatchProgress,
 )
 from .streaks import compute_streak
@@ -1460,5 +1462,212 @@ class StoryPassportTests(APITestCase):
         self.client.force_authenticate(None)
 
         response = self.client.get(reverse("auth-story-passport"), format="json")
+
+        self.assertIn(response.status_code, (401, 403))
+
+
+class AchievementTests(APITestCase):
+    """Awarded incrementally, once, and never on a read path (§6.3)."""
+
+    def setUp(self):
+        cache.clear()
+        self.client = APIClient(HTTP_USER_AGENT=BROWSER_USER_AGENT)
+        self.user = User.objects.create_user(
+            email="achiever@example.com", username="achiever", password="test-password"
+        )
+        self.client.force_authenticate(self.user)
+
+    def _story(self, slug, country="", genres=()):
+        story = Story.objects.create(
+            title=slug, slug=slug, is_published=True, country=country
+        )
+        Chapter.objects.create(
+            story=story, title="One", slug=f"{slug}-c", order=1, content="<p>text</p>"
+        )
+        if genres:
+            story.genres.set(genres)
+        return story
+
+    def _finish(self, story):
+        return self.client.put(
+            reverse("reading-progress", args=[story.slug]),
+            {"chapter_slug": story.chapters.first().slug, "progress": 1.0},
+            format="json",
+        )
+
+    def _earned_slugs(self):
+        return set(
+            UserAchievement.objects.filter(user=self.user, completed=True).values_list(
+                "achievement__slug", flat=True
+            )
+        )
+
+    def test_the_seeded_catalogue_is_present(self):
+        """Seeded by a data migration, so it exists without any fixture."""
+        self.assertTrue(Achievement.objects.filter(slug="first-story", active=True).exists())
+        self.assertEqual(
+            Achievement.objects.filter(active=True, category="countries").count(), 3
+        )
+
+    def test_finishing_a_first_story_earns_the_first_story_achievement(self):
+        response = self._finish(self._story("my-first"))
+
+        self.assertIn("first-story", self._earned_slugs())
+        self.assertEqual(
+            [row["slug"] for row in response.data["unlocked_achievements"]], ["first-story"]
+        )
+
+    def test_an_achievement_is_never_awarded_twice(self):
+        story = self._story("re-read-me")
+        self._finish(story)
+
+        again = self._finish(story)
+
+        self.assertEqual(again.data["unlocked_achievements"], [])
+        self.assertEqual(
+            UserAchievement.objects.filter(
+                user=self.user, achievement__slug="first-story"
+            ).count(),
+            1,
+        )
+
+    def test_re_running_the_trigger_raises_no_second_event(self):
+        from apps.stats.achievements import evaluate
+
+        story = self._story("triggered")
+        self._finish(story)
+        evaluate(self.user, "story_completed")
+        evaluate(self.user, "story_completed")
+
+        self.assertEqual(
+            AnalyticsEvent.objects.filter(
+                event_type=AnalyticsEvent.EVENT_ACHIEVEMENT_UNLOCKED,
+                metadata__achievement="first-story",
+            ).count(),
+            1,
+        )
+
+    def test_progress_is_recorded_before_the_target_is_reached(self):
+        """The profile shows "3 of 10", not just earned/not-earned."""
+        for index in range(3):
+            self._finish(self._story(f"story-{index}"))
+
+        row = UserAchievement.objects.get(
+            user=self.user, achievement__slug="ten-stories"
+        )
+        self.assertEqual(row.progress, 3)
+        self.assertFalse(row.completed)
+
+    def test_countries_and_reading_advance_from_the_same_completion(self):
+        for index in range(5):
+            self._finish(self._story(f"country-{index}", country=f"J{index}"[:2]))
+
+        # Five distinct countries, five stories.
+        earned = self._earned_slugs()
+        self.assertIn("first-story", earned)
+
+    def test_a_genre_achievement_counts_only_its_own_genre(self):
+        folklore = Genre.objects.create(name="Folklore", slug="folklore")
+        Genre.objects.create(name="Myth", slug="myth-other")
+        for index in range(10):
+            self._finish(self._story(f"folk-{index}", genres=[folklore]))
+
+        self.assertIn("ten-folklore", self._earned_slugs())
+        self.assertNotIn("ten-classic", self._earned_slugs())
+
+    def test_a_genre_achievement_for_a_genre_that_does_not_exist_never_progresses(self):
+        """The seeded genre slugs are examples; a site with a different
+        taxonomy must not break."""
+        self._finish(self._story("ungenred"))
+
+        row = UserAchievement.objects.filter(
+            user=self.user, achievement__slug="ten-adventure"
+        ).first()
+        self.assertTrue(row is None or row.progress == 0)
+
+    def test_quick_read_achievements_count_distinct_summaries(self):
+        from apps.stats.achievements import evaluate
+
+        story = self._story("summary-story")
+        for _ in range(3):
+            AnalyticsEvent.objects.create(
+                event_type=AnalyticsEvent.EVENT_QUICK_READ_COMPLETED,
+                user=self.user, story=story, visitor_id="v",
+            )
+        evaluate(self.user, "quick_read_completed")
+
+        row = UserAchievement.objects.get(
+            user=self.user, achievement__slug="ten-quick-reads"
+        )
+        # Re-reading one summary is not three Quick Reads.
+        self.assertEqual(row.progress, 1)
+
+    def test_a_trigger_only_measures_what_it_could_have_moved(self):
+        """§6.3: no full recalculation. Finishing a story must not go and
+        count Quick Reads."""
+        from apps.stats.achievements import evaluate
+
+        story = self._story("scoped")
+        AnalyticsEvent.objects.create(
+            event_type=AnalyticsEvent.EVENT_QUICK_READ_COMPLETED,
+            user=self.user, story=story, visitor_id="v",
+        )
+
+        evaluate(self.user, "story_completed")
+
+        self.assertFalse(
+            UserAchievement.objects.filter(
+                user=self.user, achievement__target_type="quick_reads_completed"
+            ).exists()
+        )
+
+    def test_an_unknown_trigger_does_nothing(self):
+        from apps.stats.achievements import evaluate
+
+        self.assertEqual(evaluate(self.user, "something_else"), [])
+
+    def test_an_anonymous_reader_earns_nothing(self):
+        from apps.stats.achievements import evaluate
+        from django.contrib.auth.models import AnonymousUser
+
+        self.assertEqual(evaluate(AnonymousUser(), "story_completed"), [])
+
+    def test_an_inactive_achievement_is_not_awarded(self):
+        Achievement.objects.filter(slug="first-story").update(active=False)
+
+        self._finish(self._story("quietly"))
+
+        self.assertNotIn("first-story", self._earned_slugs())
+
+    def test_the_achievements_endpoint_lists_progress_without_recalculating(self):
+        for index in range(2):
+            self._finish(self._story(f"listed-{index}"))
+        # Anything the endpoint reported beyond what the triggers recorded would
+        # mean it is measuring, which §6.3 rules out.
+        UserAchievement.objects.filter(achievement__slug="ten-stories").update(progress=0)
+
+        response = self.client.get(reverse("auth-achievements"))
+
+        self.assertEqual(response.status_code, 200)
+        rows = {row["slug"]: row for row in response.data["results"]}
+        self.assertEqual(response.data["earned"], 1)
+        self.assertTrue(rows["first-story"]["completed"])
+        self.assertEqual(rows["ten-stories"]["progress"], 0)
+        self.assertEqual(rows["ten-stories"]["target_value"], 10)
+
+    def test_reported_progress_never_exceeds_the_target(self):
+        for index in range(3):
+            self._finish(self._story(f"capped-{index}"))
+
+        rows = {
+            row["slug"]: row
+            for row in self.client.get(reverse("auth-achievements")).data["results"]
+        }
+        self.assertEqual(rows["first-story"]["progress"], 1)
+
+    def test_the_achievements_endpoint_requires_authentication(self):
+        self.client.force_authenticate(None)
+
+        response = self.client.get(reverse("auth-achievements"), format="json")
 
         self.assertIn(response.status_code, (401, 403))
