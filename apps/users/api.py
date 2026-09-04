@@ -25,6 +25,7 @@ from apps.story.models import Audio, Chapter, Favorite, Review, Story, Video
 from apps.story.serializers import StoryListSerializer
 from apps.stats.models import (
     AnalyticsEvent,
+    StoryCompletion,
     ReadingProgress,
     ChapterReadingProgress,
     AudioReadingProgress,
@@ -623,44 +624,56 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
 
     @action(detail=False, methods=["get"], url_path="library/completed-reading")
     def library_completed_reading(self, request):
-        progress_qs = (
-            ReadingProgress.objects.filter(user=request.user)
-            .select_related("story", "chapter")
-            .order_by("-updated_at")
+        """Stories this reader has finished, newest first.
+
+        Reads the durable StoryCompletion record rather than recomputing
+        completion from chapter progress. The old derivation averaged
+        ChapterReadingProgress over the story's chapter count, so an audiobook,
+        a video, an EPUB or a PDF story could never appear here at all — none
+        of them have chapters — and a story with no ReadingProgress row was
+        invisible even when every chapter was finished. See
+        apps/stats/completion.py.
+        """
+        completions = (
+            StoryCompletion.objects.filter(user=request.user)
+            .select_related("story")
+            .order_by("-completed_at")
         )
-        story_ids = [item.story_id for item in progress_qs if item.story_id]
-        chapter_progress_qs = ChapterReadingProgress.objects.filter(
-            user=request.user, story_id__in=story_ids
-        ).select_related("chapter")
 
-        chapter_progress_by_story = {}
-        for item in chapter_progress_qs:
-            chapter_progress_by_story.setdefault(item.story_id, {})[
-                item.chapter.slug
-            ] = max(0.0, min(1.0, item.progress))
-
-        chapter_counts = related_counts_by_story(Chapter, story_ids)
+        story_ids = [item.story_id for item in completions]
         cards = card_stories_by_id(story_ids, request.user)
 
-        payload = []
-        for item in progress_qs:
-            total_chapters = chapter_counts.get(item.story_id, 0)
-            chapter_progress_map = chapter_progress_by_story.get(item.story_id, {})
-            overall_progress = (
-                sum(chapter_progress_map.values()) / total_chapters if total_chapters > 0 else 0.0
-            )
-            if overall_progress < 1:
-                continue
-            payload.append(
-                {
-                    "story": cards.get(item.story_id, item.story),
-                    "chapter_slug": item.chapter.slug if item.chapter else None,
-                    "chapter_title": item.chapter.title if item.chapter else None,
-                    "chapter_progress": max(0.0, min(1.0, item.progress)),
-                    "overall_progress": 1.0,
-                    "updated_at": item.updated_at,
-                }
-            )
+        # The chapter the reader was last on, kept so a finished story still
+        # links somewhere sensible. Absent for a story finished by listening,
+        # watching or reading a file, which is expected rather than an error.
+        last_chapter_by_story = {
+            item.story_id: item.chapter
+            for item in ReadingProgress.objects.filter(
+                user=request.user, story_id__in=story_ids
+            ).select_related("chapter")
+            if item.chapter
+        }
+
+        payload = [
+            {
+                "story": cards.get(item.story_id, item.story),
+                "chapter_slug": (
+                    last_chapter_by_story[item.story_id].slug
+                    if item.story_id in last_chapter_by_story
+                    else None
+                ),
+                "chapter_title": (
+                    last_chapter_by_story[item.story_id].title
+                    if item.story_id in last_chapter_by_story
+                    else None
+                ),
+                "chapter_progress": 1.0,
+                "overall_progress": 1.0,
+                "updated_at": item.completed_at,
+                "excerpt": "",
+            }
+            for item in completions
+        ]
 
         page = self.paginate_queryset(payload)
         if page is not None:

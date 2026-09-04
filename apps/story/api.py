@@ -25,7 +25,7 @@ from rest_framework.filters import SearchFilter
 from apps.story.filters import StoryFilter
 from apps.stats.models import ReadingProgress, AudioReadingProgress, VideoWatchProgress
 from apps.users.models import User
-from apps.users.recommendations import recommend_because_finished
+from apps.users.recommendations import completion_recommendations, recommend_because_finished
 from .models import (
     default_story_type_id,
     Genre,
@@ -786,6 +786,52 @@ class StoryViewSet(ReadOnlyModelViewSet):
         stories = recommend_because_finished(request.user, story)
         serializer = StoryListSerializer(stories, many=True, context={"request": request})
         return Response(serializer.data)
+
+    @action(detail=True, methods=["get"], url_path="completion")
+    def completion(self, request, slug=None):
+        """Everything the end-of-story screen shows: one primary "read next"
+        pick plus the themed sections around it.
+
+        Composed from the same recommendation path as because-finished rather
+        than a second one — see completion_recommendations. Open to anonymous
+        readers, who get the generic similarity ranking instead of a
+        personalized one; the completion screen has to work for a reader who
+        finished a story without an account.
+
+        `country_name` is resolved here because Story.country stores an ISO
+        3166-1 alpha-2 code, and the section heading needs "More from Japan".
+        """
+        story = self.get_object()
+        primary, sections = completion_recommendations(request.user, story)
+        context = {"request": request}
+        country_name = dict(COUNTRY_CHOICES).get(story.country) if story.country else None
+
+        return Response(
+            {
+                "story_slug": story.slug,
+                "story_title": story.title,
+                "country": story.country or None,
+                "country_name": country_name,
+                "primary": (
+                    StoryListSerializer(primary, context=context).data if primary else None
+                ),
+                "sections": [
+                    {
+                        "key": key,
+                        "title": (
+                            f"More from {country_name}"
+                            if key == "more_from_country" and country_name
+                            else title
+                        ),
+                        "stories": StoryListSerializer(
+                            stories, many=True, context=context
+                        ).data,
+                    }
+                    for key, title, stories in sections
+                    if stories
+                ],
+            }
+        )
 
     @action(detail=True, methods=["get"], url_path="pdf-stream")
     def pdf_stream(self, request, slug=None):

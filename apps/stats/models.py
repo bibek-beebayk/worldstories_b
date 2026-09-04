@@ -226,6 +226,25 @@ class AnalyticsEvent(models.Model):
     EVENT_DOWNLOAD = "download"
     EVENT_READ_ALONG_CUE_SEEK = "read_along_cue_seek"
     EVENT_READ_ALONG_FOLLOW_TOGGLE = "read_along_follow_toggle"
+    # The Quick Read funnel (§2.3 / §12.2). Deliberately their own event types
+    # rather than metadata on `completion`: a summary read is not a story
+    # finished, and folding it into `completion` would inflate a story's
+    # completion count with readers who only ever read the summary. The
+    # conversion metric is a ratio of these three, so they need to be countable
+    # on their own.
+    EVENT_QUICK_READ_OPENED = "quick_read_opened"
+    EVENT_QUICK_READ_COMPLETED = "quick_read_completed"
+    EVENT_QUICK_READ_FULL_STORY_CLICKED = "quick_read_full_story_clicked"
+    # The reading lifecycle (§2.5 / §12.2): start rate is starts over story
+    # detail views, completion rate is completions over starts. Named in the
+    # past tense throughout — the source document writes "story_resume" in §2.5
+    # and "story_resumed" in §12.1; the latter is used here so the whole set
+    # reads consistently as things that happened.
+    EVENT_STORY_STARTED = "story_started"
+    EVENT_STORY_RESUMED = "story_resumed"
+    EVENT_STORY_PROGRESSED = "story_progressed"
+    EVENT_STORY_COMPLETED = "story_completed"
+    EVENT_NEXT_STORY_CLICKED = "next_story_clicked"
     EVENT_CHOICES = [
         (EVENT_VISIT, "Visit"),
         (EVENT_AD_IMPRESSION, "Ad impression"),
@@ -236,7 +255,21 @@ class AnalyticsEvent(models.Model):
         (EVENT_DOWNLOAD, "Download"),
         (EVENT_READ_ALONG_CUE_SEEK, "Read Along cue seek"),
         (EVENT_READ_ALONG_FOLLOW_TOGGLE, "Read Along follow toggle"),
+        (EVENT_QUICK_READ_OPENED, "Quick Read opened"),
+        (EVENT_QUICK_READ_COMPLETED, "Quick Read completed"),
+        (EVENT_QUICK_READ_FULL_STORY_CLICKED, "Quick Read full story clicked"),
+        (EVENT_STORY_STARTED, "Story started"),
+        (EVENT_STORY_RESUMED, "Story resumed"),
+        (EVENT_STORY_PROGRESSED, "Story progressed"),
+        (EVENT_STORY_COMPLETED, "Story completed"),
+        (EVENT_NEXT_STORY_CLICKED, "Next story clicked"),
     ]
+
+    # visitor_id for an event the server raises itself rather than receiving
+    # from a browser. Such events are always attributed to a real user, and
+    # every aggregation keys on the user when one is present
+    # (see _content_identity in analytics_api.py), so this is never read.
+    SERVER_VISITOR_ID = "server"
 
     event_id = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
     event_type = models.CharField(max_length=32, choices=EVENT_CHOICES, db_index=True)
@@ -280,3 +313,75 @@ class AnalyticsEvent(models.Model):
 
     def __str__(self):
         return f"{self.event_type} - {self.visitor_id}"
+
+
+class StoryCompletion(models.Model):
+    """"This user finished this story", as a durable fact.
+
+    Completion used to live in two places, neither of which could answer that
+    question. One was an append-only ``AnalyticsEvent`` whose idempotency came
+    from a *localStorage* key, so clearing site data or opening the story on a
+    second device recorded the same finish again. The other was a query that
+    recomputed completion on the fly by averaging ``ChapterReadingProgress``
+    over the story's chapter count — which meant an audiobook, a video, an
+    EPUB or a PDF story could never be complete at all, because none of them
+    have chapters.
+
+    The Story Passport, achievements, journeys and the weekly recap all need
+    to ask "which stories, and which countries, has this reader finished, and
+    when" — a query, with timestamps, that survives a device change. Hence a
+    row rather than a derivation: ``completed_at`` is a fact about the reader's
+    history that no amount of recomputation from current progress can
+    reconstruct, and first-unlock events depend on knowing it happened *now*
+    rather than at some point in the past.
+
+    One row per (user, story), enforced by the database. Finishing the same
+    story again — re-reading it, or finishing the audiobook after the text —
+    updates nothing and creates nothing; ``source`` records how it was first
+    completed.
+    """
+
+    SOURCE_CHAPTERS = "chapters"
+    SOURCE_AUDIO = "audio"
+    SOURCE_VIDEO = "video"
+    SOURCE_EPUB = "epub"
+    SOURCE_PDF = "pdf"
+    SOURCE_BACKFILL = "backfill"
+    SOURCE_CHOICES = [
+        (SOURCE_CHAPTERS, "Chapters"),
+        (SOURCE_AUDIO, "Audio"),
+        (SOURCE_VIDEO, "Video"),
+        (SOURCE_EPUB, "EPUB"),
+        (SOURCE_PDF, "PDF"),
+        (SOURCE_BACKFILL, "Backfilled from historical progress"),
+    ]
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="story_completions",
+    )
+    story = models.ForeignKey(
+        Story,
+        on_delete=models.CASCADE,
+        related_name="completions",
+    )
+    # Which surface the reader actually finished it on. Not a carve-out — a
+    # story finished as an audiobook is as completed as one finished as text;
+    # this only records which way round it happened.
+    source = models.CharField(max_length=16, choices=SOURCE_CHOICES)
+    completed_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ("user", "story")
+        indexes = [
+            # "Everything this reader has finished, newest first" — the
+            # profile's Completed list and the weekly recap.
+            models.Index(fields=["user", "-completed_at"], name="stats_completion_user_idx"),
+            # "Who has finished this story" — story-level reporting.
+            models.Index(fields=["story"], name="stats_completion_story_idx"),
+        ]
+        ordering = ["-completed_at"]
+
+    def __str__(self):
+        return f"{self.user} completed {self.story} ({self.source})"

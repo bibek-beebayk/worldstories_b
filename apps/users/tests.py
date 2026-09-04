@@ -20,10 +20,12 @@ from apps.stats.models import (
     ChapterReadingProgress,
     FileReadingProgress,
     ReadingProgress,
+    StoryCompletion,
 )
 from apps.story import reading_time
 from apps.story.models import Audio, Chapter, Favorite, Genre, Review, Story
 from apps.story.signals import recompute_chapter_reading_minutes
+from apps.users.recommendations import PRIMARY_WEIGHTS, select_primary_recommendation
 
 
 User = get_user_model()
@@ -865,3 +867,131 @@ class UsernameAvailabilityApiTests(APITestCase):
         response = self.client.get(reverse("auth-check-username"), {"username": "  "})
 
         self.assertEqual(response.status_code, 400)
+
+
+class PrimaryRecommendationTests(APITestCase):
+    """The single "Read Next" pick, and the preference order behind it.
+
+    Each test isolates one rung of the order from §2.2 by making the
+    alternatives equal on everything else, so a failure names the rung that
+    broke rather than "the ranking changed".
+    """
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            email="picker@example.com", username="picker", password="test-password"
+        )
+        self.genre = Genre.objects.create(name="Folklore", slug="folklore-primary")
+        self.other_genre = Genre.objects.create(name="Myth", slug="myth-primary")
+        self.finished = self._story("the-finished-one", country="JP", minutes=20)
+        self.finished.genres.add(self.genre)
+
+    def _story(self, slug, country="", minutes=None, genres=None, rating=0.0):
+        story = Story.objects.create(
+            title=slug.replace("-", " ").title(),
+            slug=slug,
+            is_published=True,
+            country=country,
+            rating=rating,
+        )
+        if genres:
+            story.genres.set(genres)
+        if minutes is not None:
+            Story.objects.filter(pk=story.pk).update(cached_chapter_reading_minutes=minutes)
+            story.refresh_from_db()
+        return story
+
+    def _pick(self):
+        return select_primary_recommendation(self.user, self.finished)
+
+    def test_unread_beats_everything_else_combined(self):
+        """Unread is the top of the preference order, so it has to outrank a
+        candidate that wins on every other signal at once."""
+        perfect_but_read = self._story(
+            "read-already", country="JP", minutes=20, genres=[self.genre], rating=5.0
+        )
+        StoryCompletion.objects.create(
+            user=self.user, story=perfect_but_read, source=StoryCompletion.SOURCE_CHAPTERS
+        )
+        plain_unread = self._story("unread-plain", genres=[self.other_genre])
+
+        self.assertEqual(self._pick(), plain_unread)
+
+    def test_an_unstarted_story_beats_one_merely_started(self):
+        started = self._story("started", country="JP", minutes=20, genres=[self.genre])
+        ReadingProgress.objects.create(user=self.user, story=started, progress=0.6)
+        untouched = self._story("untouched", genres=[self.genre])
+
+        self.assertEqual(self._pick(), untouched)
+
+    def test_a_started_story_beats_a_finished_one(self):
+        finished_before = self._story("finished-before", genres=[self.genre])
+        StoryCompletion.objects.create(
+            user=self.user, story=finished_before, source=StoryCompletion.SOURCE_CHAPTERS
+        )
+        started = self._story("half-done", genres=[self.genre])
+        ReadingProgress.objects.create(user=self.user, story=started, progress=0.5)
+
+        self.assertEqual(self._pick(), started)
+
+    def test_shared_genre_outranks_country_when_both_are_unread(self):
+        same_genre = self._story("same-genre", genres=[self.genre])
+        same_country_only = self._story(
+            "same-country", country="JP", genres=[self.other_genre]
+        )
+
+        self.assertEqual(self._pick(), same_genre)
+        self.assertNotEqual(self._pick(), same_country_only)
+
+    def test_country_breaks_a_tie_between_equally_similar_stories(self):
+        elsewhere = self._story("elsewhere", country="FR", genres=[self.genre])
+        same_country = self._story("same-country", country="JP", genres=[self.genre])
+
+        self.assertEqual(self._pick(), same_country)
+
+    def test_a_similar_length_breaks_a_tie(self):
+        wildly_longer = self._story("epic", minutes=300, genres=[self.genre])
+        about_the_same = self._story("comparable", minutes=21, genres=[self.genre])
+
+        self.assertEqual(self._pick(), about_the_same)
+
+    def test_the_readers_own_taste_breaks_a_remaining_tie(self):
+        self.user.preferred_genres.add(self.other_genre)
+        plain = self._story("plain", genres=[self.genre])
+        to_taste = self._story("to-taste", genres=[self.genre, self.other_genre])
+
+        self.assertEqual(self._pick(), to_taste)
+
+    def test_it_never_picks_the_story_just_finished(self):
+        self._story("an-alternative", genres=[self.genre])
+
+        self.assertNotEqual(self._pick(), self.finished)
+
+    def test_it_never_picks_a_translation_of_the_story_just_finished(self):
+        """Offering the same tale in another language reads as a bug."""
+        translation = self._story("same-tale-in-french", genres=[self.genre])
+        Story.objects.filter(pk=translation.pk).update(
+            translation_group=self.finished.translation_group, language="fr"
+        )
+
+        self.assertIsNone(self._pick())
+
+    def test_it_returns_none_only_when_there_is_genuinely_nothing(self):
+        self.assertIsNone(self._pick())
+
+    def test_it_works_for_a_signed_out_reader(self):
+        candidate = self._story("for-anyone", genres=[self.genre])
+
+        self.assertEqual(select_primary_recommendation(None, self.finished), candidate)
+
+    def test_the_weights_stay_readable_and_ordered(self):
+        """The requirements document asks for a transparent, configurable
+        table — this pins the two properties the ordering depends on."""
+        weights = PRIMARY_WEIGHTS
+
+        self.assertLess(weights["already_completed"], weights["already_started"])
+        self.assertLess(weights["already_started"], 0)
+        # The "already met this" penalties must outweigh every positive signal
+        # added together, or unread would stop being the top preference.
+        positives = sum(value for value in weights.values() if value > 0)
+        self.assertGreater(abs(weights["already_completed"]), positives)

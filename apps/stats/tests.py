@@ -7,10 +7,19 @@ from django.urls import reverse
 from django.utils import timezone
 from rest_framework.test import APIClient, APITestCase
 
-from apps.story.models import Audio, Video, Blog, Story, StoryView, Submission
+from apps.story.models import Audio, Chapter, Video, Blog, Story, StoryView, Submission
 from apps.users.models import User
 
-from .models import AnalyticsEvent, VideoWatchProgress
+from .completion import COMPLETION_THRESHOLD
+from .models import (
+    AnalyticsEvent,
+    AudioReadingProgress,
+    ChapterReadingProgress,
+    FileReadingProgress,
+    ReadingProgress,
+    StoryCompletion,
+    VideoWatchProgress,
+)
 from .streaks import compute_streak
 
 # The analytics endpoints reject requests with no User-Agent (a real browser
@@ -206,6 +215,83 @@ class AnalyticsEventApiTests(APITestCase):
 
         self.assertEqual(response.status_code, 202)
         self.assertFalse(AnalyticsEvent.objects.exists())
+
+    def test_reading_lifecycle_events_are_accepted(self):
+        """The browser-raised half of §2.5. `story_completed` is absent by
+        design — the server raises that one itself."""
+        for event_type in (
+            AnalyticsEvent.EVENT_STORY_STARTED,
+            AnalyticsEvent.EVENT_STORY_RESUMED,
+            AnalyticsEvent.EVENT_STORY_PROGRESSED,
+            AnalyticsEvent.EVENT_NEXT_STORY_CLICKED,
+        ):
+            with self.subTest(event_type=event_type):
+                event_id = str(uuid4())
+                response = self.client.post(
+                    reverse("analytics-events"),
+                    {
+                        "event_id": event_id,
+                        "event_type": event_type,
+                        "visitor_id": "lifecycle-reader",
+                        "story_slug": self.story.slug,
+                        "value": 0.5,
+                        "metadata": {"format": "chapter"},
+                    },
+                    format="json",
+                )
+
+                self.assertEqual(response.status_code, 201)
+                event = AnalyticsEvent.objects.get(event_id=event_id)
+                self.assertEqual(event.event_type, event_type)
+                self.assertEqual(event.story, self.story)
+                self.assertEqual(event.value, 0.5)
+
+    def test_quick_read_funnel_events_are_accepted(self):
+        """The three steps §12.2 reads conversion from. Their own event types
+        rather than metadata on `completion`, so a summary read can never be
+        counted as a story finished."""
+        for event_type in (
+            AnalyticsEvent.EVENT_QUICK_READ_OPENED,
+            AnalyticsEvent.EVENT_QUICK_READ_COMPLETED,
+            AnalyticsEvent.EVENT_QUICK_READ_FULL_STORY_CLICKED,
+        ):
+            with self.subTest(event_type=event_type):
+                event_id = str(uuid4())
+                response = self.client.post(
+                    reverse("analytics-events"),
+                    {
+                        "event_id": event_id,
+                        "event_type": event_type,
+                        "visitor_id": "quick-reader",
+                        "story_slug": self.story.slug,
+                        "metadata": {"completed_summary": True},
+                    },
+                    format="json",
+                )
+
+                self.assertEqual(response.status_code, 201)
+                event = AnalyticsEvent.objects.get(event_id=event_id)
+                self.assertEqual(event.event_type, event_type)
+                self.assertEqual(event.story, self.story)
+
+    def test_a_quick_read_completion_is_not_a_story_completion(self):
+        """Guards the reason these are separate event types: a story's
+        completion count must not include readers who only read the summary."""
+        self.client.post(
+            reverse("analytics-events"),
+            {
+                "event_id": str(uuid4()),
+                "event_type": AnalyticsEvent.EVENT_QUICK_READ_COMPLETED,
+                "visitor_id": "quick-reader",
+                "story_slug": self.story.slug,
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            AnalyticsEvent.objects.filter(event_type=AnalyticsEvent.EVENT_COMPLETION).count(), 0
+        )
+        self.assertFalse(StoryCompletion.objects.exists())
 
     def test_unknown_crawler_and_blank_user_agent_events_are_dropped(self):
         for user_agent in ("SomeUnknownBot/1.0 (+http://example.com)", "python-requests/2.31.0", ""):
@@ -964,3 +1050,267 @@ class ComputeStreakTests(SimpleTestCase):
 
         self.assertEqual(current_streak, 2)
         self.assertEqual(longest_streak, 5)
+
+
+class StoryCompletionTests(APITestCase):
+    """Completion is settled by the server on the progress write itself.
+
+    The mechanism it replaces deduplicated on a localStorage key, so clearing
+    site data or opening the story on a second device recorded the same finish
+    again — and it could only ever see chapters.
+    """
+
+    def setUp(self):
+        cache.clear()
+        self.user = User.objects.create_user(
+            email="finisher@example.com", username="finisher", password="test-password"
+        )
+        self.client.force_authenticate(self.user)
+
+    def _story(self, slug, chapters=0, audios=0, videos=0):
+        story = Story.objects.create(title=slug, slug=slug, is_published=True)
+        for index in range(chapters):
+            Chapter.objects.create(
+                story=story,
+                title=f"Chapter {index}",
+                slug=f"{slug}-chapter-{index}",
+                order=index + 1,
+                content="<p>text</p>",
+            )
+        for index in range(audios):
+            Audio.objects.create(
+                story=story,
+                title=f"Track {index}",
+                slug=f"{slug}-audio-{index}",
+                order=index + 1,
+                audio_file="story_audios/fake.mp3",
+            )
+        for index in range(videos):
+            Video.objects.create(
+                story=story,
+                title=f"Video {index}",
+                slug=f"{slug}-video-{index}",
+                order=index + 1,
+                youtube_url="https://youtu.be/dQw4w9WgXcQ",
+                youtube_id=f"vid{index}",
+            )
+        return story
+
+    def _save_chapter(self, story, chapter, progress):
+        return self.client.put(
+            reverse("reading-progress", args=[story.slug]),
+            {"chapter_slug": chapter.slug, "progress": progress},
+            format="json",
+        )
+
+    def test_finishing_every_chapter_records_one_completion(self):
+        story = self._story("two-chapters", chapters=2)
+        first, second = story.chapters.order_by("order")
+
+        partway = self._save_chapter(story, first, 1.0)
+        self.assertFalse(partway.data["story_completed"])
+        self.assertFalse(StoryCompletion.objects.exists())
+
+        finished = self._save_chapter(story, second, 1.0)
+
+        self.assertTrue(finished.data["story_completed"])
+        completion = StoryCompletion.objects.get()
+        self.assertEqual(completion.story, story)
+        self.assertEqual(completion.source, StoryCompletion.SOURCE_CHAPTERS)
+
+    def test_completion_is_reported_exactly_once(self):
+        """`story_completed` is the "finished it just now" signal the
+        completion screen and first-unlock events fire on — a re-read must not
+        raise it again."""
+        story = self._story("single", chapters=1)
+        chapter = story.chapters.get()
+
+        first = self._save_chapter(story, chapter, 1.0)
+        again = self._save_chapter(story, chapter, 1.0)
+
+        self.assertTrue(first.data["story_completed"])
+        self.assertFalse(again.data["story_completed"])
+        self.assertEqual(StoryCompletion.objects.count(), 1)
+
+    def test_a_partly_read_story_does_not_complete(self):
+        story = self._story("partial", chapters=2)
+        first, _ = story.chapters.order_by("order")
+
+        self._save_chapter(story, first, 1.0)
+
+        self.assertFalse(StoryCompletion.objects.exists())
+
+    def test_the_final_fraction_of_a_percent_is_scrollbar_rounding(self):
+        story = self._story("nearly", chapters=1)
+        chapter = story.chapters.get()
+
+        response = self._save_chapter(story, chapter, COMPLETION_THRESHOLD)
+
+        self.assertTrue(response.data["story_completed"])
+
+    def test_an_audiobook_completes_by_listening(self):
+        """The derivation this replaces averaged chapter progress, so a story
+        with no chapters could never be completed at all."""
+        story = self._story("audio-only", audios=2)
+        tracks = list(story.audios.order_by("order"))
+
+        for track in tracks:
+            response = self.client.put(
+                reverse("audio-reading-progress", args=[story.slug]),
+                {"audio_slug": track.slug, "progress": 1.0, "position_seconds": 10, "duration_seconds": 10},
+                format="json",
+            )
+
+        self.assertTrue(response.data["story_completed"])
+        self.assertEqual(StoryCompletion.objects.get().source, StoryCompletion.SOURCE_AUDIO)
+
+    def test_a_video_story_completes_by_watching(self):
+        story = self._story("video-only", videos=1)
+        video = story.videos.get()
+
+        response = self.client.put(
+            reverse("video-watch-progress", args=[story.slug]),
+            {"video_slug": video.slug, "progress": 1.0, "position_seconds": 10, "duration_seconds": 10},
+            format="json",
+        )
+
+        self.assertTrue(response.data["story_completed"])
+        self.assertEqual(StoryCompletion.objects.get().source, StoryCompletion.SOURCE_VIDEO)
+
+    def test_a_file_story_completes_only_when_the_story_has_that_file(self):
+        story = self._story("file-only")
+        story.epub_file = "story_epubs/book.epub"
+        story.save(update_fields=["epub_file"])
+
+        response = self.client.put(
+            reverse("file-reading-progress", args=[story.slug, "epub"]),
+            {"progress": 1.0, "position": "epubcfi(/6/2)"},
+            format="json",
+        )
+
+        self.assertTrue(response.data["story_completed"])
+        self.assertEqual(StoryCompletion.objects.get().source, StoryCompletion.SOURCE_EPUB)
+
+    def test_a_stale_file_progress_row_cannot_complete_a_story_without_that_file(self):
+        story = self._story("no-file")
+
+        response = self.client.put(
+            reverse("file-reading-progress", args=[story.slug, "epub"]),
+            {"progress": 1.0, "position": "epubcfi(/6/2)"},
+            format="json",
+        )
+
+        self.assertFalse(response.data["story_completed"])
+        self.assertFalse(StoryCompletion.objects.exists())
+
+    def test_a_story_with_no_content_at_all_never_completes(self):
+        """Guards the vacuous-truth trap: `all()` over an empty set is true,
+        which would complete every story on every surface it doesn't have."""
+        story = self._story("empty")
+
+        self.assertIsNone(
+            StoryCompletion.objects.filter(user=self.user, story=story).first()
+        )
+        self.assertFalse(StoryCompletion.objects.exists())
+
+    def test_finishing_on_a_second_device_does_not_duplicate(self):
+        """The exact failure of the localStorage-keyed mechanism: a device
+        that has never seen this story re-reports the finish."""
+        story = self._story("second-device", chapters=1)
+        chapter = story.chapters.get()
+
+        self._save_chapter(story, chapter, 1.0)
+        other_device = APIClient(HTTP_USER_AGENT=BROWSER_USER_AGENT)
+        other_device.force_authenticate(self.user)
+        response = other_device.put(
+            reverse("reading-progress", args=[story.slug]),
+            {"chapter_slug": chapter.slug, "progress": 1.0},
+            format="json",
+        )
+
+        self.assertFalse(response.data["story_completed"])
+        self.assertEqual(StoryCompletion.objects.count(), 1)
+
+    def test_completed_library_includes_stories_without_chapters(self):
+        chaptered = self._story("chaptered", chapters=1)
+        audio_only = self._story("listened", audios=1)
+        self._save_chapter(chaptered, chaptered.chapters.get(), 1.0)
+        self.client.put(
+            reverse("audio-reading-progress", args=[audio_only.slug]),
+            {"audio_slug": audio_only.audios.get().slug, "progress": 1.0,
+             "position_seconds": 5, "duration_seconds": 5},
+            format="json",
+        )
+
+        response = self.client.get(reverse("auth-library-completed-reading"))
+
+        self.assertEqual(response.status_code, 200)
+        rows = {row["story"]["slug"]: row for row in response.data["results"]}
+        self.assertEqual(set(rows), {"chaptered", "listened"})
+        for row in rows.values():
+            self.assertEqual(row["overall_progress"], 1.0)
+        # Nothing left of a story whose length is known...
+        self.assertEqual(rows["chaptered"]["remaining_minutes"], 0)
+        # ...and no claim at all about one whose length isn't: the audio-only
+        # story has no reading estimate, so the UI omits the line rather than
+        # asserting "0 min".
+        self.assertIsNone(rows["listened"]["remaining_minutes"])
+
+    def test_finishing_raises_exactly_one_story_completed_event(self):
+        """The event is raised beside the StoryCompletion row, so it inherits
+        that uniqueness constraint. The client-side event it replaces
+        deduplicated on a localStorage key, which a second device lacks."""
+        story = self._story("event-once", chapters=1)
+        chapter = story.chapters.get()
+
+        self._save_chapter(story, chapter, 1.0)
+        self._save_chapter(story, chapter, 1.0)
+        other_device = APIClient(HTTP_USER_AGENT=BROWSER_USER_AGENT)
+        other_device.force_authenticate(self.user)
+        other_device.put(
+            reverse("reading-progress", args=[story.slug]),
+            {"chapter_slug": chapter.slug, "progress": 1.0},
+            format="json",
+        )
+
+        events = AnalyticsEvent.objects.filter(
+            event_type=AnalyticsEvent.EVENT_STORY_COMPLETED
+        )
+        self.assertEqual(events.count(), 1)
+        event = events.get()
+        self.assertEqual(event.user, self.user)
+        self.assertEqual(event.story, story)
+        self.assertEqual(event.metadata["source"], StoryCompletion.SOURCE_CHAPTERS)
+        self.assertEqual(event.visitor_id, AnalyticsEvent.SERVER_VISITOR_ID)
+
+    def test_an_unfinished_story_raises_no_completion_event(self):
+        story = self._story("event-none", chapters=2)
+
+        self._save_chapter(story, story.chapters.order_by("order").first(), 1.0)
+
+        self.assertFalse(
+            AnalyticsEvent.objects.filter(
+                event_type=AnalyticsEvent.EVENT_STORY_COMPLETED
+            ).exists()
+        )
+
+    def test_the_completion_event_records_the_surface_it_was_finished_on(self):
+        story = self._story("event-audio", audios=1)
+
+        self.client.put(
+            reverse("audio-reading-progress", args=[story.slug]),
+            {"audio_slug": story.audios.get().slug, "progress": 1.0,
+             "position_seconds": 5, "duration_seconds": 5},
+            format="json",
+        )
+
+        event = AnalyticsEvent.objects.get(event_type=AnalyticsEvent.EVENT_STORY_COMPLETED)
+        self.assertEqual(event.metadata["source"], StoryCompletion.SOURCE_AUDIO)
+
+    def test_completed_library_excludes_unfinished_stories(self):
+        story = self._story("unfinished", chapters=2)
+        self._save_chapter(story, story.chapters.order_by("order").first(), 1.0)
+
+        response = self.client.get(reverse("auth-library-completed-reading"))
+
+        self.assertEqual(response.data["results"], [])

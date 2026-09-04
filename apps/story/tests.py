@@ -4807,3 +4807,170 @@ class StoryTypeAdminApiTests(APITestCase):
         response = self.client.get("/api/admin/story-types/")
 
         self.assertEqual(response.status_code, 403)
+
+
+class StoryCompletionScreenApiTests(APITestCase):
+    """The end-of-story screen's payload. Composed from the existing
+    "Because you finished" path rather than a second recommendation system."""
+
+    def setUp(self):
+        cache.clear()
+        self.user = User.objects.create_user(
+            email="completer@example.com", username="completer", password="test-password"
+        )
+        self.genre = Genre.objects.create(name="Folklore", slug="folklore-completion")
+        self.finished = self._story("finished-tale", country="JP", minutes=20)
+        self.finished.genres.add(self.genre)
+
+    def _story(self, slug, country="", minutes=None, rating=0):
+        story = Story.objects.create(
+            title=slug.replace("-", " ").title(),
+            slug=slug,
+            is_published=True,
+            country=country,
+            rating=rating,
+        )
+        if minutes is not None:
+            Story.objects.filter(pk=story.pk).update(cached_chapter_reading_minutes=minutes)
+            story.refresh_from_db()
+        return story
+
+    def _get(self):
+        return self.client.get(f"/api/stories/{self.finished.slug}/completion/")
+
+    def test_it_works_for_an_anonymous_reader(self):
+        """Someone can finish a story without an account; the screen still has
+        to render for them, with the generic similarity ranking."""
+        other = self._story("anon-similar", country="JP", minutes=20)
+        other.genres.add(self.genre)
+
+        response = self._get()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNotNone(response.data["primary"])
+        self.assertEqual(response.data["primary"]["slug"], other.slug)
+
+    def test_it_resolves_the_country_name_for_the_section_heading(self):
+        # Two, because the first becomes the primary pick and is then excluded
+        # from every section.
+        for index in range(2):
+            sibling = self._story(f"japan-sibling-{index}", country="JP")
+            sibling.genres.add(self.genre)
+        self.client.force_authenticate(self.user)
+
+        response = self._get()
+
+        self.assertEqual(response.data["country"], "JP")
+        self.assertEqual(response.data["country_name"], "Japan")
+        country_section = next(
+            section for section in response.data["sections"]
+            if section["key"] == "more_from_country"
+        )
+        self.assertEqual(country_section["title"], "More from Japan")
+
+    def test_the_primary_pick_is_never_repeated_in_a_section(self):
+        for index in range(5):
+            sibling = self._story(f"jp-sibling-{index}", country="JP", minutes=20)
+            sibling.genres.add(self.genre)
+        self.client.force_authenticate(self.user)
+
+        response = self._get()
+
+        primary_slug = response.data["primary"]["slug"]
+        for section in response.data["sections"]:
+            slugs = [story["slug"] for story in section["stories"]]
+            self.assertNotIn(primary_slug, slugs, section["key"])
+
+    def test_it_never_recommends_the_story_just_finished(self):
+        sibling = self._story("another-tale", country="JP", minutes=20)
+        sibling.genres.add(self.genre)
+        self.client.force_authenticate(self.user)
+
+        response = self._get()
+
+        self.assertNotEqual(response.data["primary"]["slug"], self.finished.slug)
+        for section in response.data["sections"]:
+            slugs = [story["slug"] for story in section["stories"]]
+            self.assertNotIn(self.finished.slug, slugs)
+
+    def test_similar_length_stays_within_a_proportional_window(self):
+        # Three, because one becomes the primary pick and is then excluded from
+        # every section.
+        close = self._story("about-the-same", minutes=22)
+        also_close = self._story("also-about-the-same", minutes=19)
+        far = self._story("much-longer", minutes=200)
+        for story in (close, also_close, far):
+            story.genres.add(self.genre)
+        self.client.force_authenticate(self.user)
+
+        response = self._get()
+
+        section = next(
+            (s for s in response.data["sections"] if s["key"] == "similar_length"), None
+        )
+        self.assertIsNotNone(section)
+        slugs = [story["slug"] for story in section["stories"]]
+        primary_slug = response.data["primary"]["slug"]
+        self.assertIn(primary_slug, {close.slug, also_close.slug})
+        # Whichever of the two similar-length stories wasn't picked as primary
+        # is still in the section; the 200-minute one never is.
+        self.assertEqual(
+            set(slugs), {close.slug, also_close.slug} - {primary_slug}
+        )
+        self.assertNotIn(far.slug, slugs)
+
+    def test_sections_with_nothing_in_them_are_omitted(self):
+        """The screen renders what exists rather than padding with filler."""
+        countryless = self._story("no-country-tale", minutes=20)
+        countryless.genres.add(self.genre)
+        self.finished.country = ""
+        self.finished.save(update_fields=["country"])
+        self.client.force_authenticate(self.user)
+
+        response = self._get()
+
+        keys = {section["key"] for section in response.data["sections"]}
+        self.assertNotIn("more_from_country", keys)
+        self.assertIsNone(response.data["country_name"])
+
+    def test_an_empty_catalogue_returns_no_primary_rather_than_failing(self):
+        self.client.force_authenticate(self.user)
+
+        response = self._get()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(response.data["primary"])
+        self.assertEqual(response.data["sections"], [])
+
+    def test_the_sections_exclude_stories_the_reader_has_already_engaged_with(self):
+        already_read = self._story("already-read", country="JP", minutes=20)
+        already_read.genres.add(self.genre)
+        Favorite.objects.create(user=self.user, story=already_read)
+        fresh = self._story("not-yet-read", country="JP", minutes=20)
+        fresh.genres.add(self.genre)
+        self.client.force_authenticate(self.user)
+
+        response = self._get()
+
+        self.assertEqual(response.data["primary"]["slug"], fresh.slug)
+        for section in response.data["sections"]:
+            slugs = [story["slug"] for story in section["stories"]]
+            self.assertNotIn(already_read.slug, slugs, section["key"])
+
+    def test_the_primary_falls_back_to_an_engaged_story_rather_than_nothing(self):
+        """§2.2: avoid already-completed stories *unless no alternatives exist*.
+        A reader who has genuinely read everything similar should still get a
+        suggestion, not an empty panel."""
+        already_read = self._story("only-option", country="JP", minutes=20)
+        already_read.genres.add(self.genre)
+        Favorite.objects.create(user=self.user, story=already_read)
+        self.client.force_authenticate(self.user)
+
+        response = self._get()
+
+        self.assertEqual(response.data["primary"]["slug"], already_read.slug)
+        # It is offered as the "read next" pick, but never padded into the
+        # browse sections alongside it.
+        for section in response.data["sections"]:
+            slugs = [story["slug"] for story in section["stories"]]
+            self.assertNotIn(already_read.slug, slugs, section["key"])

@@ -5,6 +5,7 @@ from rest_framework.response import Response
 from rest_framework import status
 from rest_framework.throttling import SimpleRateThrottle
 
+from apps.stats.completion import record_completion_if_finished
 from apps.story.api import is_untracked_request
 from apps.story.models import Blog, Story
 from apps.stats.models import (
@@ -15,6 +16,7 @@ from apps.stats.models import (
     VideoWatchProgress,
     BlogReadingProgress,
     FileReadingProgress,
+    StoryCompletion,
 )
 from apps.stats.serializers import (
     AnalyticsEventWriteSerializer,
@@ -131,7 +133,11 @@ class ReadingProgressAPIView(APIView):
             )
             chapter_progress_obj.save()
 
-        return Response(self._build_progress_payload(request, story, progress_obj))
+        payload = self._build_progress_payload(request, story, progress_obj)
+        # Settled server-side on the same request that moved the progress, so
+        # it survives a cleared browser store and a second device.
+        payload["story_completed"] = bool(record_completion_if_finished(request.user, story))
+        return Response(payload)
 
 
 class AudioReadingProgressAPIView(APIView):
@@ -202,7 +208,9 @@ class AudioReadingProgressAPIView(APIView):
         progress_obj.duration_seconds = serializer.validated_data.get("duration_seconds", 0.0)
         progress_obj.save()
 
-        return Response(self._build_progress_payload(request, story, progress_obj))
+        payload = self._build_progress_payload(request, story, progress_obj)
+        payload["story_completed"] = bool(record_completion_if_finished(request.user, story))
+        return Response(payload)
 
 
 class VideoWatchProgressAPIView(APIView):
@@ -273,7 +281,9 @@ class VideoWatchProgressAPIView(APIView):
         progress_obj.duration_seconds = serializer.validated_data.get("duration_seconds", 0.0)
         progress_obj.save()
 
-        return Response(self._build_progress_payload(request, story, progress_obj))
+        payload = self._build_progress_payload(request, story, progress_obj)
+        payload["story_completed"] = bool(record_completion_if_finished(request.user, story))
+        return Response(payload)
 
 
 class BlogReadingProgressAPIView(APIView):
@@ -337,4 +347,6 @@ class FileReadingProgressAPIView(APIView):
         progress_obj.position = serializer.validated_data.get("position", progress_obj.position)
         progress_obj.save()
 
-        return Response(FileReadingProgressSerializer(progress_obj).data)
+        payload = FileReadingProgressSerializer(progress_obj).data
+        payload["story_completed"] = bool(record_completion_if_finished(request.user, story))
+        return Response(payload)
