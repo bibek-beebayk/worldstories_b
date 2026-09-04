@@ -22,9 +22,9 @@ import anthropic
 import openpyxl
 from pydantic import ValidationError as PydanticValidationError
 
-from apps.stats.models import StoryCompletion
+from apps.stats.models import AnalyticsEvent, StoryCompletion
 from apps.story.api import StoryMapAPIView, StoryViewSet, open_s3_audio_stream
-from apps.story.models import Mood, StoryJourney, StoryMood
+from apps.story.models import Mood, StoryJourney, StoryMood, StoryReaction
 from apps.story.ai_generation import GenerationError, _GenerationOutput, _to_plain_text, generate
 from apps.story.ai_generation_jobs import _concatenated_chapter_text, run_generate_blog_excerpt, run_generate_field
 from apps.story.book_fetch import (
@@ -5572,4 +5572,141 @@ class StoryJourneyAdminApiTests(APITestCase):
 
         self.assertEqual(
             self.client.get(reverse("admin-journey-list"), format="json").status_code, 403
+        )
+
+
+class StoryReactionApiTests(APITestCase):
+    """A reaction is one tap at the end of a story — separate from Review,
+    which stays untouched (§10.1)."""
+
+    def setUp(self):
+        cache.clear()
+        self.user = User.objects.create_user(
+            email="reactor@example.com", username="reactor", password="test-password"
+        )
+        self.other = User.objects.create_user(
+            email="reactor2@example.com", username="reactor2", password="test-password"
+        )
+        self.story = Story.objects.create(title="A Tale", slug="a-reacted-tale", is_published=True)
+
+    def _url(self):
+        return reverse("story-reactions", kwargs={"slug": self.story.slug})
+
+    def _react(self, reaction_type):
+        return self.client.post(self._url(), {"reaction_type": reaction_type}, format="json")
+
+    def test_anyone_can_see_the_totals(self):
+        """§10.4 — a panel showing how readers felt is worth seeing before you
+        have an account."""
+        self.client.force_authenticate(self.user)
+        self._react(StoryReaction.LOVED)
+        self.client.force_authenticate(None)
+
+        response = self.client.get(self._url(), format="json")
+
+        self.assertEqual(response.status_code, 200)
+        counts = {row["type"]: row["count"] for row in response.data["reactions"]}
+        self.assertEqual(counts[StoryReaction.LOVED], 1)
+        self.assertIsNone(response.data["my_reaction"])
+
+    def test_every_reaction_type_is_returned_even_at_zero(self):
+        """Otherwise a story would offer fewer ways to answer the longer it
+        went unreacted-to."""
+        response = self.client.get(self._url(), format="json")
+
+        self.assertEqual(len(response.data["reactions"]), len(StoryReaction.REACTION_CHOICES))
+        self.assertEqual(response.data["total"], 0)
+
+    def test_reacting_requires_an_account(self):
+        response = self._react(StoryReaction.LOVED)
+
+        self.assertEqual(response.status_code, 401)
+        self.assertFalse(StoryReaction.objects.exists())
+
+    def test_a_reader_has_one_reaction_per_story(self):
+        self.client.force_authenticate(self.user)
+
+        self._react(StoryReaction.LOVED)
+        response = self._react(StoryReaction.FUNNY)
+
+        self.assertEqual(StoryReaction.objects.filter(user=self.user).count(), 1)
+        self.assertEqual(response.data["my_reaction"], StoryReaction.FUNNY)
+        counts = {row["type"]: row["count"] for row in response.data["reactions"]}
+        self.assertEqual(counts[StoryReaction.LOVED], 0)
+        self.assertEqual(counts[StoryReaction.FUNNY], 1)
+
+    def test_tapping_the_same_reaction_again_removes_it(self):
+        """The tap that set it is the tap that unsets it."""
+        self.client.force_authenticate(self.user)
+        self._react(StoryReaction.LOVED)
+
+        response = self._react(StoryReaction.LOVED)
+
+        self.assertIsNone(response.data["my_reaction"])
+        self.assertEqual(response.data["total"], 0)
+
+    def test_a_reaction_can_be_deleted_outright(self):
+        self.client.force_authenticate(self.user)
+        self._react(StoryReaction.LOVED)
+
+        response = self.client.delete(self._url(), format="json")
+
+        self.assertIsNone(response.data["my_reaction"])
+        self.assertFalse(StoryReaction.objects.exists())
+
+    def test_readers_do_not_overwrite_each_other(self):
+        self.client.force_authenticate(self.user)
+        self._react(StoryReaction.LOVED)
+        self.client.force_authenticate(self.other)
+        self._react(StoryReaction.LOVED)
+
+        response = self.client.get(self._url(), format="json")
+
+        counts = {row["type"]: row["count"] for row in response.data["reactions"]}
+        self.assertEqual(counts[StoryReaction.LOVED], 2)
+
+    def test_an_unknown_reaction_is_rejected(self):
+        self.client.force_authenticate(self.user)
+
+        response = self._react("shrug")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(StoryReaction.objects.exists())
+
+    def test_changing_a_reaction_records_what_it_replaced(self):
+        self.client.force_authenticate(self.user)
+        self._react(StoryReaction.LOVED)
+
+        self._react(StoryReaction.EMOTIONAL)
+
+        events = AnalyticsEvent.objects.filter(
+            event_type=AnalyticsEvent.EVENT_REACTION_ADDED
+        ).order_by("created_at")
+        self.assertEqual(events.count(), 2)
+        self.assertIsNone(events[0].metadata["previous"])
+        self.assertEqual(events[1].metadata["previous"], StoryReaction.LOVED)
+
+    def test_removing_a_reaction_raises_no_event(self):
+        self.client.force_authenticate(self.user)
+        self._react(StoryReaction.LOVED)
+
+        self._react(StoryReaction.LOVED)
+
+        self.assertEqual(
+            AnalyticsEvent.objects.filter(
+                event_type=AnalyticsEvent.EVENT_REACTION_ADDED
+            ).count(),
+            1,
+        )
+
+    def test_reactions_leave_reviews_alone(self):
+        """§10.1 — the two systems are independent."""
+        Review.objects.create(user=self.user, story=self.story, rating=5, comment="Lovely.")
+        self.client.force_authenticate(self.user)
+
+        self._react(StoryReaction.LOVED)
+
+        self.assertEqual(Review.objects.filter(user=self.user, story=self.story).count(), 1)
+        self.assertEqual(
+            Review.objects.get(user=self.user, story=self.story).rating, 5
         )

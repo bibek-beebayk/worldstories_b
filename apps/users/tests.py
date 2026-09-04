@@ -1357,3 +1357,117 @@ class ReadingHistoryApiTests(APITestCase):
 
         self.assertEqual((one_rows, many_rows), (1, 6))
         self.assertEqual(many_queries, one_queries)
+
+
+class WeeklyRecapApiTests(APITestCase):
+    """A time-boxed view over figures that already exist, not new measurement."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            email="recap@example.com", username="recap", password="test-password"
+        )
+        self.client.force_authenticate(self.user)
+
+    def _story(self, slug, country="", genres=()):
+        story = Story.objects.create(title=slug, slug=slug, is_published=True, country=country)
+        if genres:
+            story.genres.set(genres)
+        return story
+
+    def _complete(self, story, days_ago=0):
+        completion = StoryCompletion.objects.create(
+            user=self.user, story=story, source=StoryCompletion.SOURCE_CHAPTERS
+        )
+        if days_ago:
+            StoryCompletion.objects.filter(pk=completion.pk).update(
+                completed_at=timezone.now() - timedelta(days=days_ago)
+            )
+        return completion
+
+    def _session(self, story, seconds, days_ago=0):
+        event = AnalyticsEvent.objects.create(
+            event_type=AnalyticsEvent.EVENT_READING_SESSION,
+            user=self.user, story=story, visitor_id="v", duration_seconds=seconds,
+        )
+        if days_ago:
+            AnalyticsEvent.objects.filter(pk=event.pk).update(
+                created_at=timezone.now() - timedelta(days=days_ago)
+            )
+
+    def _recap(self):
+        return self.client.get(reverse("auth-weekly-recap")).data
+
+    def test_it_reports_the_week(self):
+        genre = Genre.objects.create(name="Folklore", slug="folklore-recap")
+        story = self._story("recap-one", country="JP", genres=[genre])
+        self._complete(story)
+        self._session(story, 600)
+
+        recap = self._recap()
+
+        self.assertEqual(recap["stories_completed"], 1)
+        self.assertEqual(recap["minutes_read"], 10)
+        self.assertEqual(recap["countries_explored"], 1)
+        self.assertEqual(recap["favourite_genre"], "Folklore")
+        self.assertTrue(recap["has_activity"])
+
+    def test_it_ignores_activity_older_than_the_window(self):
+        """A recap that quietly included last month would not be a recap."""
+        story = self._story("recap-old")
+        self._complete(story, days_ago=30)
+        self._session(story, 600, days_ago=30)
+
+        recap = self._recap()
+
+        self.assertEqual(recap["stories_completed"], 0)
+        self.assertEqual(recap["minutes_read"], 0)
+        self.assertFalse(recap["has_activity"])
+
+    def test_a_quiet_week_reports_no_activity_rather_than_zeroes_to_display(self):
+        """Five zeroes tell a reader only that they did nothing."""
+        recap = self._recap()
+
+        self.assertFalse(recap["has_activity"])
+        self.assertIsNone(recap["favourite_genre"])
+
+    def test_countries_are_counted_once_each(self):
+        for index in range(2):
+            self._complete(self._story(f"recap-jp-{index}", country="JP"))
+        self._complete(self._story("recap-fr", country="FR"))
+
+        self.assertEqual(self._recap()["countries_explored"], 2)
+
+    def test_a_completed_story_with_no_country_explores_nowhere(self):
+        self._complete(self._story("recap-placeless"))
+
+        self.assertEqual(self._recap()["countries_explored"], 0)
+
+    def test_reading_time_alone_counts_as_activity(self):
+        """Someone who read all week without finishing anything still had a
+        week worth showing."""
+        self._session(self._story("recap-unfinished"), 1800)
+
+        recap = self._recap()
+
+        self.assertEqual(recap["stories_completed"], 0)
+        self.assertEqual(recap["minutes_read"], 30)
+        self.assertTrue(recap["has_activity"])
+
+    def test_it_counts_journeys_finished_this_week(self):
+        story = self._story("recap-journey")
+        AnalyticsEvent.objects.create(
+            event_type=AnalyticsEvent.EVENT_JOURNEY_COMPLETED,
+            user=self.user, story=story, visitor_id="v",
+        )
+
+        recap = self._recap()
+
+        self.assertEqual(recap["journeys_completed"], 1)
+        self.assertTrue(recap["has_activity"])
+
+    def test_it_requires_authentication(self):
+        self.client.force_authenticate(None)
+
+        response = self.client.get(reverse("auth-weekly-recap"), format="json")
+
+        self.assertIn(response.status_code, (401, 403))

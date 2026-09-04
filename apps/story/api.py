@@ -21,11 +21,12 @@ from django.views.decorators.vary import vary_on_headers
 from datetime import date, timedelta
 from storages.backends.s3 import S3Storage
 from rest_framework.parsers import FormParser, MultiPartParser, JSONParser
-from rest_framework.permissions import BasePermission
+from rest_framework.permissions import AllowAny, BasePermission
 from rest_framework.filters import SearchFilter
 
 from apps.story.filters import StoryFilter
 from apps.stats.models import (
+    AnalyticsEvent,
     AudioReadingProgress,
     ReadingProgress,
     StoryCompletion,
@@ -69,6 +70,7 @@ from .models import (
     StoryJourney,
     StoryJourneyItem,
     StoryMood,
+    StoryReaction,
 )
 from .epub_import_jobs import executor as epub_import_executor, run_epub_import
 from .rich_text import rich_text_has_content
@@ -609,6 +611,87 @@ class StoryViewSet(ReadOnlyModelViewSet):
 
     # No retrieve() override: it existed only to call _register_view, which
     # the browser-fired beacon below now owns.
+    @action(
+        detail=True,
+        methods=["get", "post", "delete"],
+        url_path="reactions",
+        permission_classes=[AllowAny],
+    )
+    def reactions(self, request, slug=None):
+        """Totals for a story, and this reader's own reaction.
+
+        GET is open: §10.4 says anonymous readers may see the totals, and a
+        panel showing "231 loved it" is worth seeing before you have an
+        account. POST and DELETE need one, since a reaction belongs to someone.
+
+        POST with the reaction you already have removes it — the tap that set
+        it is the tap that unsets it, which is what a reader expects from a
+        control that looks like a toggle. Any other value replaces it, so
+        changing your mind updates the row rather than adding a second (§10.2).
+        """
+        story = self.get_object()
+
+        if request.method == "GET":
+            return Response(self._reaction_payload(story, request.user))
+
+        if not request.user or not request.user.is_authenticated:
+            return Response(
+                {"detail": "Sign in to react to a story."},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+
+        if request.method == "DELETE":
+            StoryReaction.objects.filter(user=request.user, story=story).delete()
+            return Response(self._reaction_payload(story, request.user))
+
+        reaction_type = request.data.get("reaction_type")
+        if reaction_type not in dict(StoryReaction.REACTION_CHOICES):
+            return Response(
+                {"detail": "Unknown reaction."}, status=status.HTTP_400_BAD_REQUEST
+            )
+
+        existing = StoryReaction.objects.filter(user=request.user, story=story).first()
+        if existing and existing.reaction_type == reaction_type:
+            existing.delete()
+            return Response(self._reaction_payload(story, request.user))
+
+        previous = existing.reaction_type if existing else None
+        StoryReaction.objects.update_or_create(
+            user=request.user, story=story, defaults={"reaction_type": reaction_type}
+        )
+        AnalyticsEvent.objects.create(
+            event_type=AnalyticsEvent.EVENT_REACTION_ADDED,
+            user=request.user,
+            story=story,
+            visitor_id=AnalyticsEvent.SERVER_VISITOR_ID,
+            metadata={"reaction": reaction_type, "previous": previous},
+        )
+        return Response(self._reaction_payload(story, request.user))
+
+    @staticmethod
+    def _reaction_payload(story, user):
+        counts = dict(
+            StoryReaction.objects.filter(story=story)
+            .values_list("reaction_type")
+            .annotate(total=Count("id"))
+        )
+        mine = None
+        if user and user.is_authenticated:
+            row = StoryReaction.objects.filter(user=user, story=story).first()
+            mine = row.reaction_type if row else None
+
+        return {
+            # Every reaction type, including the ones at zero: a panel that
+            # hid them would give a reader fewer ways to answer the longer a
+            # story went unreacted-to.
+            "reactions": [
+                {"type": value, "label": label, "count": counts.get(value, 0)}
+                for value, label in StoryReaction.REACTION_CHOICES
+            ],
+            "total": sum(counts.values()),
+            "my_reaction": mine,
+        }
+
     @action(detail=False, methods=["get"], url_path="surprise")
     def surprise(self, request):
         """One story, picked for this reader, at random from a good shortlist.

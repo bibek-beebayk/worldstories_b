@@ -21,7 +21,7 @@ from .geo import record_login
 from .models import OTP
 from .recommendations import recommend_stories_for
 from apps.story.api import IsSuperUser
-from apps.story.models import Audio, Chapter, Favorite, Review, Story, Video
+from apps.story.models import Audio, Chapter, Favorite, Genre, Review, Story, Video
 from apps.story.serializers import StoryListSerializer
 from apps.stats.models import (
     Achievement,
@@ -151,6 +151,7 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
             "library_completed_reading",
             "library_reading_history",
             "achievements",
+            "weekly_recap",
             "story_passport",
             "story_passport_country",
             "library_continue_listening",
@@ -812,6 +813,93 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
             payload, many=True, context={"request": request}
         )
         return Response(serializer.data)
+
+    @action(detail=False, methods=["get"], url_path="weekly-recap")
+    def weekly_recap(self, request):
+        """"Your Week in Stories" — the last seven days of this reader's own
+        activity.
+
+        Every figure here already exists somewhere: completions from
+        `StoryCompletion`, minutes from the session events the profile totals,
+        countries from the completions' `Story.country`, the streak from
+        `compute_streak`. This is a time-boxed view over them, not new
+        measurement — §11.1 asks to reuse rather than re-derive.
+
+        A rolling seven days rather than a calendar week: a Monday-to-Sunday
+        recap is empty every Monday morning, which is exactly when someone
+        might look at it.
+
+        `has_activity` is the honest answer to "is there anything to say" — a
+        recap of five zeroes tells a reader only that they did nothing, so the
+        client renders nothing at all in that case.
+        """
+        since = timezone.now() - timedelta(days=7)
+
+        completions = StoryCompletion.objects.filter(
+            user=request.user, completed_at__gte=since
+        ).select_related("story")
+        completed_story_ids = [row.story_id for row in completions]
+
+        session_seconds = AnalyticsEvent.objects.filter(
+            user=request.user,
+            created_at__gte=since,
+            event_type__in=[
+                AnalyticsEvent.EVENT_READING_SESSION,
+                AnalyticsEvent.EVENT_LISTENING_SESSION,
+                AnalyticsEvent.EVENT_WATCHING_SESSION,
+            ],
+        ).aggregate(total=Sum("duration_seconds"))["total"] or 0
+
+        countries = (
+            Story.objects.filter(id__in=completed_story_ids)
+            .exclude(country="")
+            .values_list("country", flat=True)
+            .distinct()
+        )
+
+        top_genre = (
+            Genre.objects.filter(stories__id__in=completed_story_ids)
+            .annotate(total=Count("stories", distinct=True))
+            .order_by("-total", "name")
+            .first()
+        )
+
+        journeys_completed = AnalyticsEvent.objects.filter(
+            user=request.user,
+            created_at__gte=since,
+            event_type=AnalyticsEvent.EVENT_JOURNEY_COMPLETED,
+        ).count()
+
+        created_ats = AnalyticsEvent.objects.filter(
+            user=request.user,
+            event_type__in=[
+                AnalyticsEvent.EVENT_READING_SESSION,
+                AnalyticsEvent.EVENT_LISTENING_SESSION,
+                AnalyticsEvent.EVENT_WATCHING_SESSION,
+            ],
+        ).values_list("created_at", flat=True)
+        current_streak, _longest = compute_streak(
+            {timezone.localtime(value).date() for value in created_ats},
+            timezone.localdate(),
+        )
+
+        stories_completed = len(completed_story_ids)
+        minutes_read = round(session_seconds / 60)
+
+        return Response(
+            {
+                "days": 7,
+                "stories_completed": stories_completed,
+                "minutes_read": minutes_read,
+                "countries_explored": len(countries),
+                "journeys_completed": journeys_completed,
+                "current_streak": current_streak,
+                "favourite_genre": top_genre.name if top_genre else None,
+                "has_activity": bool(
+                    stories_completed or minutes_read or journeys_completed
+                ),
+            }
+        )
 
     @action(detail=False, methods=["get"], url_path="achievements")
     def achievements(self, request):
