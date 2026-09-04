@@ -150,9 +150,32 @@ def story_reading_minutes(story):
     file-based estimate is computed once, at upload time (StoryAdminSerializer)
     or via the backfill_file_reading_times management command, and cached on
     cached_file_reading_minutes — never parsed live from remote storage on a
-    story-detail page view."""
+    story-detail page view.
+
+    Authoritative, and priced for one story at a time. For anything rendering
+    many stories, use story_reading_minutes_cached() instead."""
     if story.chapters.exists():
         return chapters_reading_minutes(story)
+    return story.cached_file_reading_minutes
+
+
+def story_reading_minutes_cached(story):
+    """The list-response counterpart of story_reading_minutes().
+
+    Same answer, read from the denormalized columns instead of computed: no
+    chapters query, no chapter bodies pulled out of the database, no word
+    counting. That matters because the live version drags every chapter of
+    every story through the database — fine on a detail page, ruinous on a
+    24-card shelf.
+
+    cached_chapter_reading_minutes is maintained by the Chapter signals in
+    signals.py; None means the story has no chapters (or predates the backfill
+    — run backfill_chapter_reading_times), so the file-derived estimate is the
+    correct fallback, exactly as in the live version.
+    """
+    chapter_minutes = story.cached_chapter_reading_minutes
+    if chapter_minutes:
+        return chapter_minutes
     return story.cached_file_reading_minutes
 
 

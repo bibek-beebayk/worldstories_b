@@ -21,7 +21,7 @@ from .geo import record_login
 from .models import OTP
 from .recommendations import recommend_stories_for
 from apps.story.api import IsSuperUser
-from apps.story.models import Favorite, Review, Story
+from apps.story.models import Audio, Chapter, Favorite, Review, Story, Video
 from apps.story.serializers import StoryListSerializer
 from apps.stats.models import (
     AnalyticsEvent,
@@ -66,6 +66,61 @@ def build_unique_username(base_value: str) -> str:
         username = f"{base_username}{suffix}"
         suffix += 1
     return username
+
+
+
+def card_stories_by_id(story_ids, user):
+    """Story rows prepared for ``StoryListSerializer``, keyed by id.
+
+    The library endpoints below walk progress rows and hand each row's
+    ``progress.story`` straight to that serializer. Those stories came from a
+    plain ``select_related``, so every card then re-queries its author,
+    genres, categories, audios, videos, review count and favourite count —
+    roughly seven queries per card, on an endpoint that returns a full page of
+    them. Re-fetching the same stories once through ``for_card_list()``
+    resolves all of that in a constant number of queries, and the favourite
+    flags come back in one more instead of an ``.exists()`` per row.
+    """
+    story_ids = {story_id for story_id in story_ids if story_id}
+    if not story_ids:
+        return {}
+
+    stories = {
+        story.id: story
+        for story in Story.objects.filter(id__in=story_ids).for_card_list()
+    }
+
+    if user and user.is_authenticated:
+        favourited = set(
+            Favorite.objects.filter(user=user, story_id__in=story_ids).values_list(
+                "story_id", flat=True
+            )
+        )
+        for story_id, story in stories.items():
+            # The attribute StoryListSerializer.get_is_favorite reads before
+            # falling back to a per-row query.
+            story._is_favorite = story_id in favourited
+
+    return stories
+
+
+def related_counts_by_story(model, story_ids):
+    """``{story_id: count}`` for a story's chapters / audios / videos.
+
+    One grouped query for the whole page, replacing the ``story.chapters
+    .count()`` that the overall-progress maths used to run inside the per-row
+    loop. Stories with none are simply absent, so callers must treat a missing
+    key as zero — which is also the "no items, so no meaningful overall
+    progress" case they already guard for.
+    """
+    story_ids = {story_id for story_id in story_ids if story_id}
+    if not story_ids:
+        return {}
+    return dict(
+        model.objects.filter(story_id__in=story_ids)
+        .values_list("story_id")
+        .annotate(total=Count("id"))
+    )
 
 
 class AuthenticationViewSet(viewsets.GenericViewSet):
@@ -530,9 +585,12 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
                 item.chapter.slug
             ] = max(0.0, min(1.0, item.progress))
 
+        chapter_counts = related_counts_by_story(Chapter, story_ids)
+        cards = card_stories_by_id(story_ids, request.user)
+
         payload = []
         for item in progress_qs:
-            total_chapters = item.story.chapters.count()
+            total_chapters = chapter_counts.get(item.story_id, 0)
             chapter_progress_map = chapter_progress_by_story.get(item.story_id, {})
             overall_progress = (
                 sum(chapter_progress_map.values()) / total_chapters if total_chapters > 0 else 0.0
@@ -542,7 +600,7 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
                 continue
             payload.append(
                 {
-                    "story": item.story,
+                    "story": cards.get(item.story_id, item.story),
                     "chapter_slug": item.chapter.slug if item.chapter else None,
                     "chapter_title": item.chapter.title if item.chapter else None,
                     "chapter_progress": max(0.0, min(1.0, item.progress)),
@@ -581,9 +639,12 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
                 item.chapter.slug
             ] = max(0.0, min(1.0, item.progress))
 
+        chapter_counts = related_counts_by_story(Chapter, story_ids)
+        cards = card_stories_by_id(story_ids, request.user)
+
         payload = []
         for item in progress_qs:
-            total_chapters = item.story.chapters.count()
+            total_chapters = chapter_counts.get(item.story_id, 0)
             chapter_progress_map = chapter_progress_by_story.get(item.story_id, {})
             overall_progress = (
                 sum(chapter_progress_map.values()) / total_chapters if total_chapters > 0 else 0.0
@@ -592,7 +653,7 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
                 continue
             payload.append(
                 {
-                    "story": item.story,
+                    "story": cards.get(item.story_id, item.story),
                     "chapter_slug": item.chapter.slug if item.chapter else None,
                     "chapter_title": item.chapter.title if item.chapter else None,
                     "chapter_progress": max(0.0, min(1.0, item.progress)),
@@ -638,16 +699,19 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
                 max(0.0, min(1.0, item.progress))
             )
 
+        audio_counts = related_counts_by_story(Audio, story_ids)
+        cards = card_stories_by_id(story_ids, request.user)
+
         payload = []
         for item in sorted(selected_items, key=lambda x: x.updated_at, reverse=True):
-            story_audio_count = item.story.audios.count()
+            story_audio_count = audio_counts.get(item.story_id, 0)
             story_progress_values = audio_progress_map.get(item.story_id, [])
             overall_progress = (
                 sum(story_progress_values) / story_audio_count if story_audio_count > 0 else 0.0
             )
             payload.append(
                 {
-                    "story": item.story,
+                    "story": cards.get(item.story_id, item.story),
                     "audio_slug": item.audio.slug if item.audio else None,
                     "audio_title": item.audio.title if item.audio else None,
                     "audio_progress": max(0.0, min(1.0, item.progress)),
@@ -693,16 +757,19 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
                 max(0.0, min(1.0, item.progress))
             )
 
+        video_counts = related_counts_by_story(Video, story_ids)
+        cards = card_stories_by_id(story_ids, request.user)
+
         payload = []
         for item in sorted(selected_items, key=lambda x: x.updated_at, reverse=True):
-            story_video_count = item.story.videos.count()
+            story_video_count = video_counts.get(item.story_id, 0)
             story_progress_values = video_progress_map.get(item.story_id, [])
             overall_progress = (
                 sum(story_progress_values) / story_video_count if story_video_count > 0 else 0.0
             )
             payload.append(
                 {
-                    "story": item.story,
+                    "story": cards.get(item.story_id, item.story),
                     "video_slug": item.video.slug if item.video else None,
                     "video_title": item.video.title if item.video else None,
                     "video_progress": max(0.0, min(1.0, item.progress)),

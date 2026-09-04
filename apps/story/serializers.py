@@ -272,6 +272,7 @@ class StoryListSerializer(serializers.ModelSerializer):
     # has_audio()/has_video() methods, which call .exists() and N+1 per row).
     has_audio = serializers.SerializerMethodField()
     has_video = serializers.SerializerMethodField()
+    reading_time_minutes = serializers.SerializerMethodField()
 
     @staticmethod
     def _prefetched(obj, relation):
@@ -314,6 +315,13 @@ class StoryListSerializer(serializers.ModelSerializer):
     def get_summary_reading_minutes(self, obj):
         return reading_time.summary_reading_minutes(obj.summary) if obj.summary else None
 
+    # The cached counterpart of StoryDetailSerializer.reading_time_minutes, so
+    # cards, search results, recommendations and Continue Reading can all show
+    # the same "12 min read" the detail page shows. Reads denormalized columns
+    # only — see reading_time.story_reading_minutes_cached.
+    def get_reading_time_minutes(self, obj):
+        return reading_time.story_reading_minutes_cached(obj)
+
     def get_reviews_count(self, obj):
         annotated = getattr(obj, "_reviews_count", None)
         return annotated if annotated is not None else obj.reviews.count()
@@ -355,6 +363,7 @@ class StoryListSerializer(serializers.ModelSerializer):
             "categories",
             "author",
             "summary_reading_minutes",
+            "reading_time_minutes",
             "reviews_count",
             "is_favorite",
             "favorites_count",

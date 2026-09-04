@@ -1,5 +1,10 @@
 from datetime import timedelta
+from math import ceil
 from unittest.mock import patch
+
+from django.core.management import call_command
+from django.db import connection
+from django.test.utils import CaptureQueriesContext
 
 from django.contrib.auth import get_user_model
 from django.core.cache import cache
@@ -16,7 +21,9 @@ from apps.stats.models import (
     FileReadingProgress,
     ReadingProgress,
 )
+from apps.story import reading_time
 from apps.story.models import Audio, Chapter, Favorite, Genre, Review, Story
+from apps.story.signals import recompute_chapter_reading_minutes
 
 
 User = get_user_model()
@@ -273,6 +280,181 @@ class LibraryContinueReadingApiTests(APITestCase):
         item = response.data["results"][0]
         self.assertTrue(item["excerpt"])
         self.assertNotIn("<p>", item["excerpt"])
+
+    def test_continue_reading_reports_remaining_minutes(self):
+        self.client.force_authenticate(self.user)
+
+        response = self.client.get(reverse("auth-library-continue-reading"))
+
+        item = response.data["results"][0]
+        total = item["story"]["reading_time_minutes"]
+        self.assertIsNotNone(total)
+        # Half read, so about half the estimate is left — and never rounded
+        # down to zero while there is still text to read.
+        self.assertEqual(item["remaining_minutes"], ceil(total * 0.5))
+        self.assertGreaterEqual(item["remaining_minutes"], 1)
+
+    def test_remaining_minutes_is_null_when_the_story_has_no_estimate(self):
+        """A story of unknown length must not claim "~0 min remaining"."""
+        Chapter.objects.filter(story=self.story).update(content="")
+        recompute_chapter_reading_minutes(self.story.id)
+        self.client.force_authenticate(self.user)
+
+        response = self.client.get(reverse("auth-library-continue-reading"))
+
+        item = response.data["results"][0]
+        self.assertIsNone(item["story"]["reading_time_minutes"])
+        self.assertIsNone(item["remaining_minutes"])
+
+    def _reader_with_in_progress_stories(self, email, count):
+        user = User.objects.create_user(
+            email=email, username=email.split("@")[0], password="test-password"
+        )
+        for index in range(count):
+            story = Story.objects.create(
+                title=f"{email} {index}", slug=f"{email.split('@')[0]}-{index}", is_published=True
+            )
+            chapter = Chapter.objects.create(
+                story=story,
+                title="One",
+                slug=f"one-{email.split('@')[0]}-{index}",
+                order=1,
+                content="<p>" + ("word " * 400) + "</p>",
+            )
+            Chapter.objects.create(
+                story=story,
+                title="Two",
+                slug=f"two-{email.split('@')[0]}-{index}",
+                order=2,
+                content="<p>more</p>",
+            )
+            ReadingProgress.objects.create(
+                user=user, story=story, chapter=chapter, progress=0.5
+            )
+            ChapterReadingProgress.objects.create(
+                user=user, story=story, chapter=chapter, progress=0.5
+            )
+        return user
+
+    def _continue_reading_query_count(self, user):
+        self.client.force_authenticate(user)
+        with CaptureQueriesContext(connection) as captured:
+            response = self.client.get(reverse("auth-library-continue-reading"))
+        self.assertEqual(response.status_code, 200)
+        return len(response.data["results"]), len(captured.captured_queries)
+
+    def test_continue_reading_query_count_does_not_grow_with_the_page(self):
+        """Each card used to re-query its own author, genres, categories,
+        audios, videos, review count, favourite count and chapter count —
+        roughly seven queries per row. Asserting the two page sizes cost the
+        same is the property that matters; the absolute number is free to
+        change."""
+        one = self._reader_with_in_progress_stories("one-story@example.com", 1)
+        many = self._reader_with_in_progress_stories("many-stories@example.com", 7)
+
+        one_rows, one_queries = self._continue_reading_query_count(one)
+        many_rows, many_queries = self._continue_reading_query_count(many)
+
+        self.assertEqual(one_rows, 1)
+        self.assertEqual(many_rows, 7)
+        self.assertEqual(many_queries, one_queries)
+
+
+class CachedChapterReadingTimeTests(APITestCase):
+    """Story.cached_chapter_reading_minutes is what lets list responses show a
+    reading time without word-counting every chapter of every story."""
+
+    def setUp(self):
+        self.story = Story.objects.create(
+            title="Cached", slug="cached-reading-time", is_published=True
+        )
+
+    def test_saving_a_chapter_populates_the_cached_estimate(self):
+        Chapter.objects.create(
+            story=self.story,
+            title="One",
+            slug="one",
+            order=1,
+            content="<p>" + ("word " * 400) + "</p>",
+        )
+
+        self.story.refresh_from_db()
+        self.assertEqual(self.story.cached_chapter_reading_minutes, 2)
+
+    def test_the_cached_estimate_tracks_edits_and_deletions(self):
+        chapter = Chapter.objects.create(
+            story=self.story,
+            title="One",
+            slug="one",
+            order=1,
+            content="<p>" + ("word " * 400) + "</p>",
+        )
+        second = Chapter.objects.create(
+            story=self.story,
+            title="Two",
+            slug="two",
+            order=2,
+            content="<p>" + ("word " * 400) + "</p>",
+        )
+
+        self.story.refresh_from_db()
+        self.assertEqual(self.story.cached_chapter_reading_minutes, 4)
+
+        second.delete()
+        self.story.refresh_from_db()
+        self.assertEqual(self.story.cached_chapter_reading_minutes, 2)
+
+        chapter.content = "<p>" + ("word " * 1200) + "</p>"
+        chapter.save()
+        self.story.refresh_from_db()
+        self.assertEqual(self.story.cached_chapter_reading_minutes, 6)
+
+    def test_it_agrees_with_the_live_calculation(self):
+        Chapter.objects.create(
+            story=self.story,
+            title="One",
+            slug="one",
+            order=1,
+            content="<p>" + ("word " * 950) + "</p>",
+        )
+        self.story.refresh_from_db()
+
+        self.assertEqual(
+            reading_time.story_reading_minutes_cached(self.story),
+            reading_time.story_reading_minutes(self.story),
+        )
+
+    def test_it_falls_back_to_the_file_estimate_for_a_chapterless_story(self):
+        self.story.cached_file_reading_minutes = 42
+        self.story.save(update_fields=["cached_file_reading_minutes"])
+        self.story.refresh_from_db()
+
+        self.assertEqual(reading_time.story_reading_minutes_cached(self.story), 42)
+
+    def test_deleting_a_story_does_not_raise_through_the_chapter_cascade(self):
+        Chapter.objects.create(
+            story=self.story, title="One", slug="one", order=1, content="<p>hi</p>"
+        )
+
+        self.story.delete()
+
+        self.assertFalse(Story.objects.filter(slug="cached-reading-time").exists())
+
+    def test_the_backfill_command_fills_stories_that_predate_the_signal(self):
+        Chapter.objects.create(
+            story=self.story,
+            title="One",
+            slug="one",
+            order=1,
+            content="<p>" + ("word " * 400) + "</p>",
+        )
+        # Simulate a row written before the signal existed.
+        Story.objects.filter(pk=self.story.pk).update(cached_chapter_reading_minutes=None)
+
+        call_command("backfill_chapter_reading_times", verbosity=0)
+
+        self.story.refresh_from_db()
+        self.assertEqual(self.story.cached_chapter_reading_minutes, 2)
 
 
 class UserAdminApiTests(APITestCase):

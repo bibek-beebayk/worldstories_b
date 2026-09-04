@@ -384,6 +384,14 @@ class Story(models.Model):
     # meaningful for chapterless stories; chapter-based stories compute this
     # live instead since chapter content is already in Postgres.
     cached_file_reading_minutes = models.PositiveIntegerField(blank=True, null=True)
+    # Same idea for chapter-based stories, but for a different reason: chapter
+    # content is already in Postgres, so computing it live on a *detail* page
+    # is cheap and stays authoritative. A list response can't afford it — the
+    # estimate word-counts every chapter body, so a 24-card shelf would drag
+    # every chapter of every story through the database to render "12 min
+    # read". Kept fresh by the Chapter signals in signals.py and backfilled by
+    # the backfill_chapter_reading_times command.
+    cached_chapter_reading_minutes = models.PositiveIntegerField(blank=True, null=True)
     is_completed = models.BooleanField(default=False)
     is_original = models.BooleanField(default=False, db_index=True)
     # Manual homepage-hero position (1-5, superuser-set). Null = not manually

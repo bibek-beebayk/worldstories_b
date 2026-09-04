@@ -1,7 +1,10 @@
+from math import ceil
+
 from django.contrib.auth import authenticate
 from django.contrib.auth import get_user_model
 from rest_framework import serializers
 
+from apps.story import reading_time
 from apps.story.models import Favorite, Genre, Review, Submission
 from apps.story.serializers import GenreSerializer, StoryListSerializer
 
@@ -174,7 +177,42 @@ class UserProfileUpdateSerializer(serializers.ModelSerializer):
         return username
 
 
-class ContinueReadingItemSerializer(serializers.Serializer):
+class RemainingMinutesMixin(serializers.Serializer):
+    """`~8 min remaining` for a partly-finished item.
+
+    Derived from the story's existing time estimate rather than a second
+    calculation, and served from the API so every surface that shows it agrees.
+    None when the story has no estimate at all — no chapters and no cached
+    file-derived value — so the UI can omit the line rather than print
+    "~0 min remaining" for a story whose length is simply unknown.
+
+    These payloads are plain dicts built in the library views, not model
+    instances, hence the subscript access.
+    """
+
+    remaining_minutes = serializers.SerializerMethodField()
+
+    @staticmethod
+    def total_minutes(story):
+        """The whole-item estimate this surface counts down from. Overridden
+        by the listening/watching variants, whose totals come from media
+        duration rather than words on a page."""
+        return reading_time.story_reading_minutes_cached(story)
+
+    def get_remaining_minutes(self, obj):
+        total = self.total_minutes(obj["story"])
+        if not total:
+            return None
+        progress = max(0.0, min(1.0, obj["overall_progress"] or 0.0))
+        remaining = total * (1.0 - progress)
+        if remaining <= 0:
+            return 0
+        # Rounded up, so the last stretch of a story reads as "~1 min
+        # remaining" rather than "~0 min remaining".
+        return max(1, ceil(remaining))
+
+
+class ContinueReadingItemSerializer(RemainingMinutesMixin):
     story = StoryListSerializer()
     chapter_slug = serializers.CharField(allow_null=True)
     chapter_title = serializers.CharField(allow_null=True)
@@ -184,7 +222,11 @@ class ContinueReadingItemSerializer(serializers.Serializer):
     excerpt = serializers.CharField(allow_blank=True)
 
 
-class ContinueListeningItemSerializer(serializers.Serializer):
+class ContinueListeningItemSerializer(RemainingMinutesMixin):
+    @staticmethod
+    def total_minutes(story):
+        return reading_time.story_listening_minutes(story.audios.all())
+
     story = StoryListSerializer()
     audio_slug = serializers.CharField(allow_null=True)
     audio_title = serializers.CharField(allow_null=True)
@@ -193,7 +235,11 @@ class ContinueListeningItemSerializer(serializers.Serializer):
     updated_at = serializers.DateTimeField()
 
 
-class ContinueWatchingItemSerializer(serializers.Serializer):
+class ContinueWatchingItemSerializer(RemainingMinutesMixin):
+    @staticmethod
+    def total_minutes(story):
+        return reading_time.story_watch_minutes(story.videos.all())
+
     story = StoryListSerializer()
     video_slug = serializers.CharField(allow_null=True)
     video_title = serializers.CharField(allow_null=True)
