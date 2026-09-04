@@ -131,6 +131,21 @@ def record_completion_if_finished(user, story):
         metadata={"source": source},
     )
 
+    # Daily Story dates use the site's explicit UTC timezone. This event is
+    # server-owned like story_completed: it can only fire on the unique write
+    # that records completion, never once per browser or device.
+    from django.utils import timezone
+    from apps.story.models import DailyStory
+
+    if DailyStory.objects.filter(date=timezone.localdate(), story=story, active=True).exists():
+        AnalyticsEvent.objects.create(
+            event_type=AnalyticsEvent.EVENT_DAILY_STORY_COMPLETED,
+            user=user,
+            story=story,
+            visitor_id=AnalyticsEvent.SERVER_VISITOR_ID,
+            metadata={"date": timezone.localdate().isoformat(), "source": source},
+        )
+
     # A country is unlocked by the completion that first reaches it, so this
     # belongs here rather than anywhere the Passport is read. Same guarantee as
     # the completion itself: raised once, on the write that caused it.

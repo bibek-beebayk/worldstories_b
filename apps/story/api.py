@@ -16,7 +16,7 @@ from django.utils.text import slugify
 from django.utils.decorators import method_decorator
 from django.views.decorators.cache import cache_page
 from django.views.decorators.vary import vary_on_headers
-from datetime import timedelta
+from datetime import date, timedelta
 from storages.backends.s3 import S3Storage
 from rest_framework.parsers import FormParser, MultiPartParser, JSONParser
 from rest_framework.permissions import BasePermission
@@ -46,6 +46,7 @@ from .models import (
     Blog,
     StoryQueue,
     StoryType,
+    DailyStory,
     Tag,
     Theme,
     with_preferred_translation_only,
@@ -92,6 +93,8 @@ from .serializers import (
     StoryListSerializer,
     FeaturedStorySerializer,
     FeaturedStoryAdminSerializer,
+    DailyStorySerializer,
+    DailyStoryAdminSerializer,
     ChapterSearchResultSerializer,
     StoryDetailSerializer,
     ChapterSerializer,
@@ -1126,6 +1129,36 @@ class StoryAdminViewSet(ModelViewSet):
             FeaturedStoryAdminSerializer(stories, many=True, context={"request": request}).data
         )
 
+    @action(detail=False, methods=["get", "put", "delete"], url_path="daily")
+    def daily(self, request):
+        """Read or replace the Daily Story for one explicit UTC date."""
+        raw_date = request.query_params.get("date") or request.data.get("date")
+        try:
+            selected_date = date.fromisoformat(raw_date) if raw_date else timezone.localdate()
+        except (TypeError, ValueError):
+            return Response({"detail": "date must use YYYY-MM-DD."}, status=status.HTTP_400_BAD_REQUEST)
+
+        current = DailyStory.objects.select_related("story", "story__author").filter(date=selected_date).first()
+        if request.method == "GET":
+            if not current:
+                return Response(None)
+            return Response(DailyStoryAdminSerializer(current, context={"request": request}).data)
+
+        if request.method == "DELETE":
+            if current:
+                current.delete()
+            return Response(status=status.HTTP_204_NO_CONTENT)
+
+        payload = request.data.copy()
+        payload["date"] = selected_date.isoformat()
+        serializer = DailyStoryAdminSerializer(current, data=payload)
+        serializer.is_valid(raise_exception=True)
+        daily_story = serializer.save()
+        return Response(
+            DailyStoryAdminSerializer(daily_story, context={"request": request}).data,
+            status=status.HTTP_200_OK if current else status.HTTP_201_CREATED,
+        )
+
     @action(detail=False, methods=["post"], url_path="bulk-taxonomy-preview")
     def bulk_taxonomy_preview(self, request):
         """Parses an uploaded CSV/Excel file and previews the tags/themes/
@@ -2014,6 +2047,29 @@ class HomeDataAPIView(APIView):
             featured_stories = manual_featured
         else:
             featured_stories = take(base_qs.order_by("-views", "-rating", "-id"), 5)
+        # Dates are deliberately interpreted in Django's configured timezone,
+        # which is UTC. Every visitor therefore receives the same story for a
+        # given date, regardless of their device timezone. With no active
+        # record, the hero's existing lead story is the graceful fallback.
+        configured_daily = (
+            DailyStory.objects.select_related("story", "story__author")
+            .filter(date=timezone.localdate(), active=True, story__in=base_qs)
+            .first()
+        )
+        if configured_daily:
+            daily_story = DailyStorySerializer(configured_daily, context={"request": request}).data
+            daily_story["configured"] = True
+        elif featured_stories:
+            daily_story = {
+                "date": timezone.localdate().isoformat(),
+                "story": FeaturedStorySerializer(
+                    featured_stories[0], context={"request": request}
+                ).data,
+                "featured_reason": "Today's featured story",
+                "configured": False,
+            }
+        else:
+            daily_story = None
         weekly_spotlight = take(base_qs.order_by("-rating", "-views", "-id"), 6)
         sidebar_recommended = take(base_qs.order_by("-rating", "-views", "-id"), 3)
         new_trending = take(base_qs.order_by("-views", "-site_published_date", "-id"), 5)
@@ -2043,6 +2099,7 @@ class HomeDataAPIView(APIView):
                 "featured_stories": FeaturedStorySerializer(
                     featured_stories, many=True, context={"request": request}
                 ).data,
+                "daily_story": daily_story,
                 "weekly_spotlight": StoryListSerializer(
                     weekly_spotlight, many=True, context={"request": request}
                 ).data,

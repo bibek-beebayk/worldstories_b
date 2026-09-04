@@ -154,6 +154,43 @@ class AudioReadAlongOffsetMigrationTests(TransactionTestCase):
         self.assertEqual(audio.transcript, "<p>Kept.</p>")
 
 
+class DailyStoryMigrationTests(TransactionTestCase):
+    """Adding the editorial schedule preserves every pre-existing Story."""
+
+    serialized_rollback = True
+    migrate_from = ("story", "0073_story_cached_chapter_reading_minutes")
+    migrate_to = ("story", "0074_dailystory")
+
+    def setUp(self):
+        super().setUp()
+        executor = MigrationExecutor(connection)
+        executor.migrate([self.migrate_from])
+        old_apps = executor.loader.project_state([self.migrate_from]).apps
+        StoryType = old_apps.get_model("story", "StoryType")
+        Story = old_apps.get_model("story", "Story")
+        story_type = StoryType.objects.create(name="Daily Migration Type")
+        self.story_id = Story.objects.create(
+            title="Existing Before Daily Stories",
+            slug="existing-before-daily-stories",
+            story_type_id=story_type.pk,
+        ).pk
+
+        executor = MigrationExecutor(connection)
+        executor.migrate([self.migrate_to])
+        self.apps = executor.loader.project_state([self.migrate_to]).apps
+
+    def tearDown(self):
+        executor = MigrationExecutor(connection)
+        executor.migrate(executor.loader.graph.leaf_nodes())
+        super().tearDown()
+
+    def test_existing_story_survives_and_schedule_starts_empty(self):
+        Story = self.apps.get_model("story", "Story")
+        DailyStory = self.apps.get_model("story", "DailyStory")
+        self.assertTrue(Story.objects.filter(pk=self.story_id).exists())
+        self.assertEqual(DailyStory.objects.count(), 0)
+
+
 class StoryIsOriginalMigrationTests(TransactionTestCase):
     """`Story.is_original` is an additive BooleanField — proves it applies over
     an existing story row and defaults to False."""

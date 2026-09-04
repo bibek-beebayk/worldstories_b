@@ -7,7 +7,7 @@ from django.urls import reverse
 from django.utils import timezone
 from rest_framework.test import APIClient, APITestCase
 
-from apps.story.models import Audio, Chapter, Genre, Video, Blog, Story, StoryView, Submission
+from apps.story.models import Audio, Chapter, DailyStory, Genre, Video, Blog, Story, StoryView, Submission
 from apps.users.models import User
 
 from .completion import COMPLETION_THRESHOLD
@@ -1284,6 +1284,20 @@ class StoryCompletionTests(APITestCase):
         self.assertEqual(event.story, story)
         self.assertEqual(event.metadata["source"], StoryCompletion.SOURCE_CHAPTERS)
         self.assertEqual(event.visitor_id, AnalyticsEvent.SERVER_VISITOR_ID)
+
+    def test_finishing_todays_configured_story_raises_daily_completion_once(self):
+        story = self._story("daily-completion", chapters=1)
+        DailyStory.objects.create(date=timezone.localdate(), story=story)
+        chapter = story.chapters.get()
+
+        self._save_chapter(story, chapter, 1.0)
+        self._save_chapter(story, chapter, 1.0)
+
+        events = AnalyticsEvent.objects.filter(
+            event_type=AnalyticsEvent.EVENT_DAILY_STORY_COMPLETED, story=story
+        )
+        self.assertEqual(events.count(), 1)
+        self.assertEqual(events.get().metadata["date"], timezone.localdate().isoformat())
 
     def test_an_unfinished_story_raises_no_completion_event(self):
         story = self._story("event-none", chapters=2)

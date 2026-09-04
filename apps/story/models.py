@@ -455,6 +455,21 @@ class Story(models.Model):
         verbose_name_plural = "Stories"
 
 
+class DailyStory(models.Model):
+    """The one editorial story shown to every reader on a UTC calendar date."""
+
+    date = models.DateField(unique=True, db_index=True)
+    story = models.ForeignKey(Story, on_delete=models.CASCADE, related_name="daily_features")
+    featured_reason = models.CharField(max_length=280, blank=True)
+    active = models.BooleanField(default=True, db_index=True)
+
+    class Meta:
+        ordering = ["-date"]
+
+    def __str__(self):
+        return f"{self.date}: {self.story.title}"
+
+
 def with_preferred_translation_only(queryset, preferred_language=None):
     """Given a queryset of Story rows, keep only one row per translation_group.
     When a language is requested, choose within that language; otherwise use

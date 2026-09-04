@@ -66,6 +66,7 @@ from apps.story.models import (
     PromptSettings,
     Review,
     Story,
+    DailyStory,
     StoryQueue,
     StoryType,
     Tag,
@@ -1184,6 +1185,35 @@ class HomeDataQuickReadsTests(APITestCase):
         slugs = [story["slug"] for story in response.data["featured_stories"]]
         self.assertEqual(slugs, ["auto-1", "auto-2", "auto-3", "auto-4", "auto-5"])
 
+    def test_active_daily_story_replaces_the_hero_for_the_utc_date(self):
+        daily = Story.objects.create(
+            title="Today's Choice", slug="todays-choice", is_published=True,
+            country="NP", summary="<p>A short summary.</p>", cached_chapter_reading_minutes=12,
+        )
+        DailyStory.objects.create(
+            date=timezone.localdate(), story=daily, featured_reason="A journey worth taking."
+        )
+
+        response = self.client.get(reverse("home-data"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.data["daily_story"]["configured"])
+        self.assertEqual(response.data["daily_story"]["story"]["slug"], daily.slug)
+        self.assertEqual(response.data["daily_story"]["story"]["country"], "NP")
+        self.assertEqual(response.data["daily_story"]["featured_reason"], "A journey worth taking.")
+
+    def test_missing_or_inactive_daily_story_falls_back_to_featured_lead(self):
+        lead = Story.objects.create(
+            title="Hero Lead", slug="hero-lead", is_published=True, featured_rank=1
+        )
+        inactive = Story.objects.create(title="Inactive", slug="inactive-daily", is_published=True)
+        DailyStory.objects.create(date=timezone.localdate(), story=inactive, active=False)
+
+        response = self.client.get(reverse("home-data"))
+
+        self.assertFalse(response.data["daily_story"]["configured"])
+        self.assertEqual(response.data["daily_story"]["story"]["slug"], lead.slug)
+
     def test_originals_section_only_lists_flagged_published_stories(self):
         original = Story.objects.create(
             title="An Original", slug="an-original", is_published=True, is_original=True
@@ -1202,6 +1232,50 @@ class HomeDataQuickReadsTests(APITestCase):
         self.assertEqual([s["slug"] for s in response.data["originals"]], ["an-original"])
         self.assertTrue(response.data["originals"][0]["is_original"])
 
+
+class DailyStoryAdminApiTests(APITestCase):
+    def setUp(self):
+        admin = User.objects.create_user(
+            email="daily-admin@example.com", username="daily-admin", password="x",
+            is_staff=True, is_superuser=True,
+        )
+        self.client.force_authenticate(admin)
+        self.story = Story.objects.create(title="Daily Pick", slug="daily-pick", is_published=True)
+        self.url = reverse("admin-story-daily")
+
+    def test_create_update_read_and_delete_a_date(self):
+        selected_date = "2026-09-07"
+        created = self.client.put(
+            self.url,
+            {"date": selected_date, "story": self.story.id, "featured_reason": "Read this.", "active": True},
+            format="json",
+        )
+        self.assertEqual(created.status_code, 201)
+        self.assertEqual(created.data["story_detail"]["slug"], self.story.slug)
+
+        fetched = self.client.get(self.url, {"date": selected_date})
+        self.assertEqual(fetched.status_code, 200)
+        self.assertEqual(fetched.data["featured_reason"], "Read this.")
+
+        updated = self.client.put(
+            self.url,
+            {"date": selected_date, "story": self.story.id, "featured_reason": "Updated.", "active": False},
+            format="json",
+        )
+        self.assertEqual(updated.status_code, 200)
+        self.assertFalse(updated.data["active"])
+
+        self.assertEqual(self.client.delete(self.url, {"date": selected_date}).status_code, 204)
+        self.assertFalse(DailyStory.objects.filter(date=selected_date).exists())
+
+    def test_rejects_an_unpublished_story(self):
+        draft = Story.objects.create(title="Draft", slug="daily-draft", is_published=False)
+        response = self.client.put(
+            self.url,
+            {"date": "2026-09-08", "story": draft.id, "featured_reason": "", "active": True},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
 
 class AudioStreamRangeTests(SimpleTestCase):
     def make_view(self, payload=b"0123456789"):

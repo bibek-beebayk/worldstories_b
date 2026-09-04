@@ -252,6 +252,9 @@ class AnalyticsEvent(models.Model):
     # Raised by the server beside the award itself (apps/stats/achievements.py),
     # so it inherits the conditional update that makes awarding once-only.
     EVENT_ACHIEVEMENT_UNLOCKED = "achievement_unlocked"
+    EVENT_DAILY_STORY_VIEWED = "daily_story_viewed"
+    EVENT_DAILY_STORY_STARTED = "daily_story_started"
+    EVENT_DAILY_STORY_COMPLETED = "daily_story_completed"
     EVENT_CHOICES = [
         (EVENT_VISIT, "Visit"),
         (EVENT_AD_IMPRESSION, "Ad impression"),
@@ -273,6 +276,9 @@ class AnalyticsEvent(models.Model):
         (EVENT_COUNTRY_UNLOCKED, "Country unlocked"),
         (EVENT_PASSPORT_VIEWED, "Passport viewed"),
         (EVENT_ACHIEVEMENT_UNLOCKED, "Achievement unlocked"),
+        (EVENT_DAILY_STORY_VIEWED, "Daily Story viewed"),
+        (EVENT_DAILY_STORY_STARTED, "Daily Story started"),
+        (EVENT_DAILY_STORY_COMPLETED, "Daily Story completed"),
     ]
 
     # visitor_id for an event the server raises itself rather than receiving

@@ -27,6 +27,7 @@ from .models import (
     Blog,
     StoryQueue,
     StoryType,
+    DailyStory,
     published_story_q,
     with_preferred_translation_only,
 )
@@ -375,7 +376,15 @@ class FeaturedStorySerializer(StoryListSerializer):
     cover_image_size = LARGE_COVER_SIZE
 
     class Meta(StoryListSerializer.Meta):
-        fields = StoryListSerializer.Meta.fields + ["about"]
+        fields = StoryListSerializer.Meta.fields + ["about", "country"]
+
+
+class DailyStorySerializer(serializers.ModelSerializer):
+    story = FeaturedStorySerializer(read_only=True)
+
+    class Meta:
+        model = DailyStory
+        fields = ["date", "story", "featured_reason"]
 
 
 class ChapterSearchResultSerializer(serializers.Serializer):
@@ -1386,6 +1395,19 @@ class FeaturedStoryAdminSerializer(serializers.ModelSerializer):
     class Meta:
         model = Story
         fields = ["id", "title", "slug", "cover_image", "author", "is_published", "featured_rank"]
+
+
+class DailyStoryAdminSerializer(serializers.ModelSerializer):
+    story_detail = FeaturedStoryAdminSerializer(source="story", read_only=True)
+
+    class Meta:
+        model = DailyStory
+        fields = ["date", "story", "story_detail", "featured_reason", "active"]
+
+    def validate_story(self, story):
+        if not story.is_published:
+            raise serializers.ValidationError("Only a published story can be the Daily Story.")
+        return story
 
 
 class LinkedBlogSummarySerializer(serializers.ModelSerializer):

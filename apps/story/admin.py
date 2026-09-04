@@ -4,9 +4,18 @@ from django.utils.html import strip_tags
 from django.utils import timezone
 from django.utils.text import slugify
 from solo.admin import SingletonModelAdmin
-from .models import Audio, AudioTranscriptCue, Video, Blog, Story, Genre, Category, StoryType, Tag, Theme, Author, Chapter, PromptSettings, Review, Submission, StoryView
+from .models import Audio, AudioTranscriptCue, Video, Blog, Story, DailyStory, Genre, Category, StoryType, Tag, Theme, Author, Chapter, PromptSettings, Review, Submission, StoryView
 
 admin.site.register(PromptSettings, SingletonModelAdmin)
+
+
+@admin.register(DailyStory)
+class DailyStoryAdmin(admin.ModelAdmin):
+    list_display = ("date", "story", "active", "featured_reason")
+    list_filter = ("active", "date")
+    search_fields = ("story__title", "featured_reason")
+    autocomplete_fields = ("story",)
+    date_hierarchy = "date"
 
 
 class ChapterInline(admin.TabularInline):
