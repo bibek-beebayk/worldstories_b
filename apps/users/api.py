@@ -15,7 +15,7 @@ import logging
 import os
 from collections import defaultdict
 from datetime import timedelta
-from django.db.models import Count, Q
+from django.db.models import Count, Q, Sum
 from django.utils import timezone
 from .geo import record_login
 from .models import OTP
@@ -35,6 +35,7 @@ from apps.stats.models import (
 from apps.stats.streaks import compute_streak
 from apps.story.excerpts import excerpt_at_progress
 from .serializers import (
+    ReadingHistoryItemSerializer,
     RegisterSerializer,
     LoginSerializer,
     OTPValidateSerializer,
@@ -144,6 +145,7 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
             "logout",
             "library_continue_reading",
             "library_completed_reading",
+            "library_reading_history",
             "library_continue_listening",
             "library_continue_watching",
             "library_favorites",
@@ -414,56 +416,15 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
         video_ids = {story_id for story_id, _, _ in video_rows}
         started_ids = chapter_mode_ids | epub_ids | pdf_ids | audio_ids | video_ids
 
-        completed_ids = {
-            story_id for story_id, _, progress, _ in file_rows if progress >= 0.995
-        }
-
-        chapter_totals = dict(
-            Story.objects.filter(id__in=chapter_story_ids)
-            .annotate(item_count=Count("chapters"))
-            .values_list("id", "item_count")
-        )
-        completed_chapters = defaultdict(int)
-        for story_id, progress, _ in chapter_rows:
-            if progress >= 0.995:
-                completed_chapters[story_id] += 1
-        completed_ids.update(
-            story_id
-            for story_id, completed_count in completed_chapters.items()
-            if chapter_totals.get(story_id, 0) > 0
-            and completed_count >= chapter_totals[story_id]
-        )
-
-        audio_totals = dict(
-            Story.objects.filter(id__in=audio_ids)
-            .annotate(item_count=Count("audios"))
-            .values_list("id", "item_count")
-        )
-        completed_audio = defaultdict(int)
-        for story_id, progress, _ in audio_rows:
-            if progress >= 0.995:
-                completed_audio[story_id] += 1
-        completed_ids.update(
-            story_id
-            for story_id, completed_count in completed_audio.items()
-            if audio_totals.get(story_id, 0) > 0
-            and completed_count >= audio_totals[story_id]
-        )
-
-        video_totals = dict(
-            Story.objects.filter(id__in=video_ids)
-            .annotate(item_count=Count("videos"))
-            .values_list("id", "item_count")
-        )
-        completed_video = defaultdict(int)
-        for story_id, progress, _ in video_rows:
-            if progress >= 0.995:
-                completed_video[story_id] += 1
-        completed_ids.update(
-            story_id
-            for story_id, completed_count in completed_video.items()
-            if video_totals.get(story_id, 0) > 0
-            and completed_count >= video_totals[story_id]
+        # Read from the durable record rather than re-deriving completion from
+        # progress counts, which is what the ~50 lines this replaces used to do
+        # — three separate item-count queries and three defaultdict tallies,
+        # all of which could disagree with the Completed list on the same page.
+        # See apps/stats/completion.py.
+        completed_ids = set(
+            StoryCompletion.objects.filter(user=request.user).values_list(
+                "story_id", flat=True
+            )
         )
 
         def activity_date(value):
@@ -521,13 +482,43 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
         active_since = today - timedelta(days=29)
         active_days = len({day for day in all_activity_dates if day >= active_since})
 
+        # 4.4: measured, not estimated. Session events carry how long the
+        # reader actually had a reader or player open (see
+        # useContentSessionAnalytics), which is a different and more honest
+        # number than summing the stories' estimated durations — that would
+        # credit a reader for the whole of a book they abandoned on page two.
+        session_seconds = AnalyticsEvent.objects.filter(
+            user=request.user,
+            event_type__in=[
+                AnalyticsEvent.EVENT_READING_SESSION,
+                AnalyticsEvent.EVENT_LISTENING_SESSION,
+                AnalyticsEvent.EVENT_WATCHING_SESSION,
+            ],
+        ).aggregate(total=Sum("duration_seconds"))["total"] or 0
+
+        # Answerable today because Milestone 2.0 made completion durable; the
+        # Story Passport (Milestone 5) builds the page around this same fact.
+        countries_explored = (
+            Story.objects.filter(id__in=completed_ids)
+            .exclude(country="")
+            .values("country")
+            .distinct()
+            .count()
+        )
+
         return Response(
             {
                 "summary": {
                     "titles_started": len(started_ids),
-                    "titles_completed": len(completed_ids & started_ids),
+                    # Completions are counted from the record itself, not
+                    # intersected with started_ids: a story finished on a
+                    # device whose progress rows have since been pruned is
+                    # still finished.
+                    "titles_completed": len(completed_ids),
                     "active_days_30": active_days,
                     "favorite_genre": genres[0]["name"] if genres else None,
+                    "total_reading_minutes": round(session_seconds / 60),
+                    "countries_explored": countries_explored,
                 },
                 "activity": [
                     {
@@ -798,6 +789,81 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
             )
             return self.get_paginated_response(serializer.data)
         serializer = ContinueWatchingItemSerializer(
+            payload, many=True, context={"request": request}
+        )
+        return Response(serializer.data)
+
+    @action(detail=False, methods=["get"], url_path="library/reading-history")
+    def library_reading_history(self, request):
+        """Everything this reader has opened, most recently touched first.
+
+        Distinct from Continue Reading, which is only what is *unfinished*, and
+        from Completed, which is only what is *finished*. History is the whole
+        record — the answer to "what was that story I read a few weeks ago".
+
+        Derived from the progress rows that already exist rather than a new
+        table: every surface stamps `updated_at` on save, so the latest across
+        a story's rows is when the reader last touched it. `progress` is the
+        furthest of those rows, so a story read to the end as an audiobook
+        reads as complete even if its text was barely opened.
+        """
+        sources = [
+            (ReadingProgress, "reading"),
+            (ChapterReadingProgress, "chapter"),
+            (FileReadingProgress, "file"),
+            (AudioReadingProgress, "audio"),
+            (VideoWatchProgress, "video"),
+        ]
+
+        last_read_at = {}
+        furthest_progress = {}
+        for model, _label in sources:
+            rows = model.objects.filter(user=request.user).values_list(
+                "story_id", "progress", "updated_at"
+            )
+            for story_id, progress, updated_at in rows:
+                if story_id is None:
+                    continue
+                progress = max(0.0, min(1.0, progress or 0.0))
+                seen_at = last_read_at.get(story_id)
+                # Membership check rather than a sentinel default: datetime.min
+                # is naive and these are timezone-aware, which raises rather
+                # than comparing.
+                if seen_at is None or updated_at > seen_at:
+                    last_read_at[story_id] = updated_at
+                furthest_progress[story_id] = max(
+                    furthest_progress.get(story_id, 0.0), progress
+                )
+
+        story_ids = sorted(last_read_at, key=lambda sid: last_read_at[sid], reverse=True)
+        cards = card_stories_by_id(story_ids, request.user)
+        completed_ids = set(
+            StoryCompletion.objects.filter(
+                user=request.user, story_id__in=story_ids
+            ).values_list("story_id", flat=True)
+        )
+
+        payload = [
+            {
+                "story": cards[story_id],
+                "last_read_at": last_read_at[story_id],
+                "progress": round(furthest_progress.get(story_id, 0.0), 4),
+                # From the record, not from the progress fraction: a story can
+                # be complete while no single surface reads 100%.
+                "completed": story_id in completed_ids,
+            }
+            for story_id in story_ids
+            # A story unpublished since it was read has no card to show.
+            if story_id in cards
+        ]
+
+        page = self.paginate_queryset(payload)
+        if page is not None:
+            serializer = ReadingHistoryItemSerializer(
+                page, many=True, context={"request": request}
+            )
+            return self.get_paginated_response(serializer.data)
+        serializer = ReadingHistoryItemSerializer(
             payload, many=True, context={"request": request}
         )
         return Response(serializer.data)

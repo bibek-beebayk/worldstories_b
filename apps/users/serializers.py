@@ -222,6 +222,20 @@ class ContinueReadingItemSerializer(RemainingMinutesMixin):
     excerpt = serializers.CharField(allow_blank=True)
 
 
+class ReadingHistoryItemSerializer(serializers.Serializer):
+    """One row of "everything you have opened".
+
+    Deliberately not a RemainingMinutesMixin subclass: history is a record of
+    what happened, not an invitation to continue, and a "~8 min remaining" on a
+    story finished last year would be noise.
+    """
+
+    story = StoryListSerializer()
+    last_read_at = serializers.DateTimeField()
+    progress = serializers.FloatField()
+    completed = serializers.BooleanField()
+
+
 class ContinueListeningItemSerializer(RemainingMinutesMixin):
     @staticmethod
     def total_minutes(story):

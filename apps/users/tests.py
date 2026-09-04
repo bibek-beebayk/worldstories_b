@@ -21,6 +21,7 @@ from apps.stats.models import (
     FileReadingProgress,
     ReadingProgress,
     StoryCompletion,
+    VideoWatchProgress,
 )
 from apps.story import reading_time
 from apps.story.models import Audio, Chapter, Favorite, Genre, Review, Story
@@ -179,6 +180,12 @@ class ProfileInsightsApiTests(APITestCase):
             audio=audio,
             progress=0.25,
         )
+        # titles_completed reads the durable StoryCompletion record now rather
+        # than re-deriving completion from progress counts, so the finish has
+        # to be recorded the way the progress endpoints record it.
+        StoryCompletion.objects.create(
+            user=self.user, story=story, source=StoryCompletion.SOURCE_CHAPTERS
+        )
         self.client.force_authenticate(self.user)
 
         response = self.client.get(reverse("auth-profile-insights"))
@@ -188,6 +195,11 @@ class ProfileInsightsApiTests(APITestCase):
         self.assertEqual(response.data["summary"]["titles_completed"], 1)
         self.assertEqual(response.data["summary"]["favorite_genre"], "Fantasy")
         self.assertEqual(response.data["summary"]["active_days_30"], 1)
+        # Reading Journey fields (§4.3/§4.4). Reading time is measured from
+        # session events, and this reader has none — zero, not an estimate
+        # derived from the story's length.
+        self.assertEqual(response.data["summary"]["total_reading_minutes"], 0)
+        self.assertEqual(response.data["summary"]["countries_explored"], 0)
         formats = {item["name"]: item["value"] for item in response.data["formats"]}
         self.assertEqual(formats["Chapters"], 1)
         self.assertEqual(formats["EPUB"], 1)
@@ -1118,3 +1130,230 @@ class ReaderTasteSignalTests(APITestCase):
         taste = reader_taste(self.user)
 
         self.assertEqual(taste.bonus_for(self._story("placeless")), 0)
+
+
+class ReadingJourneySummaryTests(APITestCase):
+    """The §4.3 panel's numbers, and §4.4's insistence that reading time be
+    measured rather than estimated."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            email="journey@example.com", username="journey", password="test-password"
+        )
+        self.client.force_authenticate(self.user)
+
+    def _finished(self, slug, country=""):
+        story = Story.objects.create(
+            title=slug, slug=slug, is_published=True, country=country
+        )
+        StoryCompletion.objects.create(
+            user=self.user, story=story, source=StoryCompletion.SOURCE_CHAPTERS
+        )
+        return story
+
+    def _summary(self):
+        return self.client.get(reverse("auth-profile-insights")).data["summary"]
+
+    def test_reading_time_comes_from_real_sessions_not_story_estimates(self):
+        """A reader who abandoned a long book on page two has not read it —
+        summing estimated story durations would say otherwise."""
+        story = Story.objects.create(title="Long", slug="a-long-one", is_published=True)
+        Chapter.objects.create(
+            story=story, title="One", slug="long-one", order=1,
+            content="<p>" + ("word " * 20000) + "</p>",
+        )
+        ReadingProgress.objects.create(user=self.user, story=story, progress=0.02)
+        AnalyticsEvent.objects.create(
+            event_type=AnalyticsEvent.EVENT_READING_SESSION,
+            user=self.user, story=story, visitor_id="v", duration_seconds=300,
+        )
+
+        self.assertEqual(self._summary()["total_reading_minutes"], 5)
+
+    def test_it_counts_listening_and_watching_time_too(self):
+        story = Story.objects.create(title="Mixed", slug="mixed", is_published=True)
+        for event_type, seconds in (
+            (AnalyticsEvent.EVENT_READING_SESSION, 60),
+            (AnalyticsEvent.EVENT_LISTENING_SESSION, 120),
+            (AnalyticsEvent.EVENT_WATCHING_SESSION, 180),
+        ):
+            AnalyticsEvent.objects.create(
+                event_type=event_type, user=self.user, story=story,
+                visitor_id="v", duration_seconds=seconds,
+            )
+
+        self.assertEqual(self._summary()["total_reading_minutes"], 6)
+
+    def test_countries_explored_counts_distinct_countries_of_finished_stories(self):
+        self._finished("jp-one", country="JP")
+        self._finished("jp-two", country="JP")
+        self._finished("fr-one", country="FR")
+
+        self.assertEqual(self._summary()["countries_explored"], 2)
+
+    def test_a_finished_story_with_no_country_explores_nowhere(self):
+        self._finished("placeless")
+
+        self.assertEqual(self._summary()["countries_explored"], 0)
+
+    def test_an_unfinished_story_does_not_explore_its_country(self):
+        """§5.2: a country is explored by *completing* a story from it."""
+        story = Story.objects.create(
+            title="Started", slug="started-jp", is_published=True, country="JP"
+        )
+        ReadingProgress.objects.create(user=self.user, story=story, progress=0.5)
+
+        self.assertEqual(self._summary()["countries_explored"], 0)
+
+    def test_a_new_reader_gets_zeroes_rather_than_an_error(self):
+        summary = self._summary()
+
+        self.assertEqual(summary["titles_completed"], 0)
+        self.assertEqual(summary["total_reading_minutes"], 0)
+        self.assertEqual(summary["countries_explored"], 0)
+        self.assertIsNone(summary["favorite_genre"])
+
+
+class ReadingHistoryApiTests(APITestCase):
+    """History is the whole record — distinct from Continue Reading (only what
+    is unfinished) and Completed (only what is finished)."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            email="historian@example.com", username="historian", password="test-password"
+        )
+        self.client.force_authenticate(self.user)
+
+    def _story(self, slug, chapters=1, audios=0):
+        story = Story.objects.create(title=slug, slug=slug, is_published=True)
+        for index in range(chapters):
+            Chapter.objects.create(
+                story=story, title=f"C{index}", slug=f"{slug}-c{index}",
+                order=index + 1, content="<p>text</p>",
+            )
+        for index in range(audios):
+            Audio.objects.create(
+                story=story, title=f"A{index}", slug=f"{slug}-a{index}",
+                order=index + 1, audio_file="story_audios/fake.mp3",
+            )
+        return story
+
+    def _get(self):
+        return self.client.get(reverse("auth-library-reading-history"))
+
+    def test_it_lists_everything_opened_most_recent_first(self):
+        older = self._story("read-long-ago")
+        newer = self._story("read-yesterday")
+        for story in (older, newer):
+            ReadingProgress.objects.create(
+                user=self.user, story=story, chapter=story.chapters.first(), progress=0.3
+            )
+        ReadingProgress.objects.filter(story=older).update(
+            updated_at=timezone.now() - timedelta(days=30)
+        )
+
+        response = self._get()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            [row["story"]["slug"] for row in response.data["results"]],
+            ["read-yesterday", "read-long-ago"],
+        )
+
+    def test_it_includes_finished_stories_unlike_continue_reading(self):
+        story = self._story("finished-one")
+        ChapterReadingProgress.objects.create(
+            user=self.user, story=story, chapter=story.chapters.first(), progress=1.0
+        )
+        StoryCompletion.objects.create(
+            user=self.user, story=story, source=StoryCompletion.SOURCE_CHAPTERS
+        )
+
+        row = self._get().data["results"][0]
+
+        self.assertEqual(row["story"]["slug"], "finished-one")
+        self.assertTrue(row["completed"])
+
+    def test_completion_comes_from_the_record_not_the_progress_fraction(self):
+        """A story can be complete while no single surface reads 100% — an
+        audiobook finished after the text was barely opened."""
+        story = self._story("listened-not-read", chapters=1, audios=1)
+        ReadingProgress.objects.create(
+            user=self.user, story=story, chapter=story.chapters.first(), progress=0.05
+        )
+        StoryCompletion.objects.create(
+            user=self.user, story=story, source=StoryCompletion.SOURCE_AUDIO
+        )
+
+        row = self._get().data["results"][0]
+
+        self.assertTrue(row["completed"])
+
+    def test_progress_is_the_furthest_any_surface_reached(self):
+        story = self._story("part-read", chapters=1, audios=1)
+        ReadingProgress.objects.create(
+            user=self.user, story=story, chapter=story.chapters.first(), progress=0.2
+        )
+        AudioReadingProgress.objects.create(
+            user=self.user, story=story, audio=story.audios.first(), progress=0.8
+        )
+
+        row = self._get().data["results"][0]
+
+        self.assertAlmostEqual(row["progress"], 0.8)
+        self.assertFalse(row["completed"])
+
+    def test_a_story_appears_once_however_many_surfaces_were_used(self):
+        story = self._story("read-and-heard", chapters=1, audios=1)
+        ReadingProgress.objects.create(
+            user=self.user, story=story, chapter=story.chapters.first(), progress=0.4
+        )
+        AudioReadingProgress.objects.create(
+            user=self.user, story=story, audio=story.audios.first(), progress=0.6
+        )
+        ChapterReadingProgress.objects.create(
+            user=self.user, story=story, chapter=story.chapters.first(), progress=0.4
+        )
+
+        self.assertEqual(len(self._get().data["results"]), 1)
+
+    def test_it_is_empty_for_a_reader_who_has_opened_nothing(self):
+        self.assertEqual(self._get().data["results"], [])
+
+    def test_it_requires_authentication(self):
+        self.client.force_authenticate(None)
+
+        # format="json" so DRF answers with JSON rather than rendering its
+        # browsable-API template, which Django's template-capture in the test
+        # client cannot copy on this Python build.
+        response = self.client.get(
+            reverse("auth-library-reading-history"), format="json"
+        )
+
+        self.assertIn(response.status_code, (401, 403))
+
+    def test_query_count_does_not_grow_with_the_page(self):
+        def history_cost(user, count):
+            self.client.force_authenticate(user)
+            for index in range(count):
+                story = self._story(f"{user.username}-{index}")
+                ReadingProgress.objects.create(
+                    user=user, story=story, chapter=story.chapters.first(), progress=0.5
+                )
+            with CaptureQueriesContext(connection) as captured:
+                response = self.client.get(reverse("auth-library-reading-history"))
+            self.assertEqual(response.status_code, 200)
+            return len(response.data["results"]), len(captured.captured_queries)
+
+        one = User.objects.create_user(
+            email="hist1@example.com", username="histone", password="test-password"
+        )
+        many = User.objects.create_user(
+            email="hist2@example.com", username="histmany", password="test-password"
+        )
+
+        one_rows, one_queries = history_cost(one, 1)
+        many_rows, many_queries = history_cost(many, 6)
+
+        self.assertEqual((one_rows, many_rows), (1, 6))
+        self.assertEqual(many_queries, one_queries)
