@@ -10,7 +10,7 @@ from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db.models import Sum, Avg, Count, Exists, F, IntegerField, OuterRef, Prefetch, Subquery
 from django.db.models import Q
 from django.db.models.functions import Coalesce
-from django.http import FileResponse, HttpResponse, StreamingHttpResponse
+from django.http import FileResponse, Http404, HttpResponse, StreamingHttpResponse
 from django.db import transaction
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -32,6 +32,7 @@ from apps.stats.models import (
     VideoWatchProgress,
 )
 from apps.users.models import User
+from apps.stats.journeys import journey_progress, journeys_for_reader
 from apps.users.recommendations import (
     completion_recommendations,
     recommend_because_finished,
@@ -65,6 +66,8 @@ from .models import (
     LANGUAGE_CHOICES,
     COUNTRY_CHOICES,
     Mood,
+    StoryJourney,
+    StoryJourneyItem,
     StoryMood,
 )
 from .epub_import_jobs import executor as epub_import_executor, run_epub_import
@@ -95,8 +98,12 @@ from .serializers import (
     AdminTagSerializer,
     ThemeSerializer,
     ThemeDetailSerializer,
+    CARD_COVER_SIZE,
     AdminMoodSerializer,
+    AdminStoryJourneyItemSerializer,
+    AdminStoryJourneySerializer,
     AdminStoryMoodSerializer,
+    get_cover_image_url,
     AdminThemeSerializer,
     StoryTypeSerializer,
     AdminStoryTypeSerializer,
@@ -2070,6 +2077,100 @@ def _unique_theme_slug(name: str) -> str:
     return slug
 
 
+def _unique_journey_slug(title: str) -> str:
+    base_slug = slugify(title) or "journey"
+    slug = base_slug
+    index = 2
+    while StoryJourney.objects.filter(slug=slug).exists():
+        slug = f"{base_slug}-{index}"
+        index += 1
+    return slug
+
+
+class StoryJourneyAdminViewSet(ModelViewSet):
+    """Journey management for the admin panel.
+
+    Exists because Django admin is unusable on this deployment (Django 5.0 on
+    Python 3.14 — `BaseContext.__copy__` breaks every admin change list), and
+    because every other kind of content here is managed from the custom panel
+    anyway. The Django admin registration stays as a fallback for whenever that
+    version mismatch is resolved.
+    """
+
+    queryset = StoryJourney.objects.all().prefetch_related("items__story").order_by("order", "title")
+    serializer_class = AdminStoryJourneySerializer
+    permission_classes = [IsSuperUser]
+    pagination_class = None
+    filter_backends = [SearchFilter]
+    search_fields = ["title", "description"]
+
+    def perform_create(self, serializer):
+        serializer.save(slug=_unique_journey_slug(serializer.validated_data["title"]))
+
+    @action(detail=True, methods=["get", "put"], url_path="items")
+    def items(self, request, pk=None):
+        """Read or replace a journey's ordered story list.
+
+        PUT replaces the whole set, which matches how the editor works — they
+        arrange the journey and save it, rather than issuing add/remove/reorder
+        operations one at a time. Position is taken from the order the client
+        sends, so reordering needs no separate endpoint.
+        """
+        journey = self.get_object()
+
+        if request.method == "GET":
+            return Response(
+                AdminStoryJourneyItemSerializer(
+                    journey.items.select_related("story").all(),
+                    many=True,
+                    context={"request": request},
+                ).data
+            )
+
+        payload = request.data.get("items")
+        if not isinstance(payload, list):
+            return Response(
+                {"detail": "items must be a list."}, status=status.HTTP_400_BAD_REQUEST
+            )
+
+        wanted = []
+        seen = set()
+        for index, row in enumerate(payload):
+            try:
+                story_id = int(row.get("story"))
+            except (AttributeError, TypeError, ValueError):
+                return Response(
+                    {"detail": "Each item needs a numeric story id."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            # A story twice in one journey is an editing slip, not a path.
+            if story_id in seen:
+                continue
+            seen.add(story_id)
+            wanted.append((story_id, index + 1, bool(row.get("required", True))))
+
+        valid_ids = set(Story.objects.filter(id__in=seen).values_list("id", flat=True))
+
+        with transaction.atomic():
+            journey.items.exclude(story_id__in=valid_ids).delete()
+            for story_id, position, required in wanted:
+                if story_id not in valid_ids:
+                    continue
+                StoryJourneyItem.objects.update_or_create(
+                    journey=journey,
+                    story_id=story_id,
+                    defaults={"position": position, "required": required},
+                )
+
+        return Response(
+            AdminStoryJourneyItemSerializer(
+                journey.items.select_related("story").all(),
+                many=True,
+                context={"request": request},
+            ).data
+        )
+
+
 def _unique_mood_slug(name: str) -> str:
     base_slug = slugify(name) or "mood"
     slug = base_slug
@@ -2451,6 +2552,107 @@ class DiscoverDataAPIView(APIView):
                 ).data,
             }
         )
+
+
+class StoryJourneyListAPIView(APIView):
+    """Active journeys, with this reader's progress through each.
+
+    Progress is derived from completions rather than stored — see
+    apps/stats/journeys.py. A signed-out reader gets the same list with zero
+    progress, so the page is worth visiting before signing in.
+    """
+
+    def get(self, request):
+        rows = journeys_for_reader(request.user)
+        return Response(
+            {
+                "journeys": [
+                    {
+                        "slug": row["journey"].slug,
+                        "title": row["journey"].title,
+                        "description": row["journey"].description,
+                        "type": row["journey"].type,
+                        "cover_image": _journey_cover(row["journey"], request),
+                        "completed": row["completed"],
+                        "total": row["total"],
+                        "is_complete": row["is_complete"],
+                    }
+                    for row in rows
+                ]
+            }
+        )
+
+
+def _journey_cover(journey, request):
+    """A journey's own artwork, or the first story's cover.
+
+    Falling back means a journey is never blank simply because nobody uploaded
+    a bespoke image for it.
+    """
+    if journey.cover_image:
+        return journey.cover_image
+    first = next(iter(journey.items.all()), None)
+    if not first:
+        return ""
+    return get_cover_image_url(
+        first.story.cover_image_file, first.story.cover_image, request, size=CARD_COVER_SIZE
+    )
+
+
+class StoryJourneyDetailAPIView(APIView):
+    """One journey, in order, with each story marked done or not."""
+
+    def get(self, request, slug):
+        journey = get_object_or_404(
+            StoryJourney.objects.filter(active=True).prefetch_related("items__story"), slug=slug
+        )
+        completed_ids = _reader_completed_story_ids(request.user)
+        done, total, is_complete = journey_progress(journey, completed_ids)
+        if total == 0:
+            raise Http404("This journey has no stories yet.")
+
+        items = list(journey.items.all())
+        cards = {
+            story.id: story
+            for story in Story.objects.filter(
+                id__in=[item.story_id for item in items]
+            ).for_card_list()
+        }
+
+        return Response(
+            {
+                "slug": journey.slug,
+                "title": journey.title,
+                "description": journey.description,
+                "type": journey.type,
+                "cover_image": _journey_cover(journey, request),
+                "completed": done,
+                "total": total,
+                "is_complete": is_complete,
+                "items": [
+                    {
+                        "position": item.position,
+                        "required": item.required,
+                        "completed": item.story_id in completed_ids,
+                        "story": StoryListSerializer(
+                            cards[item.story_id], context={"request": request}
+                        ).data,
+                    }
+                    for item in items
+                    # A story unpublished since the journey was built has no
+                    # card to show.
+                    if item.story_id in cards
+                ],
+            }
+        )
+
+
+def _reader_completed_story_ids(user):
+    if not user or not user.is_authenticated:
+        return set()
+    return set(
+        StoryCompletion.objects.filter(user=user).values_list("story_id", flat=True)
+    )
 
 
 class MoodListAPIView(APIView):

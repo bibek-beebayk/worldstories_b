@@ -252,6 +252,16 @@ class AnalyticsEvent(models.Model):
     # Raised by the server beside the award itself (apps/stats/achievements.py),
     # so it inherits the conditional update that makes awarding once-only.
     EVENT_ACHIEVEMENT_UNLOCKED = "achievement_unlocked"
+    # Story Journeys. Both are server-raised beside the completion that caused
+    # them, and both are decided from completion counts — a journey passes
+    # through 1-of-N and N-of-N exactly once per reader, so neither needs extra
+    # state to be once-only.
+    EVENT_JOURNEY_STARTED = "journey_started"
+    EVENT_JOURNEY_COMPLETED = "journey_completed"
+    # An interaction rather than a milestone: unlike the completion-derived
+    # events above, this legitimately fires again when a reader changes their
+    # mind, carrying what it replaced.
+    EVENT_REACTION_ADDED = "reaction_added"
     EVENT_DAILY_STORY_VIEWED = "daily_story_viewed"
     EVENT_DAILY_STORY_STARTED = "daily_story_started"
     EVENT_DAILY_STORY_COMPLETED = "daily_story_completed"
@@ -276,6 +286,9 @@ class AnalyticsEvent(models.Model):
         (EVENT_COUNTRY_UNLOCKED, "Country unlocked"),
         (EVENT_PASSPORT_VIEWED, "Passport viewed"),
         (EVENT_ACHIEVEMENT_UNLOCKED, "Achievement unlocked"),
+        (EVENT_JOURNEY_STARTED, "Journey started"),
+        (EVENT_JOURNEY_COMPLETED, "Journey completed"),
+        (EVENT_REACTION_ADDED, "Reaction added"),
         (EVENT_DAILY_STORY_VIEWED, "Daily Story viewed"),
         (EVENT_DAILY_STORY_STARTED, "Daily Story started"),
         (EVENT_DAILY_STORY_COMPLETED, "Daily Story completed"),
@@ -421,12 +434,14 @@ class Achievement(models.Model):
     CATEGORY_GENRE = "genre"
     CATEGORY_STREAK = "streak"
     CATEGORY_QUICK_READ = "quick_read"
+    CATEGORY_JOURNEY = "journey"
     CATEGORY_CHOICES = [
         (CATEGORY_READING, "Reading"),
         (CATEGORY_COUNTRIES, "Countries"),
         (CATEGORY_GENRE, "Genre"),
         (CATEGORY_STREAK, "Streak"),
         (CATEGORY_QUICK_READ, "Quick Read"),
+        (CATEGORY_JOURNEY, "Journeys"),
     ]
 
     # What the achievement counts. Each maps to one measure function in
@@ -436,12 +451,14 @@ class Achievement(models.Model):
     TARGET_GENRE_COMPLETED = "genre_completed"
     TARGET_STREAK_DAYS = "streak_days"
     TARGET_QUICK_READS_COMPLETED = "quick_reads_completed"
+    TARGET_JOURNEYS_COMPLETED = "journeys_completed"
     TARGET_TYPE_CHOICES = [
         (TARGET_STORIES_COMPLETED, "Stories completed"),
         (TARGET_COUNTRIES_EXPLORED, "Countries explored"),
         (TARGET_GENRE_COMPLETED, "Stories completed in a genre"),
         (TARGET_STREAK_DAYS, "Longest reading streak, in days"),
         (TARGET_QUICK_READS_COMPLETED, "Quick Reads completed"),
+        (TARGET_JOURNEYS_COMPLETED, "Story Journeys completed"),
     ]
 
     name = models.CharField(max_length=120)

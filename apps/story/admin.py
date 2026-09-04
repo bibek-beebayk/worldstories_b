@@ -4,7 +4,7 @@ from django.utils.html import strip_tags
 from django.utils import timezone
 from django.utils.text import slugify
 from solo.admin import SingletonModelAdmin
-from .models import Audio, AudioTranscriptCue, Video, Blog, Story, DailyStory, Genre, Category, StoryType, Tag, Theme, Author, Chapter, PromptSettings, Review, Submission, StoryView
+from .models import Audio, AudioTranscriptCue, Video, Blog, Story, DailyStory, Genre, Category, Mood, StoryJourney, StoryJourneyItem, StoryMood, StoryType, Tag, Theme, Author, Chapter, PromptSettings, Review, Submission, StoryView
 
 admin.site.register(PromptSettings, SingletonModelAdmin)
 
@@ -16,6 +16,49 @@ class DailyStoryAdmin(admin.ModelAdmin):
     search_fields = ("story__title", "featured_reason")
     autocomplete_fields = ("story",)
     date_hierarchy = "date"
+
+
+class StoryJourneyItemInline(admin.TabularInline):
+    """Journeys are built by ordering stories, so the items belong inline with
+    the journey rather than as a separate list to hunt through."""
+
+    model = StoryJourneyItem
+    extra = 3
+    autocomplete_fields = ("story",)
+    fields = ("position", "story", "required")
+    ordering = ("position",)
+
+
+@admin.register(StoryJourney)
+class StoryJourneyAdmin(admin.ModelAdmin):
+    list_display = ("title", "type", "active", "item_count")
+    list_filter = ("active", "type")
+    search_fields = ("title", "description")
+    prepopulated_fields = {"slug": ("title",)}
+    inlines = [StoryJourneyItemInline]
+
+    @admin.display(description="Stories")
+    def item_count(self, obj):
+        return obj.items.count()
+
+
+@admin.register(Mood)
+class MoodAdmin(admin.ModelAdmin):
+    list_display = ("name", "slug", "icon", "active", "order")
+    list_filter = ("active",)
+    search_fields = ("name",)
+    prepopulated_fields = {"slug": ("name",)}
+
+
+@admin.register(StoryMood)
+class StoryMoodAdmin(admin.ModelAdmin):
+    """Provenance is the point of this model, so `source` and `reviewed` are
+    front and centre — an unreviewed AI suggestion is invisible to readers."""
+
+    list_display = ("story", "mood", "source", "reviewed", "created_at")
+    list_filter = ("source", "reviewed", "mood")
+    search_fields = ("story__title", "mood__name")
+    autocomplete_fields = ("story", "mood")
 
 
 class ChapterInline(admin.TabularInline):

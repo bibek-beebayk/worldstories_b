@@ -26,8 +26,10 @@ TRIGGER_TARGETS = {
         "genre_completed",
         "countries_explored",
         "streak_days",
+        "journeys_completed",
     ),
     "quick_read_completed": ("quick_reads_completed",),
+    "journey_completed": ("journeys_completed",),
     "country_unlocked": ("countries_explored",),
     "streak_changed": ("streak_days",),
 }
@@ -93,12 +95,19 @@ def _quick_reads_completed(user, _key):
     )
 
 
+def _journeys_completed(user, _key):
+    from apps.stats.journeys import journeys_for_reader
+
+    return sum(1 for row in journeys_for_reader(user) if row["is_complete"])
+
+
 MEASURES = {
     "stories_completed": _stories_completed,
     "countries_explored": _countries_explored,
     "genre_completed": _genre_completed,
     "streak_days": _streak_days,
     "quick_reads_completed": _quick_reads_completed,
+    "journeys_completed": _journeys_completed,
 }
 
 

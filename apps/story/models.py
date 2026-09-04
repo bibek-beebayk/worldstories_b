@@ -341,6 +341,114 @@ class StoryMood(models.Model):
         return f"{self.story} — {self.mood} ({self.source})"
 
 
+class StoryJourney(models.Model):
+    """A curated path through several stories — "Japanese Folklore", "Ghost
+    Stories Around the World".
+
+    Editorial content, like DailyStory: an editor decides what belongs and in
+    what order. A reader's progress through it is **derived** from the stories
+    they have completed (see apps/stats/journeys.py), so there is no enrolment
+    step and nothing to keep in step with StoryCompletion.
+    """
+
+    TYPE_CURATED = "curated"
+    TYPE_COUNTRY = "country"
+    TYPE_GENRE = "genre"
+    TYPE_THEME = "theme"
+    TYPE_CHOICES = [
+        (TYPE_CURATED, "Curated selection"),
+        (TYPE_COUNTRY, "Stories from one country"),
+        (TYPE_GENRE, "Stories of one genre"),
+        (TYPE_THEME, "Stories on one theme"),
+    ]
+
+    title = models.CharField(max_length=140)
+    slug = models.SlugField(max_length=160, unique=True)
+    description = models.TextField(blank=True)
+    # Optional: the API falls back to the first story's cover, so a journey is
+    # never blank simply because nobody uploaded artwork for it.
+    cover_image = models.URLField(blank=True)
+    type = models.CharField(max_length=20, choices=TYPE_CHOICES, default=TYPE_CURATED)
+    active = models.BooleanField(default=False, db_index=True)
+    order = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["order", "title"]
+
+    def __str__(self):
+        return self.title
+
+
+class StoryJourneyItem(models.Model):
+    """One story's place in a journey.
+
+    `required` distinguishes the spine of a journey from its optional extras:
+    completion is judged on the required items only, so an editor can add a
+    bonus story without moving the finish line for readers who are already
+    part-way through.
+    """
+
+    journey = models.ForeignKey(
+        StoryJourney, on_delete=models.CASCADE, related_name="items"
+    )
+    story = models.ForeignKey("Story", on_delete=models.CASCADE, related_name="journey_items")
+    position = models.PositiveIntegerField(default=0)
+    required = models.BooleanField(default=True)
+
+    class Meta:
+        unique_together = ("journey", "story")
+        ordering = ["position", "id"]
+
+    def __str__(self):
+        return f"{self.journey.title} #{self.position}: {self.story.title}"
+
+
+class StoryReaction(models.Model):
+    """How one reader felt about one story.
+
+    Deliberately separate from `Review` and leaving it untouched (§10.1). A
+    review is a considered opinion with a rating and prose; a reaction is a
+    single tap at the end of a story. Folding them together would have made
+    reacting feel like a commitment and reviewing feel trivial.
+
+    One reaction per reader per story, enforced by the database. Changing your
+    mind updates the row rather than adding a second — "loved it" and "made me
+    cry" are not two votes, they are one reader revising an answer.
+    """
+
+    LOVED = "loved"
+    FUNNY = "funny"
+    SURPRISING = "surprising"
+    EMOTIONAL = "emotional"
+    THOUGHT_PROVOKING = "thought_provoking"
+    REACTION_CHOICES = [
+        (LOVED, "Loved it"),
+        (FUNNY, "Funny"),
+        (SURPRISING, "Surprising"),
+        (EMOTIONAL, "Emotional"),
+        (THOUGHT_PROVOKING, "Thought-provoking"),
+    ]
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="story_reactions"
+    )
+    story = models.ForeignKey("Story", on_delete=models.CASCADE, related_name="reactions")
+    reaction_type = models.CharField(max_length=20, choices=REACTION_CHOICES, db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = ("user", "story")
+        indexes = [
+            # "How did readers feel about this story" — the totals query.
+            models.Index(fields=["story", "reaction_type"], name="story_reaction_story_idx"),
+        ]
+
+    def __str__(self):
+        return f"{self.user} — {self.story} ({self.reaction_type})"
+
+
 class Author(models.Model):
     name = models.CharField(max_length=100)
     bio = models.TextField(blank=True, null=True)

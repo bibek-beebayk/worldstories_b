@@ -24,7 +24,7 @@ from pydantic import ValidationError as PydanticValidationError
 
 from apps.stats.models import StoryCompletion
 from apps.story.api import StoryMapAPIView, StoryViewSet, open_s3_audio_stream
-from apps.story.models import Mood, StoryMood
+from apps.story.models import Mood, StoryJourney, StoryMood
 from apps.story.ai_generation import GenerationError, _GenerationOutput, _to_plain_text, generate
 from apps.story.ai_generation_jobs import _concatenated_chapter_text, run_generate_blog_excerpt, run_generate_field
 from apps.story.book_fetch import (
@@ -5421,3 +5421,155 @@ class MoodAdminApiTests(APITestCase):
             reverse("admin-mood-pending-review"),
         ):
             self.assertEqual(self.client.get(url, format="json").status_code, 403, url)
+
+
+class StoryJourneyAdminApiTests(APITestCase):
+    """Journey management from the custom admin panel — Django admin is
+    unusable on this deployment (Django 5.0 on Python 3.14)."""
+
+    def setUp(self):
+        cache.clear()
+        self.admin = User.objects.create_user(
+            email="journeyadmin@example.com", username="journeyadmin",
+            password="test-password", is_superuser=True, is_staff=True, is_active=True,
+        )
+        self.reader = User.objects.create_user(
+            email="journeyreader@example.com", username="journeyreader", password="test-password"
+        )
+        self.client.force_authenticate(self.admin)
+        self.journey = StoryJourney.objects.create(title="A Path", slug="a-path")
+        self.first = Story.objects.create(title="One", slug="j-one", is_published=True)
+        self.second = Story.objects.create(title="Two", slug="j-two", is_published=True)
+
+    def _items_url(self):
+        return reverse("admin-journey-items", kwargs={"pk": self.journey.id})
+
+    def test_it_creates_a_journey_with_a_slug(self):
+        response = self.client.post(
+            reverse("admin-journey-list"),
+            {"title": "Ghost Stories", "description": "Spooky."},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["slug"], "ghost-stories")
+        # New journeys stay off until an editor has filled and checked them.
+        self.assertFalse(response.data["active"])
+
+    def test_two_journeys_with_the_same_title_do_not_collide(self):
+        self.client.post(reverse("admin-journey-list"), {"title": "Ghost Stories"}, format="json")
+        second = self.client.post(
+            reverse("admin-journey-list"), {"title": "Ghost Stories"}, format="json"
+        )
+
+        self.assertEqual(second.data["slug"], "ghost-stories-2")
+
+    def test_position_comes_from_the_order_sent(self):
+        """Reordering therefore needs no separate endpoint."""
+        response = self.client.put(
+            self._items_url(),
+            {"items": [{"story": self.second.id}, {"story": self.first.id}]},
+            format="json",
+        )
+
+        self.assertEqual(
+            [(row["story_slug"], row["position"]) for row in response.data],
+            [("j-two", 1), ("j-one", 2)],
+        )
+
+    def test_replacing_the_set_removes_what_was_dropped(self):
+        self.client.put(
+            self._items_url(),
+            {"items": [{"story": self.first.id}, {"story": self.second.id}]},
+            format="json",
+        )
+
+        response = self.client.put(
+            self._items_url(), {"items": [{"story": self.second.id}]}, format="json"
+        )
+
+        self.assertEqual([row["story_slug"] for row in response.data], ["j-two"])
+
+    def test_required_is_carried_through(self):
+        response = self.client.put(
+            self._items_url(),
+            {
+                "items": [
+                    {"story": self.first.id, "required": True},
+                    {"story": self.second.id, "required": False},
+                ]
+            },
+            format="json",
+        )
+
+        self.assertEqual([row["required"] for row in response.data], [True, False])
+
+    def test_a_story_listed_twice_is_kept_once(self):
+        """A duplicate is an editing slip, not a path."""
+        response = self.client.put(
+            self._items_url(),
+            {"items": [{"story": self.first.id}, {"story": self.first.id}]},
+            format="json",
+        )
+
+        self.assertEqual(len(response.data), 1)
+
+    def test_an_unknown_story_is_ignored_rather_than_fatal(self):
+        response = self.client.put(
+            self._items_url(),
+            {"items": [{"story": self.first.id}, {"story": 999999}]},
+            format="json",
+        )
+
+        self.assertEqual([row["story_slug"] for row in response.data], ["j-one"])
+
+    def test_it_rejects_a_malformed_payload(self):
+        self.assertEqual(
+            self.client.put(self._items_url(), {"items": "nope"}, format="json").status_code, 400
+        )
+        self.assertEqual(
+            self.client.put(
+                self._items_url(), {"items": [{"story": "abc"}]}, format="json"
+            ).status_code,
+            400,
+        )
+
+    def test_the_list_reports_both_counts(self):
+        self.client.put(
+            self._items_url(),
+            {
+                "items": [
+                    {"story": self.first.id, "required": True},
+                    {"story": self.second.id, "required": False},
+                ]
+            },
+            format="json",
+        )
+
+        row = next(
+            item for item in self.client.get(reverse("admin-journey-list")).data
+            if item["slug"] == "a-path"
+        )
+        # Required count is the one that decides completion, so an editor needs
+        # to see it separately from the total.
+        self.assertEqual((row["item_count"], row["required_count"]), (2, 1))
+
+    def test_activating_a_journey_shows_it_to_readers(self):
+        self.client.put(self._items_url(), {"items": [{"story": self.first.id}]}, format="json")
+        self.client.patch(
+            reverse("admin-journey-detail", kwargs={"pk": self.journey.id}),
+            {"active": True},
+            format="json",
+        )
+
+        self.client.force_authenticate(None)
+        public = self.client.get(reverse("journey-list"), format="json").data["journeys"]
+
+        self.assertEqual([row["slug"] for row in public], ["a-path"])
+
+    def test_journey_administration_is_superuser_only(self):
+        self.client.force_authenticate(self.reader)
+
+        self.assertEqual(
+            self.client.get(reverse("admin-journey-list"), format="json").status_code, 403
+        )

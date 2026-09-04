@@ -38,6 +38,7 @@ router.register("admin/genres", story_api.GenreAdminViewSet, basename="admin-gen
 router.register("admin/tags", story_api.TagAdminViewSet, basename="admin-tag")
 router.register("admin/themes", story_api.ThemeAdminViewSet, basename="admin-theme")
 router.register("admin/moods", story_api.MoodAdminViewSet, basename="admin-mood")
+router.register("admin/journeys", story_api.StoryJourneyAdminViewSet, basename="admin-journey")
 router.register("admin/story-types", story_api.StoryTypeAdminViewSet, basename="admin-story-type")
 router.register("admin/users", users_api.UserAdminViewSet, basename="admin-user")
 router.register("admin/blog", story_api.BlogAdminViewSet, basename="admin-blog")
@@ -198,6 +199,12 @@ urlpatterns = [
     path("api/discover/", story_api.DiscoverDataAPIView.as_view(), name="discover-data"),
     path("api/story-map/", story_api.StoryMapAPIView.as_view(), name="story-map-data"),
     path("api/moods/", story_api.MoodListAPIView.as_view(), name="mood-list"),
+    path("api/journeys/", story_api.StoryJourneyListAPIView.as_view(), name="journey-list"),
+    path(
+        "api/journeys/<slug:slug>/",
+        story_api.StoryJourneyDetailAPIView.as_view(),
+        name="journey-detail",
+    ),
     path(
         "api/analytics/events/",
         stats_views.AnalyticsEventCreateAPIView.as_view(),

@@ -7,7 +7,19 @@ from django.urls import reverse
 from django.utils import timezone
 from rest_framework.test import APIClient, APITestCase
 
-from apps.story.models import Audio, Chapter, DailyStory, Genre, Video, Blog, Story, StoryView, Submission
+from apps.story.models import (
+    Audio,
+    Blog,
+    Chapter,
+    DailyStory,
+    Genre,
+    Story,
+    StoryJourney,
+    StoryJourneyItem,
+    StoryView,
+    Submission,
+    Video,
+)
 from apps.users.models import User
 
 from .completion import COMPLETION_THRESHOLD
@@ -1685,3 +1697,183 @@ class AchievementTests(APITestCase):
         response = self.client.get(reverse("auth-achievements"), format="json")
 
         self.assertIn(response.status_code, (401, 403))
+
+
+class StoryJourneyTests(APITestCase):
+    """Progress derived from completions, never stored — the same decision as
+    the Story Passport, for the same reason."""
+
+    def setUp(self):
+        cache.clear()
+        self.client = APIClient(HTTP_USER_AGENT=BROWSER_USER_AGENT)
+        self.user = User.objects.create_user(
+            email="wanderer@example.com", username="wanderer", password="test-password"
+        )
+        self.client.force_authenticate(self.user)
+        self.journey = StoryJourney.objects.create(
+            title="Japanese Folklore", slug="japanese-folklore-test", active=True
+        )
+
+    def _story(self, slug):
+        story = Story.objects.create(title=slug, slug=slug, is_published=True)
+        Chapter.objects.create(
+            story=story, title="One", slug=f"{slug}-c", order=1, content="<p>text</p>"
+        )
+        return story
+
+    def _add(self, story, position, required=True):
+        return StoryJourneyItem.objects.create(
+            journey=self.journey, story=story, position=position, required=required
+        )
+
+    def _finish(self, story):
+        return self.client.put(
+            reverse("reading-progress", args=[story.slug]),
+            {"chapter_slug": story.chapters.first().slug, "progress": 1.0},
+            format="json",
+        )
+
+    def _list(self):
+        return self.client.get(reverse("journey-list")).data["journeys"]
+
+    def test_progress_counts_completed_stories(self):
+        first, second = self._story("jf-one"), self._story("jf-two")
+        self._add(first, 1)
+        self._add(second, 2)
+
+        self._finish(first)
+
+        row = self._list()[0]
+        self.assertEqual((row["completed"], row["total"]), (1, 2))
+        self.assertFalse(row["is_complete"])
+
+    def test_a_journey_completes_when_every_required_story_is_done(self):
+        first, second = self._story("jf-a"), self._story("jf-b")
+        self._add(first, 1)
+        self._add(second, 2)
+        self._finish(first)
+
+        self._finish(second)
+
+        self.assertTrue(self._list()[0]["is_complete"])
+
+    def test_optional_items_do_not_hold_a_journey_open(self):
+        """An editor adding a bonus story must not move the finish line for
+        readers already part-way through."""
+        required, bonus = self._story("jf-req"), self._story("jf-bonus")
+        self._add(required, 1)
+        self._add(bonus, 2, required=False)
+
+        self._finish(required)
+
+        self.assertTrue(self._list()[0]["is_complete"])
+
+    def test_a_journey_with_no_required_items_is_never_complete(self):
+        """The vacuous-truth trap: an empty journey is unfinished, not
+        finished for everyone."""
+        bonus = self._story("jf-only-bonus")
+        self._add(bonus, 1, required=False)
+
+        self._finish(bonus)
+
+        self.assertEqual(self._list(), [])
+
+    def test_an_empty_journey_is_not_shown_to_readers(self):
+        self.assertEqual(self._list(), [])
+
+    def test_an_inactive_journey_is_not_shown(self):
+        story = self._story("jf-hidden")
+        self._add(story, 1)
+        StoryJourney.objects.filter(pk=self.journey.pk).update(active=False)
+
+        self.assertEqual(self._list(), [])
+
+    def test_the_first_completion_raises_journey_started(self):
+        first, second = self._story("jf-s1"), self._story("jf-s2")
+        self._add(first, 1)
+        self._add(second, 2)
+
+        self._finish(first)
+
+        events = AnalyticsEvent.objects.filter(
+            event_type=AnalyticsEvent.EVENT_JOURNEY_STARTED
+        )
+        self.assertEqual(events.count(), 1)
+        self.assertEqual(events.get().metadata["journey"], self.journey.slug)
+
+    def test_a_later_completion_does_not_re_raise_journey_started(self):
+        first, second = self._story("jf-r1"), self._story("jf-r2")
+        self._add(first, 1)
+        self._add(second, 2)
+        self._finish(first)
+
+        self._finish(second)
+
+        self.assertEqual(
+            AnalyticsEvent.objects.filter(
+                event_type=AnalyticsEvent.EVENT_JOURNEY_STARTED
+            ).count(),
+            1,
+        )
+
+    def test_finishing_raises_journey_completed_exactly_once(self):
+        story = self._story("jf-single")
+        self._add(story, 1)
+
+        self._finish(story)
+        self._finish(story)
+
+        self.assertEqual(
+            AnalyticsEvent.objects.filter(
+                event_type=AnalyticsEvent.EVENT_JOURNEY_COMPLETED
+            ).count(),
+            1,
+        )
+
+    def test_completing_a_journey_earns_the_journey_achievement(self):
+        story = self._story("jf-achieve")
+        self._add(story, 1)
+
+        response = self._finish(story)
+
+        slugs = [row["slug"] for row in response.data["unlocked_achievements"]]
+        self.assertIn("first-journey", slugs)
+
+    def test_detail_marks_which_stories_are_done_and_keeps_order(self):
+        first, second = self._story("jf-d1"), self._story("jf-d2")
+        self._add(second, 2)
+        self._add(first, 1)
+        self._finish(first)
+
+        detail = self.client.get(
+            reverse("journey-detail", kwargs={"slug": self.journey.slug})
+        ).data
+
+        self.assertEqual([item["story"]["slug"] for item in detail["items"]], ["jf-d1", "jf-d2"])
+        self.assertTrue(detail["items"][0]["completed"])
+        self.assertFalse(detail["items"][1]["completed"])
+
+    def test_detail_404s_for_a_journey_with_no_stories(self):
+        response = self.client.get(
+            reverse("journey-detail", kwargs={"slug": self.journey.slug})
+        )
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_a_signed_out_reader_sees_the_journey_with_no_progress(self):
+        story = self._story("jf-public")
+        self._add(story, 1)
+        self.client.force_authenticate(None)
+
+        rows = self.client.get(reverse("journey-list"), format="json").data["journeys"]
+
+        self.assertEqual(rows[0]["completed"], 0)
+        self.assertFalse(rows[0]["is_complete"])
+
+    def test_the_cover_falls_back_to_the_first_story(self):
+        story = self._story("jf-cover")
+        story.cover_image = "https://example.test/cover.jpg"
+        story.save(update_fields=["cover_image"])
+        self._add(story, 1)
+
+        self.assertTrue(self._list()[0]["cover_image"])

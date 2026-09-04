@@ -17,6 +17,8 @@ from .models import (
     Category,
     Chapter,
     Mood,
+    StoryJourney,
+    StoryJourneyItem,
     StoryMood,
     Tag,
     Theme,
@@ -302,6 +304,67 @@ class AdminStoryMoodSerializer(serializers.ModelSerializer):
             "created_at",
         ]
         read_only_fields = ["created_at"]
+
+
+class AdminStoryJourneyItemSerializer(serializers.ModelSerializer):
+    """One story's place in a journey, with just enough of the story to show a
+    row without a second request."""
+
+    story_title = serializers.CharField(source="story.title", read_only=True)
+    story_slug = serializers.CharField(source="story.slug", read_only=True)
+    story_cover = serializers.SerializerMethodField(read_only=True)
+    story_published = serializers.BooleanField(source="story.is_published", read_only=True)
+
+    def get_story_cover(self, obj):
+        return get_cover_image_url(
+            obj.story.cover_image_file,
+            obj.story.cover_image,
+            self.context.get("request"),
+            size=CARD_COVER_SIZE,
+        )
+
+    class Meta:
+        model = StoryJourneyItem
+        fields = [
+            "id",
+            "story",
+            "story_title",
+            "story_slug",
+            "story_cover",
+            "story_published",
+            "position",
+            "required",
+        ]
+
+
+class AdminStoryJourneySerializer(serializers.ModelSerializer):
+    items = AdminStoryJourneyItemSerializer(many=True, read_only=True)
+    item_count = serializers.SerializerMethodField(read_only=True)
+    required_count = serializers.SerializerMethodField(read_only=True)
+
+    def get_item_count(self, obj):
+        return obj.items.count()
+
+    def get_required_count(self, obj):
+        return obj.items.filter(required=True).count()
+
+    class Meta:
+        model = StoryJourney
+        fields = [
+            "id",
+            "title",
+            "slug",
+            "description",
+            "cover_image",
+            "type",
+            "active",
+            "order",
+            "items",
+            "item_count",
+            "required_count",
+            "created_at",
+        ]
+        read_only_fields = ["slug", "created_at"]
 
 
 class AdminCategorySerializer(serializers.ModelSerializer):

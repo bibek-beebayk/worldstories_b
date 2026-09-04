@@ -165,9 +165,33 @@ def record_completion_if_finished(user, story):
         # this response, not of the row.
         completion.unlocked_country = unlocked
 
+    # Journeys this completion started or finished. Decided from the completion
+    # counts, so each passes through 1-of-N and N-of-N exactly once per reader
+    # without any extra state — see apps/stats/journeys.py.
+    from apps.stats.journeys import journey_events_for_completion
+
+    completed_ids = set(
+        StoryCompletion.objects.filter(user=user).values_list("story_id", flat=True)
+    )
+    started_journeys, finished_journeys = journey_events_for_completion(
+        user, story, completed_ids
+    )
+    for journey, event_type in (
+        *((j, AnalyticsEvent.EVENT_JOURNEY_STARTED) for j in started_journeys),
+        *((j, AnalyticsEvent.EVENT_JOURNEY_COMPLETED) for j in finished_journeys),
+    ):
+        AnalyticsEvent.objects.create(
+            event_type=event_type,
+            user=user,
+            story=story,
+            visitor_id=AnalyticsEvent.SERVER_VISITOR_ID,
+            metadata={"journey": journey.slug, "journey_title": journey.title},
+        )
+    completion.completed_journeys = finished_journeys
+
     # Evaluated here rather than anywhere achievements are read: §6.3 forbids
     # recalculating on page view, and this is the write that could have moved
-    # a reading, genre, country or streak counter.
+    # a reading, genre, country, streak or journey counter.
     from apps.stats.achievements import evaluate
 
     completion.unlocked_achievements = evaluate(user, "story_completed")
