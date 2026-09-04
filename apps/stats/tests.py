@@ -1314,3 +1314,151 @@ class StoryCompletionTests(APITestCase):
         response = self.client.get(reverse("auth-library-completed-reading"))
 
         self.assertEqual(response.data["results"], [])
+
+
+class StoryPassportTests(APITestCase):
+    """Derived from completions, not stored — see apps/stats/passport.py."""
+
+    def setUp(self):
+        cache.clear()
+        self.client = APIClient(HTTP_USER_AGENT=BROWSER_USER_AGENT)
+        self.user = User.objects.create_user(
+            email="traveller@example.com", username="traveller", password="test-password"
+        )
+        self.client.force_authenticate(self.user)
+
+    def _story(self, slug, country="", chapters=1):
+        story = Story.objects.create(
+            title=slug, slug=slug, is_published=True, country=country
+        )
+        for index in range(chapters):
+            Chapter.objects.create(
+                story=story, title=f"C{index}", slug=f"{slug}-c{index}",
+                order=index + 1, content="<p>text</p>",
+            )
+        return story
+
+    def _finish(self, story):
+        return self.client.put(
+            reverse("reading-progress", args=[story.slug]),
+            {"chapter_slug": story.chapters.first().slug, "progress": 1.0},
+            format="json",
+        )
+
+    def _passport(self):
+        return self.client.get(reverse("auth-story-passport")).data
+
+    def test_completing_a_story_explores_its_country(self):
+        self._finish(self._story("a-japanese-tale", country="JP"))
+
+        passport = self._passport()
+
+        self.assertEqual(passport["countries_explored"], 1)
+        japan = next(row for row in passport["countries"] if row["code"] == "JP")
+        self.assertTrue(japan["explored"])
+        self.assertEqual(japan["stories_completed"], 1)
+        self.assertEqual(japan["name"], "Japan")
+        self.assertIsNotNone(japan["unlocked_at"])
+
+    def test_starting_a_story_does_not_explore_its_country(self):
+        story = self._story("half-read", country="JP")
+        self.client.put(
+            reverse("reading-progress", args=[story.slug]),
+            {"chapter_slug": story.chapters.first().slug, "progress": 0.5},
+            format="json",
+        )
+
+        self.assertEqual(self._passport()["countries_explored"], 0)
+
+    def test_the_denominator_counts_countries_with_stories_not_the_iso_list(self):
+        """Telling a reader they have explored 1 of 196 would measure them
+        against a catalogue that does not exist."""
+        self._story("jp-one", country="JP")
+        self._story("fr-one", country="FR")
+        self._story("placeless")
+
+        passport = self._passport()
+
+        self.assertEqual(passport["countries_available"], 2)
+
+    def test_a_first_completion_reports_the_country_it_unlocked(self):
+        response = self._finish(self._story("first-from-japan", country="JP"))
+
+        self.assertTrue(response.data["story_completed"])
+        self.assertEqual(response.data["unlocked_country"], "JP")
+
+    def test_a_second_story_from_the_same_country_unlocks_nothing(self):
+        self._finish(self._story("jp-first", country="JP"))
+
+        response = self._finish(self._story("jp-second", country="JP"))
+
+        self.assertTrue(response.data["story_completed"])
+        self.assertIsNone(response.data["unlocked_country"])
+
+    def test_the_unlock_event_is_raised_once_per_country(self):
+        self._finish(self._story("jp-a", country="JP"))
+        self._finish(self._story("jp-b", country="JP"))
+        self._finish(self._story("fr-a", country="FR"))
+
+        events = AnalyticsEvent.objects.filter(
+            event_type=AnalyticsEvent.EVENT_COUNTRY_UNLOCKED
+        )
+        self.assertEqual(
+            sorted(event.metadata["country"] for event in events), ["FR", "JP"]
+        )
+
+    def test_finishing_a_story_with_no_country_unlocks_nothing(self):
+        response = self._finish(self._story("placeless-tale"))
+
+        self.assertTrue(response.data["story_completed"])
+        self.assertIsNone(response.data["unlocked_country"])
+        self.assertEqual(self._passport()["countries_explored"], 0)
+
+    def test_a_new_reader_sees_the_whole_world_unexplored(self):
+        self._story("jp-one", country="JP")
+
+        passport = self._passport()
+
+        self.assertEqual(passport["countries_explored"], 0)
+        self.assertEqual(passport["countries_available"], 1)
+        self.assertFalse(passport["countries"][0]["explored"])
+        self.assertIsNone(passport["countries"][0]["unlocked_at"])
+
+    def test_explored_countries_are_listed_first(self):
+        self._story("fr-lots-1", country="FR")
+        self._story("fr-lots-2", country="FR")
+        self._finish(self._story("jp-only", country="JP"))
+
+        codes = [row["code"] for row in self._passport()["countries"]]
+
+        # Japan has fewer stories but is the one the reader has been to.
+        self.assertEqual(codes[0], "JP")
+
+    def test_country_detail_separates_what_is_read_from_what_is_left(self):
+        finished = self._story("jp-finished", country="JP")
+        self._story("jp-unread", country="JP")
+        self._finish(finished)
+
+        detail = self.client.get(
+            reverse("auth-story-passport-country", kwargs={"country_code": "jp"})
+        ).data
+
+        self.assertEqual(detail["name"], "Japan")
+        self.assertTrue(detail["explored"])
+        self.assertEqual(detail["stories_available"], 2)
+        self.assertEqual([row["slug"] for row in detail["completed"]], ["jp-finished"])
+        self.assertEqual([row["slug"] for row in detail["continue_exploring"]], ["jp-unread"])
+
+    def test_country_detail_rejects_an_unknown_code(self):
+        response = self.client.get(
+            reverse("auth-story-passport-country", kwargs={"country_code": "ZZ"})
+        )
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_the_passport_requires_authentication(self):
+        self.client.force_authenticate(None)
+
+        response = self.client.get(reverse("auth-story-passport"), format="json")
+
+        self.assertIn(response.status_code, (401, 403))

@@ -130,4 +130,24 @@ def record_completion_if_finished(user, story):
         visitor_id=AnalyticsEvent.SERVER_VISITOR_ID,
         metadata={"source": source},
     )
+
+    # A country is unlocked by the completion that first reaches it, so this
+    # belongs here rather than anywhere the Passport is read. Same guarantee as
+    # the completion itself: raised once, on the write that caused it.
+    from apps.stats.passport import newly_unlocked_country
+
+    unlocked = newly_unlocked_country(user, story)
+    if unlocked:
+        AnalyticsEvent.objects.create(
+            event_type=AnalyticsEvent.EVENT_COUNTRY_UNLOCKED,
+            user=user,
+            story=story,
+            visitor_id=AnalyticsEvent.SERVER_VISITOR_ID,
+            metadata={"country": unlocked},
+        )
+        # Carried on the object so the progress endpoints can hand the reader a
+        # toast without a second request. Not a model field — it is true of
+        # this response, not of the row.
+        completion.unlocked_country = unlocked
+
     return completion

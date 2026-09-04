@@ -32,6 +32,7 @@ from apps.stats.models import (
     VideoWatchProgress,
     FileReadingProgress,
 )
+from apps.stats.passport import COUNTRY_NAMES, passport_summary
 from apps.stats.streaks import compute_streak
 from apps.story.excerpts import excerpt_at_progress
 from .serializers import (
@@ -146,6 +147,8 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
             "library_continue_reading",
             "library_completed_reading",
             "library_reading_history",
+            "story_passport",
+            "story_passport_country",
             "library_continue_listening",
             "library_continue_watching",
             "library_favorites",
@@ -792,6 +795,64 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
             payload, many=True, context={"request": request}
         )
         return Response(serializer.data)
+
+    @action(detail=False, methods=["get"], url_path="story-passport")
+    def story_passport(self, request):
+        """Where this reader has been, derived from the stories they finished.
+
+        Not the Story Map: that is the catalogue grouped by country and is the
+        same for everyone. This is one reader's own progress laid over it, and
+        the two are deliberately separate features (§5.1).
+
+        Derived rather than stored — see apps/stats/passport.py for why, and
+        for the measurement behind that decision.
+        """
+        return Response(passport_summary(request.user))
+
+    @action(
+        detail=False,
+        methods=["get"],
+        url_path=r"story-passport/(?P<country_code>[A-Za-z]{2})",
+    )
+    def story_passport_country(self, request, country_code=None):
+        """One country: what the reader has finished there, and what is left.
+
+        The "Continue Exploring" half is the point — a passport that only
+        looked backwards would have nothing to offer once a country was
+        unlocked.
+        """
+        code = (country_code or "").upper()
+        if code not in COUNTRY_NAMES:
+            return Response({"detail": "Unknown country."}, status=status.HTTP_404_NOT_FOUND)
+
+        completed_ids = set(
+            StoryCompletion.objects.filter(
+                user=request.user, story__country=code
+            ).values_list("story_id", flat=True)
+        )
+        in_country = Story.objects.published().filter(country=code)
+        cards = card_stories_by_id(
+            list(in_country.values_list("id", flat=True)), request.user
+        )
+
+        completed = [cards[sid] for sid in cards if sid in completed_ids]
+        remaining = [cards[sid] for sid in cards if sid not in completed_ids]
+
+        return Response(
+            {
+                "code": code,
+                "name": COUNTRY_NAMES[code],
+                "explored": bool(completed_ids),
+                "stories_available": len(cards),
+                "stories_completed": len(completed),
+                "completed": StoryListSerializer(
+                    completed, many=True, context={"request": request}
+                ).data,
+                "continue_exploring": StoryListSerializer(
+                    remaining, many=True, context={"request": request}
+                ).data,
+            }
+        )
 
     @action(detail=False, methods=["get"], url_path="library/reading-history")
     def library_reading_history(self, request):

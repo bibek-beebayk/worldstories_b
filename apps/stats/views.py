@@ -33,6 +33,20 @@ from apps.stats.serializers import (
 )
 
 
+def annotate_completion(payload, completion):
+    """Add the one-shot completion signals to a progress response.
+
+    `story_completed` is true only on the write that finished the story, and
+    `unlocked_country` only when that finish also reached a country the reader
+    had never completed anything from. Both are facts about *this response*
+    rather than about the reader's state, which is what lets the client show a
+    completion screen or an unlock toast exactly once.
+    """
+    payload["story_completed"] = bool(completion)
+    payload["unlocked_country"] = getattr(completion, "unlocked_country", None)
+    return payload
+
+
 class AnalyticsEventThrottle(SimpleRateThrottle):
     scope = "analytics-events"
 
@@ -136,7 +150,7 @@ class ReadingProgressAPIView(APIView):
         payload = self._build_progress_payload(request, story, progress_obj)
         # Settled server-side on the same request that moved the progress, so
         # it survives a cleared browser store and a second device.
-        payload["story_completed"] = bool(record_completion_if_finished(request.user, story))
+        annotate_completion(payload, record_completion_if_finished(request.user, story))
         return Response(payload)
 
 
@@ -209,7 +223,7 @@ class AudioReadingProgressAPIView(APIView):
         progress_obj.save()
 
         payload = self._build_progress_payload(request, story, progress_obj)
-        payload["story_completed"] = bool(record_completion_if_finished(request.user, story))
+        annotate_completion(payload, record_completion_if_finished(request.user, story))
         return Response(payload)
 
 
@@ -282,7 +296,7 @@ class VideoWatchProgressAPIView(APIView):
         progress_obj.save()
 
         payload = self._build_progress_payload(request, story, progress_obj)
-        payload["story_completed"] = bool(record_completion_if_finished(request.user, story))
+        annotate_completion(payload, record_completion_if_finished(request.user, story))
         return Response(payload)
 
 
@@ -348,5 +362,5 @@ class FileReadingProgressAPIView(APIView):
         progress_obj.save()
 
         payload = FileReadingProgressSerializer(progress_obj).data
-        payload["story_completed"] = bool(record_completion_if_finished(request.user, story))
+        annotate_completion(payload, record_completion_if_finished(request.user, story))
         return Response(payload)

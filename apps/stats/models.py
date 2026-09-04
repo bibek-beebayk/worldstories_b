@@ -245,6 +245,10 @@ class AnalyticsEvent(models.Model):
     EVENT_STORY_PROGRESSED = "story_progressed"
     EVENT_STORY_COMPLETED = "story_completed"
     EVENT_NEXT_STORY_CLICKED = "next_story_clicked"
+    # Story Passport (§5). country_unlocked is raised by the server beside the
+    # completion that caused it, so it is exactly-once per reader per country.
+    EVENT_COUNTRY_UNLOCKED = "country_unlocked"
+    EVENT_PASSPORT_VIEWED = "passport_viewed"
     EVENT_CHOICES = [
         (EVENT_VISIT, "Visit"),
         (EVENT_AD_IMPRESSION, "Ad impression"),
@@ -263,6 +267,8 @@ class AnalyticsEvent(models.Model):
         (EVENT_STORY_PROGRESSED, "Story progressed"),
         (EVENT_STORY_COMPLETED, "Story completed"),
         (EVENT_NEXT_STORY_CLICKED, "Next story clicked"),
+        (EVENT_COUNTRY_UNLOCKED, "Country unlocked"),
+        (EVENT_PASSPORT_VIEWED, "Passport viewed"),
     ]
 
     # visitor_id for an event the server raises itself rather than receiving
