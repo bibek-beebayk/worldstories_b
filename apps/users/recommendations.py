@@ -61,6 +61,30 @@ BECAUSE_FINISHED_LIMIT = 8
 GENRE_MATCH_WEIGHT = 2
 COLLABORATIVE_WEIGHT = 1
 
+# Signals added in Milestone 3.3, on top of the genre and collaborative ones
+# above. All small next to GENRE_MATCH_WEIGHT: these refine an ordering that is
+# already anchored to what the reader likes, rather than competing with it.
+#
+# A genre the reader has actually *finished* stories in is stronger evidence
+# than one they merely started, and stronger again than one they ticked at
+# onboarding and may never have read — hence a bonus on top of the genre match
+# those stories already earn.
+COMPLETED_GENRE_WEIGHT = 2
+FAVOURITED_GENRE_WEIGHT = 2
+# Countries cut both ways on purpose: more from a place whose stories they
+# finish, and a nudge towards places they have never read from at all. The
+# second is what keeps a recommendation list from narrowing to one region,
+# and it feeds the Story Passport's reason for existing.
+COMPLETED_COUNTRY_WEIGHT = 2
+UNEXPLORED_COUNTRY_WEIGHT = 1
+# Length is a habit, not a preference to be honoured strictly — someone who
+# reads short folk tales is unlikely to want a novella next, but it should
+# never outrank subject matter.
+SIMILAR_LENGTH_WEIGHT = 1
+# How far a story's estimate may sit from the reader's typical length and still
+# count as familiar.
+LENGTH_AFFINITY_TOLERANCE = 0.5
+
 
 def _engagement_pairs(user_ids=None, story_ids=None):
     """(user_id, story_id) pairs across every "this user cared about this
@@ -182,10 +206,13 @@ def _blended_recommendations(
         .distinct()
     )
 
+    taste = reader_taste(user)
+
     def score(story):
         return (
             story.matching_genres * GENRE_MATCH_WEIGHT
-            + collaborative_scores.get(story.id, 0) * COLLABORATIVE_WEIGHT,
+            + collaborative_scores.get(story.id, 0) * COLLABORATIVE_WEIGHT
+            + taste.bonus_for(story),
             story.rating,
             story.views,
             story.id,
@@ -517,3 +544,110 @@ def completion_recommendations(user, story, limit=COMPLETION_SECTION_LIMIT):
         ("similar_length", "Similar reading length", similar_length),
     ]
     return primary, sections
+
+
+class ReaderTaste:
+    """The additional signals §3.3 asks for, resolved once per request.
+
+    Kept as a small object rather than more annotations on the candidate query
+    for the reason this module's header already gives: several Count aggregates
+    over different to-many relations fan the joins out and inflate each other.
+    Each signal below is one small query, and the scoring is plain Python.
+    """
+
+    def __init__(
+        self,
+        completed_genre_ids,
+        favourited_genre_ids,
+        completed_country_codes,
+        read_country_codes,
+        typical_minutes,
+    ):
+        self.completed_genre_ids = completed_genre_ids
+        self.favourited_genre_ids = favourited_genre_ids
+        self.completed_country_codes = completed_country_codes
+        self.read_country_codes = read_country_codes
+        self.typical_minutes = typical_minutes
+
+    def bonus_for(self, story):
+        bonus = 0
+        genre_ids = {genre.id for genre in story.genres.all()}
+
+        if genre_ids & self.completed_genre_ids:
+            bonus += COMPLETED_GENRE_WEIGHT
+        if genre_ids & self.favourited_genre_ids:
+            bonus += FAVOURITED_GENRE_WEIGHT
+
+        if story.country:
+            if story.country in self.completed_country_codes:
+                bonus += COMPLETED_COUNTRY_WEIGHT
+            elif story.country not in self.read_country_codes:
+                # Somewhere they have never read from at all.
+                bonus += UNEXPLORED_COUNTRY_WEIGHT
+
+        if self.typical_minutes:
+            minutes = story.cached_chapter_reading_minutes or story.cached_file_reading_minutes
+            if minutes:
+                window = max(1, round(self.typical_minutes * LENGTH_AFFINITY_TOLERANCE))
+                if abs(minutes - self.typical_minutes) <= window:
+                    bonus += SIMILAR_LENGTH_WEIGHT
+
+        return bonus
+
+
+def reader_taste(user):
+    """Gather the §3.3 signals for one reader.
+
+    Completions are the backbone of three of them, and only became answerable
+    when Milestone 2.0 gave completion a durable home — a derived query could
+    not say which genres or countries a reader had actually finished.
+    """
+    from apps.stats.models import StoryCompletion
+
+    completed_story_ids = set(
+        StoryCompletion.objects.filter(user=user).values_list("story_id", flat=True)
+    )
+    favourited_story_ids = set(
+        Favorite.objects.filter(user=user).values_list("story_id", flat=True)
+    )
+
+    def genres_of(story_ids):
+        if not story_ids:
+            return set()
+        return set(
+            Genre.objects.filter(stories__id__in=story_ids).values_list("id", flat=True)
+        )
+
+    completed_countries = set(
+        Story.objects.filter(id__in=completed_story_ids)
+        .exclude(country="")
+        .values_list("country", flat=True)
+    )
+    # Every country they have touched at all, so "unexplored" means genuinely
+    # new rather than merely unfinished.
+    engaged_story_ids = {story_id for _uid, story_id in _engagement_pairs(user_ids=[user.pk])}
+    read_countries = completed_countries | set(
+        Story.objects.filter(id__in=engaged_story_ids)
+        .exclude(country="")
+        .values_list("country", flat=True)
+    )
+
+    # The median rather than the mean: one very long book should not move a
+    # reader's typical length, and a reader's history is small enough that one
+    # outlier would.
+    lengths = sorted(
+        minutes
+        for minutes in Story.objects.filter(id__in=completed_story_ids).values_list(
+            "cached_chapter_reading_minutes", flat=True
+        )
+        if minutes
+    )
+    typical_minutes = lengths[len(lengths) // 2] if lengths else None
+
+    return ReaderTaste(
+        completed_genre_ids=genres_of(completed_story_ids),
+        favourited_genre_ids=genres_of(favourited_story_ids),
+        completed_country_codes=completed_countries,
+        read_country_codes=read_countries,
+        typical_minutes=typical_minutes,
+    )

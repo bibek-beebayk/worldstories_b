@@ -25,7 +25,11 @@ from apps.stats.models import (
 from apps.story import reading_time
 from apps.story.models import Audio, Chapter, Favorite, Genre, Review, Story
 from apps.story.signals import recompute_chapter_reading_minutes
-from apps.users.recommendations import PRIMARY_WEIGHTS, select_primary_recommendation
+from apps.users.recommendations import (
+    PRIMARY_WEIGHTS,
+    reader_taste,
+    select_primary_recommendation,
+)
 
 
 User = get_user_model()
@@ -995,3 +999,122 @@ class PrimaryRecommendationTests(APITestCase):
         # added together, or unread would stop being the top preference.
         positives = sum(value for value in weights.values() if value > 0)
         self.assertGreater(abs(weights["already_completed"]), positives)
+
+
+class ReaderTasteSignalTests(APITestCase):
+    """The §3.3 signals layered on top of the existing genre/collaborative
+    ranking. Each is isolated so a failure names the signal that broke."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            email="taste@example.com", username="taste", password="test-password"
+        )
+        self.folklore = Genre.objects.create(name="Folklore", slug="folklore-taste")
+        self.myth = Genre.objects.create(name="Myth", slug="myth-taste")
+
+    def _story(self, slug, country="", minutes=None, genres=None):
+        story = Story.objects.create(title=slug, slug=slug, is_published=True, country=country)
+        if genres:
+            story.genres.set(genres)
+        if minutes is not None:
+            Story.objects.filter(pk=story.pk).update(cached_chapter_reading_minutes=minutes)
+            story.refresh_from_db()
+        return story
+
+    def test_a_finished_genre_counts_for_more_than_an_untouched_one(self):
+        finished = self._story("finished-folklore", genres=[self.folklore])
+        StoryCompletion.objects.create(
+            user=self.user, story=finished, source=StoryCompletion.SOURCE_CHAPTERS
+        )
+        taste = reader_taste(self.user)
+
+        matching = self._story("more-folklore", genres=[self.folklore])
+        unrelated = self._story("some-myth", genres=[self.myth])
+
+        self.assertGreater(taste.bonus_for(matching), taste.bonus_for(unrelated))
+
+    def test_a_favourited_genre_counts(self):
+        favourited = self._story("saved-myth", genres=[self.myth])
+        Favorite.objects.create(user=self.user, story=favourited)
+        taste = reader_taste(self.user)
+
+        self.assertGreater(
+            taste.bonus_for(self._story("more-myth", genres=[self.myth])),
+            taste.bonus_for(self._story("plain", genres=[self.folklore])),
+        )
+
+    def test_a_country_they_finish_stories_from_counts(self):
+        finished = self._story("from-japan", country="JP")
+        StoryCompletion.objects.create(
+            user=self.user, story=finished, source=StoryCompletion.SOURCE_CHAPTERS
+        )
+        taste = reader_taste(self.user)
+
+        self.assertGreater(
+            taste.bonus_for(self._story("another-japan", country="JP")),
+            taste.bonus_for(self._story("from-france", country="FR")),
+        )
+
+    def test_a_country_they_have_never_read_from_gets_a_nudge(self):
+        """Keeps a list from narrowing to one region, and feeds the Passport's
+        reason for existing."""
+        started = self._story("from-nepal", country="NP")
+        ReadingProgress.objects.create(user=self.user, story=started, progress=0.9)
+        taste = reader_taste(self.user)
+
+        somewhere_new = self._story("from-peru", country="PE")
+        already_seen = self._story("more-nepal", country="NP")
+
+        self.assertGreater(taste.bonus_for(somewhere_new), taste.bonus_for(already_seen))
+
+    def test_a_finished_country_still_beats_an_unexplored_one(self):
+        finished = self._story("beloved-japan", country="JP")
+        StoryCompletion.objects.create(
+            user=self.user, story=finished, source=StoryCompletion.SOURCE_CHAPTERS
+        )
+        taste = reader_taste(self.user)
+
+        self.assertGreater(
+            taste.bonus_for(self._story("more-japan", country="JP")),
+            taste.bonus_for(self._story("brand-new-place", country="PE")),
+        )
+
+    def test_a_familiar_length_counts(self):
+        for index in range(3):
+            finished = self._story(f"short-{index}", minutes=10)
+            StoryCompletion.objects.create(
+                user=self.user, story=finished, source=StoryCompletion.SOURCE_CHAPTERS
+            )
+        taste = reader_taste(self.user)
+
+        self.assertEqual(taste.typical_minutes, 10)
+        self.assertGreater(
+            taste.bonus_for(self._story("also-short", minutes=12)),
+            taste.bonus_for(self._story("a-novella", minutes=300)),
+        )
+
+    def test_one_long_book_does_not_move_a_readers_typical_length(self):
+        """Median, not mean — a reader's history is small enough that a single
+        outlier would otherwise redefine their habit."""
+        for index, minutes in enumerate([8, 10, 12, 600]):
+            finished = self._story(f"mixed-{index}", minutes=minutes)
+            StoryCompletion.objects.create(
+                user=self.user, story=finished, source=StoryCompletion.SOURCE_CHAPTERS
+            )
+
+        self.assertLessEqual(reader_taste(self.user).typical_minutes, 12)
+
+    def test_a_reader_with_no_history_gets_no_bonuses(self):
+        taste = reader_taste(self.user)
+
+        self.assertIsNone(taste.typical_minutes)
+        self.assertEqual(taste.bonus_for(self._story("anything", genres=[self.folklore])), 0)
+
+    def test_a_story_with_no_country_is_neither_rewarded_nor_punished(self):
+        finished = self._story("from-japan-2", country="JP")
+        StoryCompletion.objects.create(
+            user=self.user, story=finished, source=StoryCompletion.SOURCE_CHAPTERS
+        )
+        taste = reader_taste(self.user)
+
+        self.assertEqual(taste.bonus_for(self._story("placeless")), 0)
