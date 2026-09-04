@@ -18,6 +18,7 @@ from rest_framework.views import APIView
 
 from apps.stats.models import (
     AnalyticsEvent,
+    StoryCompletion,
     AudioReadingProgress,
     VideoWatchProgress,
     BlogReadingProgress,
@@ -767,6 +768,189 @@ def build_geography_data(days):
     }
 
 
+def _rate(numerator, denominator):
+    """A ratio, or None when there is nothing to divide by.
+
+    None rather than 0 on purpose: "no data yet" and "0%" look identical in a
+    dashboard but mean opposite things, and a completion rate reading 0%
+    because nobody has started anything would send someone hunting a bug.
+    """
+    if not denominator:
+        return None
+    return round(numerator / denominator, 4)
+
+
+def _retention(events, cutoff, day_offset):
+    """Share of readers who came back on or after day N.
+
+    Measured over readers whose **first** activity in the window is at least
+    `day_offset` days old — anyone newer has not had the chance yet, and
+    counting them would drag every retention figure toward zero as traffic
+    grows. That is the trap in a naive "returned / signed up" query.
+    """
+    now = timezone.now()
+    first_seen = {}
+    last_seen = {}
+    for user_id, created_at in events.filter(user_id__isnull=False).values_list(
+        "user_id", "created_at"
+    ):
+        if user_id not in first_seen or created_at < first_seen[user_id]:
+            first_seen[user_id] = created_at
+        if user_id not in last_seen or created_at > last_seen[user_id]:
+            last_seen[user_id] = created_at
+
+    eligible = 0
+    returned = 0
+    for user_id, first in first_seen.items():
+        if (now - first).days < day_offset:
+            continue
+        eligible += 1
+        if (last_seen[user_id] - first).days >= day_offset:
+            returned += 1
+    return {"eligible": eligible, "returned": returned, "rate": _rate(returned, eligible)}
+
+
+def build_engagement_metrics_data(days):
+    """The §12.2 funnel: the rates that say whether the engagement work worked.
+
+    Every figure is a ratio of events the milestones already emit, so this adds
+    no new tracking — it reads what is there. Rates are None rather than 0 when
+    their denominator is empty, so an unpopulated metric cannot be mistaken for
+    a bad one.
+    """
+    cutoff = get_cutoff(days)
+    events = audience_only(AnalyticsEvent.objects.filter(created_at__gte=cutoff))
+
+    def count(event_type):
+        return events.filter(event_type=event_type).count()
+
+    starts = count(AnalyticsEvent.EVENT_STORY_STARTED)
+    resumes = count(AnalyticsEvent.EVENT_STORY_RESUMED)
+    completions = count(AnalyticsEvent.EVENT_STORY_COMPLETED)
+    detail_views = audience_only(StoryView.objects.filter(created_at__gte=cutoff)).count()
+
+    quick_read_completed = count(AnalyticsEvent.EVENT_QUICK_READ_COMPLETED)
+    quick_read_converted = count(AnalyticsEvent.EVENT_QUICK_READ_FULL_STORY_CLICKED)
+
+    daily_viewed = count(AnalyticsEvent.EVENT_DAILY_STORY_VIEWED)
+    daily_started = count(AnalyticsEvent.EVENT_DAILY_STORY_STARTED)
+
+    journeys_started = count(AnalyticsEvent.EVENT_JOURNEY_STARTED)
+    journeys_completed = count(AnalyticsEvent.EVENT_JOURNEY_COMPLETED)
+
+    # Stories per session and average session length, from the reading-session
+    # events that already carry both a session id and a duration.
+    sessions = events.filter(
+        event_type__in=[
+            AnalyticsEvent.EVENT_READING_SESSION,
+            AnalyticsEvent.EVENT_LISTENING_SESSION,
+            AnalyticsEvent.EVENT_WATCHING_SESSION,
+        ]
+    ).exclude(session_id="")
+    stories_by_session = {}
+    durations = []
+    for session_id, story_id, duration in sessions.values_list(
+        "session_id", "story_id", "duration_seconds"
+    ):
+        if story_id:
+            stories_by_session.setdefault(session_id, set()).add(story_id)
+        if duration:
+            durations.append(duration)
+
+    stories_per_session = _rate(
+        sum(len(story_ids) for story_ids in stories_by_session.values()),
+        len(stories_by_session),
+    )
+
+    # Countries per active reader, over readers who completed anything at all —
+    # dividing by every active reader would measure how many people have not
+    # finished a story rather than how far the ones who did have travelled.
+    completions_in_window = audience_only(
+        StoryCompletion.objects.filter(completed_at__gte=cutoff)
+    ).exclude(story__country="")
+    countries_by_user = {}
+    for user_id, country in completions_in_window.values_list("user_id", "story__country"):
+        countries_by_user.setdefault(user_id, set()).add(country)
+    countries_per_reader = _rate(
+        sum(len(countries) for countries in countries_by_user.values()),
+        len(countries_by_user),
+    )
+
+    return {
+        "range_days": days,
+        "funnel": [
+            {
+                "key": "story_start_rate",
+                "label": "Story start rate",
+                "help": "Readers who began a story, over story detail views.",
+                "numerator": starts,
+                "denominator": detail_views,
+                "rate": _rate(starts, detail_views),
+            },
+            {
+                "key": "completion_rate",
+                "label": "Completion rate",
+                "help": "Stories finished, over stories started.",
+                "numerator": completions,
+                "denominator": starts,
+                "rate": _rate(completions, starts),
+            },
+            {
+                "key": "resume_rate",
+                "label": "Continue Reading resume rate",
+                "help": "Openings that picked up an unfinished story, over all openings.",
+                "numerator": resumes,
+                "denominator": starts + resumes,
+                "rate": _rate(resumes, starts + resumes),
+            },
+            {
+                "key": "quick_read_conversion",
+                "label": "Quick Read conversion",
+                "help": "Full-story opens after a summary, over summaries finished.",
+                "numerator": quick_read_converted,
+                "denominator": quick_read_completed,
+                "rate": _rate(quick_read_converted, quick_read_completed),
+            },
+            {
+                "key": "daily_story_participation",
+                "label": "Daily Story participation",
+                "help": "Daily Story opens, over Daily Story views.",
+                "numerator": daily_started,
+                "denominator": daily_viewed,
+                "rate": _rate(daily_started, daily_viewed),
+            },
+            {
+                "key": "journey_completion_rate",
+                "label": "Journey completion rate",
+                "help": "Journeys finished, over journeys begun.",
+                "numerator": journeys_completed,
+                "denominator": journeys_started,
+                "rate": _rate(journeys_completed, journeys_started),
+            },
+        ],
+        "averages": {
+            "stories_per_session": stories_per_session,
+            "average_session_minutes": (
+                round(statistics.mean(durations) / 60, 1) if durations else None
+            ),
+            "countries_per_reader": countries_per_reader,
+        },
+        "retention": {
+            "d1": _retention(events, cutoff, 1),
+            "d7": _retention(events, cutoff, 7),
+            "d30": _retention(events, cutoff, 30),
+        },
+        "discovery": {
+            "surprise_me_clicked": count(AnalyticsEvent.EVENT_SURPRISE_ME_CLICKED),
+            "mood_selected": count(AnalyticsEvent.EVENT_MOOD_SELECTED),
+            "next_story_clicked": count(AnalyticsEvent.EVENT_NEXT_STORY_CLICKED),
+            "reactions_added": count(AnalyticsEvent.EVENT_REACTION_ADDED),
+            "achievements_unlocked": count(AnalyticsEvent.EVENT_ACHIEVEMENT_UNLOCKED),
+            "countries_unlocked": count(AnalyticsEvent.EVENT_COUNTRY_UNLOCKED),
+        },
+    }
+
+
 def build_submissions_data(days):
     cutoff = get_cutoff(days)
 
@@ -1316,6 +1500,16 @@ class AdminAnalyticsGeographyAPIView(APIView):
         return Response(build_geography_data(get_range_days(request)))
 
 
+class AdminAnalyticsEngagementMetricsAPIView(APIView):
+    """The §12.2 funnel. Reads events the milestones already emit."""
+
+    permission_classes = [IsSuperUser]
+
+    @method_decorator(cache_page(CACHE_SECONDS))
+    def get(self, request):
+        return Response(build_engagement_metrics_data(get_range_days(request)))
+
+
 class AdminAnalyticsSubmissionsAPIView(APIView):
     permission_classes = [IsSuperUser]
 
@@ -1339,6 +1533,7 @@ EXPORT_SECTION_BUILDERS = {
     "users": build_users_data,
     "geography": build_geography_data,
     "submissions": build_submissions_data,
+    "engagement_metrics": build_engagement_metrics_data,
 }
 
 
@@ -1381,6 +1576,7 @@ SECTION_TABLE_KEYS = {
     "users": {"signups_over_time", "login_frequency_buckets"},
     "geography": {"by_country", "by_city", "logins_over_time"},
     "submissions": {"submissions_over_time", "funnel", "by_story_type", "by_genre"},
+    "engagement_metrics": {"funnel"},
     "audience": {
         "daily_activity",
         "visitor_retention",

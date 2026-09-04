@@ -254,6 +254,11 @@ urlpatterns = [
         name="admin-analytics-blog-detail",
     ),
     path(
+        "api/admin/analytics/engagement-metrics/",
+        story_analytics_api.AdminAnalyticsEngagementMetricsAPIView.as_view(),
+        name="admin-analytics-engagement-metrics",
+    ),
+    path(
         "api/admin/analytics/submissions/",
         story_analytics_api.AdminAnalyticsSubmissionsAPIView.as_view(),
         name="admin-analytics-submissions",

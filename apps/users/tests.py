@@ -1116,6 +1116,44 @@ class ReaderTasteSignalTests(APITestCase):
 
         self.assertLessEqual(reader_taste(self.user).typical_minutes, 12)
 
+    def test_a_story_readers_tend_to_finish_scores_higher(self):
+        """§12.3's "strong completion rate" — a quality signal about the story,
+        not about this reader."""
+        finished_often = self._story("well-finished", genres=[self.folklore])
+        rarely = self._story("often-abandoned", genres=[self.folklore])
+        for _ in range(6):
+            AnalyticsEvent.objects.create(
+                event_type=AnalyticsEvent.EVENT_STORY_STARTED,
+                user=self.user, story=finished_often, visitor_id="v",
+            )
+            AnalyticsEvent.objects.create(
+                event_type=AnalyticsEvent.EVENT_STORY_STARTED,
+                user=self.user, story=rarely, visitor_id="v",
+            )
+        for _ in range(5):
+            AnalyticsEvent.objects.create(
+                event_type=AnalyticsEvent.EVENT_STORY_COMPLETED,
+                user=self.user, story=finished_often, visitor_id="v",
+            )
+        taste = reader_taste(self.user)
+
+        self.assertGreater(taste.bonus_for(finished_often), taste.bonus_for(rarely))
+
+    def test_one_reader_finishing_an_unread_story_is_not_evidence_of_quality(self):
+        """Without a minimum number of starts, a story with one start and one
+        completion would rank as the best on the site."""
+        story = self._story("barely-seen", genres=[self.folklore])
+        AnalyticsEvent.objects.create(
+            event_type=AnalyticsEvent.EVENT_STORY_STARTED,
+            user=self.user, story=story, visitor_id="v",
+        )
+        AnalyticsEvent.objects.create(
+            event_type=AnalyticsEvent.EVENT_STORY_COMPLETED,
+            user=self.user, story=story, visitor_id="v",
+        )
+
+        self.assertEqual(reader_taste(self.user).bonus_for(story), 0)
+
     def test_a_reader_with_no_history_gets_no_bonuses(self):
         taste = reader_taste(self.user)
 

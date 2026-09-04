@@ -84,6 +84,15 @@ SIMILAR_LENGTH_WEIGHT = 1
 # How far a story's estimate may sit from the reader's typical length and still
 # count as familiar.
 LENGTH_AFFINITY_TOLERANCE = 0.5
+# §12.3's "strong completion rate": stories that readers who start them tend to
+# finish. A quality signal about the *story* rather than about this reader, so
+# it is computed once and shared. Small on purpose — it should break a tie
+# between two stories a reader would equally like, not override their taste.
+STRONG_COMPLETION_WEIGHT = 1
+STRONG_COMPLETION_RATE = 0.5
+# Below this many starts a completion rate is noise: one reader finishing the
+# only story nobody else has opened is not evidence of quality.
+STRONG_COMPLETION_MIN_STARTS = 5
 
 
 def _engagement_pairs(user_ids=None, story_ids=None):
@@ -562,12 +571,14 @@ class ReaderTaste:
         completed_country_codes,
         read_country_codes,
         typical_minutes,
+        well_finished_ids=frozenset(),
     ):
         self.completed_genre_ids = completed_genre_ids
         self.favourited_genre_ids = favourited_genre_ids
         self.completed_country_codes = completed_country_codes
         self.read_country_codes = read_country_codes
         self.typical_minutes = typical_minutes
+        self.well_finished_ids = well_finished_ids
 
     def bonus_for(self, story):
         bonus = 0
@@ -592,7 +603,37 @@ class ReaderTaste:
                 if abs(minutes - self.typical_minutes) <= window:
                     bonus += SIMILAR_LENGTH_WEIGHT
 
+        if story.id in self.well_finished_ids:
+            bonus += STRONG_COMPLETION_WEIGHT
+
         return bonus
+
+
+def well_finished_story_ids():
+    """Stories that most readers who start them go on to finish.
+
+    Derived from the lifecycle events rather than a stored score, and guarded
+    by a minimum number of starts — otherwise a story with one start and one
+    completion would rank as the best on the site.
+    """
+    from apps.stats.models import AnalyticsEvent
+
+    starts = Counter(
+        AnalyticsEvent.objects.filter(
+            event_type=AnalyticsEvent.EVENT_STORY_STARTED, story_id__isnull=False
+        ).values_list("story_id", flat=True)
+    )
+    finishes = Counter(
+        AnalyticsEvent.objects.filter(
+            event_type=AnalyticsEvent.EVENT_STORY_COMPLETED, story_id__isnull=False
+        ).values_list("story_id", flat=True)
+    )
+    return {
+        story_id
+        for story_id, started in starts.items()
+        if started >= STRONG_COMPLETION_MIN_STARTS
+        and finishes.get(story_id, 0) / started >= STRONG_COMPLETION_RATE
+    }
 
 
 def reader_taste(user):
@@ -645,6 +686,7 @@ def reader_taste(user):
     typical_minutes = lengths[len(lengths) // 2] if lengths else None
 
     return ReaderTaste(
+        well_finished_ids=well_finished_story_ids(),
         completed_genre_ids=genres_of(completed_story_ids),
         favourited_genre_ids=genres_of(favourited_story_ids),
         completed_country_codes=completed_countries,

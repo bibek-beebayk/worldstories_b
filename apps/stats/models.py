@@ -262,6 +262,12 @@ class AnalyticsEvent(models.Model):
     # events above, this legitimately fires again when a reader changes their
     # mind, carrying what it replaced.
     EVENT_REACTION_ADDED = "reaction_added"
+    # Advanced discovery (§8). These shipped in the frontend's event union in
+    # Milestone 8 but were never added here, so the ingest endpoint rejected
+    # them and every one was silently dropped — the client is a fire-and-forget
+    # beacon that ignores the 400.
+    EVENT_SURPRISE_ME_CLICKED = "surprise_me_clicked"
+    EVENT_MOOD_SELECTED = "mood_selected"
     EVENT_DAILY_STORY_VIEWED = "daily_story_viewed"
     EVENT_DAILY_STORY_STARTED = "daily_story_started"
     EVENT_DAILY_STORY_COMPLETED = "daily_story_completed"
@@ -289,6 +295,8 @@ class AnalyticsEvent(models.Model):
         (EVENT_JOURNEY_STARTED, "Journey started"),
         (EVENT_JOURNEY_COMPLETED, "Journey completed"),
         (EVENT_REACTION_ADDED, "Reaction added"),
+        (EVENT_SURPRISE_ME_CLICKED, "Surprise Me clicked"),
+        (EVENT_MOOD_SELECTED, "Mood selected"),
         (EVENT_DAILY_STORY_VIEWED, "Daily Story viewed"),
         (EVENT_DAILY_STORY_STARTED, "Daily Story started"),
         (EVENT_DAILY_STORY_COMPLETED, "Daily Story completed"),

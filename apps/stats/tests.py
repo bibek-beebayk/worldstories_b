@@ -1877,3 +1877,135 @@ class StoryJourneyTests(APITestCase):
         self._add(story, 1)
 
         self.assertTrue(self._list()[0]["cover_image"])
+
+
+class EngagementMetricsApiTests(APITestCase):
+    """§12.2's funnel. Ratios over events the milestones already emit."""
+
+    def setUp(self):
+        cache.clear()
+        self.client = APIClient(HTTP_USER_AGENT=BROWSER_USER_AGENT)
+        self.admin = User.objects.create_user(
+            email="metrics@example.com", username="metrics", password="test-password",
+            is_superuser=True, is_staff=True, is_active=True,
+        )
+        self.reader = User.objects.create_user(
+            email="metricsreader@example.com", username="metricsreader", password="test-password"
+        )
+        self.story = Story.objects.create(title="M", slug="metrics-story", is_published=True)
+        self.client.force_authenticate(self.admin)
+
+    def _event(self, event_type, **kwargs):
+        return AnalyticsEvent.objects.create(
+            event_type=event_type,
+            user=kwargs.pop("user", self.reader),
+            story=kwargs.pop("story", self.story),
+            visitor_id=kwargs.pop("visitor_id", "v"),
+            **kwargs,
+        )
+
+    def _metrics(self):
+        return self.client.get(reverse("admin-analytics-engagement-metrics"), {"days": 30}).data
+
+    def _rate(self, key):
+        return next(row for row in self._metrics()["funnel"] if row["key"] == key)["rate"]
+
+    def test_completion_rate_is_completions_over_starts(self):
+        for _ in range(4):
+            self._event(AnalyticsEvent.EVENT_STORY_STARTED)
+        self._event(AnalyticsEvent.EVENT_STORY_COMPLETED)
+
+        self.assertEqual(self._rate("completion_rate"), 0.25)
+
+    def test_quick_read_conversion_is_clicks_over_completions(self):
+        for _ in range(2):
+            self._event(AnalyticsEvent.EVENT_QUICK_READ_COMPLETED)
+        self._event(AnalyticsEvent.EVENT_QUICK_READ_FULL_STORY_CLICKED)
+
+        self.assertEqual(self._rate("quick_read_conversion"), 0.5)
+
+    def test_a_metric_with_no_denominator_reports_none_not_zero(self):
+        """"No data yet" and "0%" look identical in a dashboard and mean
+        opposite things — a completion rate reading 0% because nobody started
+        anything would send someone hunting a bug."""
+        self.assertIsNone(self._rate("completion_rate"))
+        self.assertIsNone(self._rate("journey_completion_rate"))
+
+    def test_resume_rate_is_measured_against_all_openings(self):
+        self._event(AnalyticsEvent.EVENT_STORY_STARTED)
+        self._event(AnalyticsEvent.EVENT_STORY_RESUMED)
+        self._event(AnalyticsEvent.EVENT_STORY_RESUMED)
+
+        self.assertAlmostEqual(self._rate("resume_rate"), 0.6667, places=3)
+
+    def test_countries_per_reader_divides_by_readers_who_finished_something(self):
+        """Dividing by every active reader would measure how many people have
+        not finished a story, not how far the ones who did have travelled."""
+        for index, country in enumerate(["JP", "FR"]):
+            story = Story.objects.create(
+                title=f"c{index}", slug=f"metrics-c{index}", is_published=True, country=country
+            )
+            StoryCompletion.objects.create(
+                user=self.reader, story=story, source=StoryCompletion.SOURCE_CHAPTERS
+            )
+
+        self.assertEqual(self._metrics()["averages"]["countries_per_reader"], 2.0)
+
+    def test_stories_per_session_counts_distinct_stories(self):
+        other = Story.objects.create(title="O", slug="metrics-other", is_published=True)
+        for story in (self.story, self.story, other):
+            self._event(
+                AnalyticsEvent.EVENT_READING_SESSION,
+                story=story, session_id="s1", duration_seconds=60,
+            )
+
+        self.assertEqual(self._metrics()["averages"]["stories_per_session"], 2.0)
+
+    def test_retention_only_counts_readers_old_enough_to_have_returned(self):
+        """Counting readers who have not had the chance would drag every
+        retention figure toward zero as traffic grows."""
+        fresh = self._event(AnalyticsEvent.EVENT_READING_SESSION)
+        AnalyticsEvent.objects.filter(pk=fresh.pk).update(created_at=timezone.now())
+
+        d7 = self._metrics()["retention"]["d7"]
+
+        self.assertEqual(d7["eligible"], 0)
+        self.assertIsNone(d7["rate"])
+
+    def test_a_returning_reader_counts_toward_retention(self):
+        first = self._event(AnalyticsEvent.EVENT_READING_SESSION)
+        AnalyticsEvent.objects.filter(pk=first.pk).update(
+            created_at=timezone.now() - timedelta(days=10)
+        )
+        later = self._event(AnalyticsEvent.EVENT_READING_SESSION)
+        AnalyticsEvent.objects.filter(pk=later.pk).update(
+            created_at=timezone.now() - timedelta(days=2)
+        )
+
+        d7 = self._metrics()["retention"]["d7"]
+
+        self.assertEqual((d7["eligible"], d7["returned"]), (1, 1))
+        self.assertEqual(d7["rate"], 1.0)
+
+    def test_discovery_counters_are_reported(self):
+        self._event(AnalyticsEvent.EVENT_SURPRISE_ME_CLICKED, story=None)
+        self._event(AnalyticsEvent.EVENT_MOOD_SELECTED, story=None)
+
+        discovery = self._metrics()["discovery"]
+
+        self.assertEqual(discovery["surprise_me_clicked"], 1)
+        self.assertEqual(discovery["mood_selected"], 1)
+
+    def test_operator_activity_is_excluded_like_every_other_dashboard_query(self):
+        self._event(AnalyticsEvent.EVENT_STORY_STARTED, user=self.admin)
+
+        self.assertIsNone(self._rate("completion_rate"))
+
+    def test_the_endpoint_is_superuser_only(self):
+        self.client.force_authenticate(self.reader)
+
+        response = self.client.get(
+            reverse("admin-analytics-engagement-metrics"), format="json"
+        )
+
+        self.assertEqual(response.status_code, 403)
