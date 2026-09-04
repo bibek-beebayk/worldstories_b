@@ -5,6 +5,7 @@ from rest_framework.response import Response
 from rest_framework import status
 from rest_framework.throttling import SimpleRateThrottle
 
+from apps.story.api import is_untracked_request
 from apps.story.models import Blog, Story
 from apps.stats.models import (
     AnalyticsEvent,
@@ -49,6 +50,15 @@ class AnalyticsEventCreateAPIView(APIView):
     throttle_classes = [AnalyticsEventThrottle]
 
     def post(self, request):
+        # Crawlers and superusers are dropped before anything is written, so the
+        # events table only ever holds real audience behaviour from the reader
+        # side of the site. Answered 202 rather than an error: the client is a
+        # fire-and-forget beacon with nothing useful to do about a rejection,
+        # and a 4xx here would just show up as console noise for admins
+        # browsing their own site.
+        if is_untracked_request(request):
+            return Response(status=status.HTTP_202_ACCEPTED)
+
         serializer = AnalyticsEventWriteSerializer(
             data=request.data, context={"request": request}
         )

@@ -5,18 +5,26 @@ from django.core.cache import cache
 from django.test import SimpleTestCase
 from django.urls import reverse
 from django.utils import timezone
-from rest_framework.test import APITestCase
+from rest_framework.test import APIClient, APITestCase
 
-from apps.story.models import Audio, Video, Blog, Story, StoryView
+from apps.story.models import Audio, Video, Blog, Story, StoryView, Submission
 from apps.users.models import User
 
 from .models import AnalyticsEvent, VideoWatchProgress
 from .streaks import compute_streak
 
+# The analytics endpoints reject requests with no User-Agent (a real browser
+# always sends one), so the test client has to look like one to reach them.
+BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+
 
 class AnalyticsEventApiTests(APITestCase):
     def setUp(self):
         cache.clear()
+        self.client = APIClient(HTTP_USER_AGENT=BROWSER_USER_AGENT)
         self.story = Story.objects.create(
             title="Tracked Story",
             slug="tracked-story",
@@ -147,6 +155,128 @@ class AnalyticsEventApiTests(APITestCase):
 
         self.assertEqual(response.status_code, 201)
         self.assertIsNone(AnalyticsEvent.objects.get(event_id=event_id).blog)
+
+    def _visit_payload(self):
+        return {
+            "event_id": str(uuid4()),
+            "event_type": AnalyticsEvent.EVENT_VISIT,
+            "visitor_id": "some-visitor",
+            "metadata": {"path": "/story/tracked-story"},
+        }
+
+    def test_superuser_events_are_dropped(self):
+        admin = User.objects.create_user(
+            email="ops@example.com",
+            username="ops",
+            password="test-password",
+            is_superuser=True,
+            is_staff=True,
+        )
+        self.client.force_authenticate(admin)
+
+        response = self.client.post(
+            reverse("analytics-events"), self._visit_payload(), format="json"
+        )
+
+        self.assertEqual(response.status_code, 202)
+        self.assertFalse(AnalyticsEvent.objects.exists())
+
+    def test_staff_events_are_dropped(self):
+        staff = User.objects.create_user(
+            email="editor@example.com",
+            username="editor",
+            password="test-password",
+            is_staff=True,
+        )
+        self.client.force_authenticate(staff)
+
+        response = self.client.post(
+            reverse("analytics-events"), self._visit_payload(), format="json"
+        )
+
+        self.assertEqual(response.status_code, 202)
+        self.assertFalse(AnalyticsEvent.objects.exists())
+
+    def test_crawler_events_are_dropped(self):
+        crawler = APIClient(
+            HTTP_USER_AGENT="Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
+        )
+
+        response = crawler.post(reverse("analytics-events"), self._visit_payload(), format="json")
+
+        self.assertEqual(response.status_code, 202)
+        self.assertFalse(AnalyticsEvent.objects.exists())
+
+    def test_unknown_crawler_and_blank_user_agent_events_are_dropped(self):
+        for user_agent in ("SomeUnknownBot/1.0 (+http://example.com)", "python-requests/2.31.0", ""):
+            with self.subTest(user_agent=user_agent):
+                client = APIClient(HTTP_USER_AGENT=user_agent)
+                response = client.post(
+                    reverse("analytics-events"), self._visit_payload(), format="json"
+                )
+                self.assertEqual(response.status_code, 202)
+        self.assertFalse(AnalyticsEvent.objects.exists())
+
+
+class StoryViewBeaconTests(APITestCase):
+    def setUp(self):
+        cache.clear()
+        self.client = APIClient(HTTP_USER_AGENT=BROWSER_USER_AGENT)
+        self.story = Story.objects.create(
+            title="Beacon Story", slug="beacon-story", is_published=True
+        )
+
+    def _beacon_url(self):
+        return f"/api/stories/{self.story.slug}/view/"
+
+    def test_detail_get_does_not_count_a_view(self):
+        """Under SSR the detail GET comes from the render server, not the
+        visitor — counting there recorded the wrong IP and User-Agent."""
+        response = self.client.get(f"/api/stories/{self.story.slug}/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(StoryView.objects.count(), 0)
+        self.story.refresh_from_db()
+        self.assertEqual(self.story.views, 0)
+
+    def test_beacon_counts_one_view_and_dedupes_by_ip(self):
+        first = self.client.post(self._beacon_url(), REMOTE_ADDR="203.0.113.9")
+        second = self.client.post(self._beacon_url(), REMOTE_ADDR="203.0.113.9")
+
+        self.assertEqual(first.status_code, 204)
+        self.assertEqual(second.status_code, 204)
+        self.assertEqual(StoryView.objects.count(), 1)
+        self.story.refresh_from_db()
+        self.assertEqual(self.story.views, 1)
+
+    def test_beacon_counts_distinct_visitors_separately(self):
+        self.client.post(self._beacon_url(), REMOTE_ADDR="203.0.113.9")
+        self.client.post(self._beacon_url(), REMOTE_ADDR="203.0.113.10")
+
+        self.assertEqual(StoryView.objects.count(), 2)
+
+    def test_beacon_ignores_crawlers(self):
+        crawler = APIClient(HTTP_USER_AGENT="Mozilla/5.0 (compatible; bingbot/2.0)")
+
+        response = crawler.post(self._beacon_url(), REMOTE_ADDR="203.0.113.9")
+
+        self.assertEqual(response.status_code, 204)
+        self.assertEqual(StoryView.objects.count(), 0)
+
+    def test_beacon_ignores_superusers(self):
+        admin = User.objects.create_user(
+            email="ops2@example.com",
+            username="ops2",
+            password="test-password",
+            is_superuser=True,
+            is_staff=True,
+        )
+        self.client.force_authenticate(admin)
+
+        response = self.client.post(self._beacon_url(), REMOTE_ADDR="203.0.113.9")
+
+        self.assertEqual(response.status_code, 204)
+        self.assertEqual(StoryView.objects.count(), 0)
 
 
 class AdminAudienceAnalyticsApiTests(APITestCase):
@@ -526,6 +656,212 @@ class AdminContentAnalyticsApiTests(APITestCase):
         self.assertEqual(ranking.status_code, 200)
         self.assertEqual(ranking.data["content_type"], "blog")
         self.assertEqual(ranking.data["results"][0]["id"], self.blog.id)
+
+    def test_rankings_exclude_operator_activity_but_keep_anonymous(self):
+        """Rows written before the ingest gate existed are still in the tables,
+        so the aggregators have to filter operators on read too — while leaving
+        logged-out visitors (user IS NULL), who are the bulk of the audience."""
+        StoryView.objects.create(story=self.plain_story, ip_address="198.51.100.1")
+        StoryView.objects.create(
+            story=self.plain_story, user=self.admin, ip_address="198.51.100.2"
+        )
+        AnalyticsEvent.objects.create(
+            event_type=AnalyticsEvent.EVENT_READING_SESSION,
+            visitor_id="real-reader",
+            story=self.plain_story,
+            duration_seconds=60,
+        )
+        AnalyticsEvent.objects.create(
+            event_type=AnalyticsEvent.EVENT_READING_SESSION,
+            visitor_id="admin-browser",
+            user=self.admin,
+            story=self.plain_story,
+            duration_seconds=600,
+        )
+        self.client.force_authenticate(self.admin)
+
+        response = self.client.get(reverse("admin-analytics-content"), {"days": 30})
+
+        story = next(row for row in response.data["top_stories"] if row["id"] == self.plain_story.id)
+        self.assertEqual(story["views"], 1)
+        self.assertEqual(story["reads"], 1)
+        self.assertEqual(story["reading_minutes"], 1)
+
+    def test_user_metrics_exclude_operator_accounts(self):
+        User.objects.create_user(
+            email="reader1@example.com",
+            username="reader1",
+            password="test-password",
+            login_count=2,
+            last_login=timezone.now(),
+        )
+        self.admin.login_count = 40
+        self.admin.last_login = timezone.now()
+        self.admin.save(update_fields=["login_count", "last_login"])
+        self.client.force_authenticate(self.admin)
+
+        response = self.client.get(reverse("admin-analytics-users"), {"days": 30})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["total_users"], 1)
+        self.assertEqual(response.data["active_users"], 1)
+        buckets = {row["bucket"]: row["count"] for row in response.data["login_frequency_buckets"]}
+        self.assertEqual(buckets["1-2"], 1)
+        self.assertEqual(buckets["11+"], 0)
+
+
+class TimeSeriesBucketFillTests(APITestCase):
+    """Every chart series must carry a row for each bucket in the range, even
+    an empty one — a GROUP BY only returns buckets that had data, and the chart
+    then drew a straight line across the gap at even spacing, hiding quiet
+    periods entirely."""
+
+    def setUp(self):
+        cache.clear()
+        self.admin = User.objects.create_user(
+            email="charts@example.com",
+            username="charts",
+            password="test-password",
+            is_superuser=True,
+            is_staff=True,
+        )
+        self.story = Story.objects.create(
+            title="Charted Story", slug="charted-story", is_published=True
+        )
+        self.client.force_authenticate(self.admin)
+
+    def _dated(self, obj, when, field="created_at"):
+        type(obj).objects.filter(pk=obj.pk).update(**{field: when})
+
+    def test_daily_range_emits_every_day_including_empty_ones(self):
+        view = StoryView.objects.create(story=self.story, ip_address="198.51.100.5")
+        self._dated(view, timezone.now() - timedelta(days=3))
+
+        response = self.client.get(reverse("admin-analytics-content"), {"days": 7})
+
+        series = response.data["views_over_time"]
+        # Today plus each of the 7 preceding days.
+        self.assertEqual(len(series), 8)
+        days = [row["day"] for row in series]
+        self.assertEqual(days, sorted(days))
+        self.assertEqual(len(set(days)), len(days))
+        self.assertEqual(sum(row["count"] for row in series), 1)
+        self.assertEqual([row["count"] for row in series].count(0), 7)
+        expected_day = (timezone.now() - timedelta(days=3)).date()
+        self.assertEqual(next(row for row in series if row["count"] == 1)["day"], expected_day)
+
+    def test_hourly_range_emits_every_hour_including_empty_ones(self):
+        view = StoryView.objects.create(story=self.story, ip_address="198.51.100.6")
+        self._dated(view, timezone.now() - timedelta(hours=5))
+
+        response = self.client.get(reverse("admin-analytics-content"), {"days": 1})
+
+        series = response.data["views_over_time"]
+        self.assertEqual(response.data["time_interval"], "hour")
+        # This hour plus each of the 24 preceding ones.
+        self.assertEqual(len(series), 25)
+        self.assertEqual(sum(row["count"] for row in series), 1)
+        self.assertEqual([row["count"] for row in series].count(0), 24)
+
+    def test_series_is_full_length_even_with_no_data_at_all(self):
+        response = self.client.get(reverse("admin-analytics-content"), {"days": 30})
+
+        series = response.data["views_over_time"]
+        self.assertEqual(len(series), 31)
+        self.assertTrue(all(row["count"] == 0 for row in series))
+
+    def test_weekly_and_monthly_ranges_are_bucketed_without_gaps(self):
+        for days, expected_interval, expected_length in ((90, "week", 14), (365, "month", 13)):
+            with self.subTest(days=days):
+                response = self.client.get(reverse("admin-analytics-content"), {"days": days})
+                series = response.data["views_over_time"]
+                self.assertEqual(response.data["time_interval"], expected_interval)
+                self.assertEqual(len(series), expected_length)
+                days_seen = [row["day"] for row in series]
+                self.assertEqual(days_seen, sorted(days_seen))
+                self.assertEqual(len(set(days_seen)), len(days_seen))
+
+    def test_every_content_and_users_series_is_filled(self):
+        content = self.client.get(reverse("admin-analytics-content"), {"days": 7}).data
+        users = self.client.get(reverse("admin-analytics-users"), {"days": 7}).data
+
+        for key, payload in (
+            ("views_over_time", content),
+            ("publishing_over_time", content),
+            ("blog_publishing_over_time", content),
+            ("signups_over_time", users),
+        ):
+            with self.subTest(series=key):
+                self.assertEqual(len(payload[key]), 8)
+
+    def test_rating_trend_fills_average_with_none_not_zero(self):
+        """A day with no reviews has no average — a 0 would render as if every
+        reviewer that day gave zero stars."""
+        response = self.client.get(reverse("admin-analytics-engagement"), {"days": 7})
+
+        series = response.data["rating_trend"]
+        self.assertEqual(len(series), 8)
+        self.assertTrue(all(row["avg_rating"] is None for row in series))
+        self.assertTrue(all(row["count"] == 0 for row in series))
+        self.assertEqual(len(response.data["favorites_over_time"]), 8)
+
+    def test_audience_series_are_filled_with_zeroed_rows(self):
+        AnalyticsEvent.objects.create(
+            event_type=AnalyticsEvent.EVENT_VISIT,
+            visitor_id="chart-visitor",
+            story=self.story,
+        )
+
+        response = self.client.get(reverse("admin-analytics-audience"), {"days": 7})
+
+        activity = response.data["daily_activity"]
+        self.assertEqual(len(activity), 8)
+        for row in activity:
+            self.assertEqual(
+                set(row) - {"day"},
+                {
+                    "ad_impressions",
+                    "downloads",
+                    "completions",
+                    "reading_minutes",
+                    "listening_minutes",
+                    "watching_minutes",
+                    "read_along_minutes",
+                },
+            )
+        retention = response.data["visitor_retention"]
+        self.assertEqual(len(retention), 8)
+        self.assertEqual(sum(row["new_visitors"] for row in retention), 1)
+
+    def test_submissions_series_emits_every_day_for_every_status_in_range(self):
+        """Two-dimensional series: the dashboard pivots these rows into one line
+        per status, so a status missing from a day breaks that line the same way
+        a missing day breaks a single-series chart."""
+        author = User.objects.create_user(
+            email="author@example.com", username="author", password="test-password"
+        )
+        submission = Submission.objects.create(
+            user=author, title="A Submission", about="about", content="<p>x</p>"
+        )
+        Submission.objects.filter(pk=submission.pk).update(
+            created_at=timezone.now() - timedelta(days=3)
+        )
+
+        response = self.client.get(reverse("admin-analytics-submissions"), {"days": 7})
+
+        series = response.data["submissions_over_time"]
+        statuses = {row["status"] for row in series}
+        self.assertEqual(len(statuses), 1)
+        self.assertEqual(len(series), 8 * len(statuses))
+        self.assertEqual(sum(row["count"] for row in series), 1)
+        self.assertEqual([row["count"] for row in series].count(0), 7)
+
+    def test_geography_series_is_filled(self):
+        response = self.client.get(reverse("admin-analytics-geography"), {"days": 7})
+
+        series = response.data["logins_over_time"]
+        self.assertEqual(len(series), 8)
+        self.assertTrue(all(row["count"] == 0 and row["users"] == 0 for row in series))
 
 
 class VideoWatchProgressApiTests(APITestCase):

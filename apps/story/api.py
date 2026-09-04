@@ -126,12 +126,18 @@ from core.libs.pagination import PageNumberPagination
 
 VIEW_DEDUPE_WINDOW = timedelta(hours=24)
 
-# Same bot list the social-meta Netlify edge function checks — its server-side fetches
-# to this endpoint (for link-preview scraping) shouldn't be counted as real reads.
+# Named crawlers/link-preview scrapers, plus the generic markers that catch the
+# long tail nobody maintains a list for (unknown search bots, scrapers, HTTP
+# libraries hitting the API directly). Analytics writes are all explicit
+# browser-originated calls now, so anything non-interactive reaching them is
+# noise by definition — see _register_view and AnalyticsEventCreateAPIView.
 BOT_USER_AGENT_PATTERN = re.compile(
     r"facebookexternalhit|Facebot|Twitterbot|Slackbot|Slack-ImgProxy|Discordbot|WhatsApp|"
     r"TelegramBot|LinkedInBot|Pinterest|redditbot|SkypeUriPreview|Applebot|Googlebot|"
-    r"bingbot|DuckDuckBot|YandexBot|W3C_Validator|vkShare",
+    r"bingbot|DuckDuckBot|YandexBot|W3C_Validator|vkShare|"
+    r"\bbot\b|[-_ ]bot|bot/|crawl|spider|slurp|scrap|headless|phantomjs|fetcher|"
+    r"python-requests|python-urllib|aiohttp|httpx|node-fetch|undici|axios|curl/|wget/|"
+    r"go-http-client|okhttp|java/|libwww|lighthouse|pagespeed|gtmetrix|semrush|ahrefs|mj12",
     re.IGNORECASE,
 )
 
@@ -192,8 +198,27 @@ def get_client_ip(request):
 
 
 def is_bot_request(request):
-    user_agent = request.META.get("HTTP_USER_AGENT", "")
+    user_agent = request.META.get("HTTP_USER_AGENT", "").strip()
+    # A blank User-Agent is never an interactive browser — every browser sends
+    # one, so an absent header means a script or a deliberately stripped client.
+    if not user_agent:
+        return True
     return bool(BOT_USER_AGENT_PATTERN.search(user_agent))
+
+
+def is_analytics_excluded_user(request):
+    """Superusers run the site as operators — previewing a story, checking a
+    reader, spot-checking a blog post. None of that is audience behaviour, so
+    it must never reach any counter the admin dashboard reads back."""
+    user = getattr(request, "user", None)
+    return bool(user and user.is_authenticated and (user.is_superuser or user.is_staff))
+
+
+def is_untracked_request(request):
+    """Single gate for every analytics write: real, human, non-operator traffic
+    only. Kept in one place so the view counter and the event ingest endpoint
+    can't drift apart on what counts as a tracked visitor."""
+    return is_bot_request(request) or is_analytics_excluded_user(request)
 
 
 # Chapters/audios are managed as a full per-story list in the admin panel
@@ -520,10 +545,16 @@ class StoryViewSet(ReadOnlyModelViewSet):
 
     def _register_view(self, request, story):
         """Counts one view per IP per story per VIEW_DEDUPE_WINDOW, so refreshing the
-        page or re-fetching for chapter navigation doesn't inflate the count. Bot/crawler
-        requests (including the social-meta edge function's own server-side fetches) are
-        excluded entirely."""
-        if is_bot_request(request):
+        page or re-fetching for chapter navigation doesn't inflate the count.
+
+        Only ever reached from the explicit ``POST /stories/<slug>/view/`` beacon
+        the story page fires from the browser — never from ``retrieve``. Under SSR
+        the detail GET is issued by the render server, not the visitor: it carries
+        the render host's IP and User-Agent, which both defeats the bot filter
+        (a crawler's request arrives wearing the server's identity) and collapses
+        the IP dedupe (every visitor worldwide sharing a couple of IPs, so all but
+        the first view of a story in 24h was being dropped)."""
+        if is_untracked_request(request):
             return
 
         ip_address = get_client_ip(request)
@@ -546,11 +577,18 @@ class StoryViewSet(ReadOnlyModelViewSet):
         Story.objects.filter(pk=story.pk).update(views=F("views") + 1)
         story.views += 1
 
-    def retrieve(self, request, *args, **kwargs):
-        instance = self.get_object()
-        self._register_view(request, instance)
-        serializer = self.get_serializer(instance)
-        return Response(serializer.data)
+    # No retrieve() override: it existed only to call _register_view, which
+    # the browser-fired beacon below now owns.
+    @action(detail=True, methods=["post"], url_path="view")
+    def register_view(self, request, slug=None):
+        """Browser-fired view beacon. Counting here rather than in ``retrieve``
+        keeps the visitor's own IP and User-Agent on the request, which is what
+        makes the bot filter and the per-IP dedupe in ``_register_view`` mean
+        anything — and it raises the bar for a "view" to "a real browser
+        rendered this page", which no non-JS crawler clears."""
+        story = self.get_object()
+        self._register_view(request, story)
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
     def get_serializer_class(self):
         if self.action == "retrieve":

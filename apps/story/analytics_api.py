@@ -29,6 +29,26 @@ from apps.users.models import User, UserLoginLocation
 from .api import IsSuperUser
 from .models import Blog, Favorite, Genre, Review, Story, StoryView, Submission, published_blog_q, published_story_q
 
+# Superuser/staff activity is now rejected at ingest (see is_untracked_request
+# in .api), but two things still need filtering on the read side: rows written
+# before that gate existed, and the product models — reading progress,
+# favorites, reviews — which have no analytics gate at all because they're
+# real features an operator can legitimately use on their own account. Every
+# dashboard queryset goes through audience_only() so the numbers can't drift
+# apart depending on which table they came from.
+#
+# Anonymous rows (user IS NULL) are audience by definition and must survive the
+# filter, hence the explicit isnull branch rather than a bare exclude() — an
+# exclude across a nullable FK is exactly where NULL-vs-NOT-IN silently drops
+# every logged-out visitor.
+AUDIENCE_Q = Q(user__isnull=True) | Q(user__is_superuser=False, user__is_staff=False)
+
+
+def audience_only(queryset):
+    """Restrict a queryset to real (non-operator) audience rows."""
+    return queryset.filter(AUDIENCE_Q)
+
+
 ALLOWED_RANGE_DAYS = (1, 7, 30, 90, 365)
 DEFAULT_RANGE_DAYS = 30
 CACHE_SECONDS = 60 * 5
@@ -57,28 +77,98 @@ def get_time_interval(days):
     return "day"
 
 
+def resolve_interval(days, date_only=False):
+    """The bucket size a series actually uses. `date_only` is for series over a
+    DateField, which has no hours to bucket by. Shared by time_trunc() and the
+    bucket-filling helpers so a series' grouping and its generated empty
+    buckets can never disagree about the interval."""
+    return "day" if date_only and days == 1 else get_time_interval(days)
+
+
 def time_trunc(field, days, *, date_only=False):
-    interval = "day" if date_only and days == 1 else get_time_interval(days)
     trunc = {
         "hour": TruncHour,
         "day": TruncDate,
         "week": TruncWeek,
         "month": TruncMonth,
-    }[interval]
+    }[resolve_interval(days, date_only)]
     return trunc(field)
 
 
-def python_time_bucket(value, days):
-    local = timezone.localtime(value)
-    interval = get_time_interval(days)
+def _bucket_floor(moment, interval):
+    """Snap a moment down to the start of its bucket, in the active timezone —
+    mirroring what the database's Trunc* functions do to the same value."""
+    local = timezone.localtime(moment)
     if interval == "hour":
         return local.replace(minute=0, second=0, microsecond=0)
-    day = local.date()
+    start = local.replace(hour=0, minute=0, second=0, microsecond=0)
     if interval == "week":
-        return day - timedelta(days=day.weekday())
+        return start - timedelta(days=start.weekday())
     if interval == "month":
-        return day.replace(day=1)
-    return day
+        return start.replace(day=1)
+    return start
+
+
+def _next_bucket(start, interval):
+    if interval == "hour":
+        return start + timedelta(hours=1)
+    if interval == "week":
+        return start + timedelta(days=7)
+    if interval == "month":
+        # Step via the 28th so this lands in the next month for every month
+        # length, then snap back to the 1st.
+        return (start.replace(day=28) + timedelta(days=4)).replace(day=1)
+    return start + timedelta(days=1)
+
+
+def _bucket_key(start, interval, date_only):
+    """Match the *type* the database returns for this interval, since that's
+    what ends up serialized and what the filled-in buckets have to sort and
+    compare against: TruncDate yields a date, the others a datetime — and a
+    DateField source yields a date at every interval."""
+    return start.date() if date_only or interval == "day" else start
+
+
+def python_time_bucket(value, days, *, date_only=False):
+    """The bucket a single timestamp falls in, keyed exactly as time_trunc()
+    would key it in SQL."""
+    interval = resolve_interval(days, date_only)
+    return _bucket_key(_bucket_floor(value, interval), interval, date_only)
+
+
+def time_bucket_keys(days, *, date_only=False):
+    """Every bucket key across the selected range, oldest first — including the
+    ones with no data behind them."""
+    interval = resolve_interval(days, date_only)
+    cursor = _bucket_floor(get_cutoff(days), interval)
+    last = _bucket_floor(timezone.now(), interval)
+    keys = []
+    while cursor <= last:
+        keys.append(_bucket_key(cursor, interval, date_only))
+        cursor = _next_bucket(cursor, interval)
+    return keys
+
+
+def fill_time_buckets(rows, days, *, defaults, date_only=False, key="day"):
+    """Expand an already-shaped time series to one row per bucket.
+
+    A GROUP BY only returns buckets that had rows, so a quiet day or hour
+    simply vanished from the series — and the chart then drew a straight line
+    between the two buckets either side of it at even spacing, hiding the gap
+    and flattening the slope. Every bucket in range is emitted now, carrying
+    `defaults` where there was no data (0 for counts; None for averages, which
+    have no meaningful zero and are better drawn as a break in the line).
+
+    Buckets found in `rows` but outside the generated range (a future-dated
+    publish, say) are kept rather than dropped.
+    """
+    by_key = {row[key]: row for row in rows}
+    ordered = sorted(set(time_bucket_keys(days, date_only=date_only)) | set(by_key))
+    return [
+        {key: bucket, **{name: by_key.get(bucket, defaults).get(name, fallback)
+                         for name, fallback in defaults.items()}}
+        for bucket in ordered
+    ]
 
 
 def _content_identity(user_id, visitor_id):
@@ -119,13 +209,13 @@ def build_content_rankings(days, kind):
 
     if is_story:
         for row in (
-            StoryView.objects.filter(story_id__in=title_ids, created_at__gte=cutoff)
+            audience_only(StoryView.objects.filter(story_id__in=title_ids, created_at__gte=cutoff))
             .values("story_id")
             .annotate(count=Count("id"))
         ):
             metrics[row["story_id"]]["views"] = row["count"]
 
-    events = AnalyticsEvent.objects.filter(created_at__gte=cutoff)
+    events = audience_only(AnalyticsEvent.objects.filter(created_at__gte=cutoff))
     events = events.filter(story_id__in=title_ids) if is_story else events.filter(blog_id__in=title_ids)
     id_field = "story_id" if is_story else "blog_id"
     event_interaction_types = {
@@ -162,12 +252,12 @@ def build_content_rankings(days, kind):
     reviews = {}
     if is_story:
         favorites = dict(
-            Favorite.objects.filter(story_id__in=title_ids, created_at__gte=cutoff)
+            audience_only(Favorite.objects.filter(story_id__in=title_ids, created_at__gte=cutoff))
             .values_list("story_id")
             .annotate(count=Count("id"))
         )
         reviews = dict(
-            Review.objects.filter(story_id__in=title_ids, created_at__gte=cutoff)
+            audience_only(Review.objects.filter(story_id__in=title_ids, created_at__gte=cutoff))
             .values_list("story_id")
             .annotate(count=Count("id"))
         )
@@ -259,14 +349,14 @@ def build_detail_time_series(days, *, story=None, blog=None):
         return points[index] if 0 <= index < bucket_count else None
 
     if story is not None:
-        for created_at in story.view_events.filter(
-            created_at__gte=cutoff, created_at__lte=now
+        for created_at in audience_only(
+            story.view_events.filter(created_at__gte=cutoff, created_at__lte=now)
         ).values_list("created_at", flat=True):
             bucket = bucket_for(created_at)
             if bucket:
                 bucket["views"] += 1
 
-    events = AnalyticsEvent.objects.filter(created_at__gte=cutoff, created_at__lte=now)
+    events = audience_only(AnalyticsEvent.objects.filter(created_at__gte=cutoff, created_at__lte=now))
     events = events.filter(story=story) if story is not None else events.filter(blog=blog)
     interaction_types = {
         AnalyticsEvent.EVENT_COMPLETION,
@@ -296,8 +386,8 @@ def build_detail_time_series(days, *, story=None, blog=None):
 
     if story is not None:
         for queryset in (
-            story.favorites.filter(created_at__gte=cutoff, created_at__lte=now),
-            story.reviews.filter(created_at__gte=cutoff, created_at__lte=now),
+            audience_only(story.favorites.filter(created_at__gte=cutoff, created_at__lte=now)),
+            audience_only(story.reviews.filter(created_at__gte=cutoff, created_at__lte=now)),
         ):
             for created_at in queryset.values_list("created_at", flat=True):
                 bucket = bucket_for(created_at)
@@ -323,7 +413,7 @@ def build_content_data(days):
     cutoff = get_cutoff(days)
 
     views_over_time = (
-        StoryView.objects.filter(created_at__gte=cutoff)
+        audience_only(StoryView.objects.filter(created_at__gte=cutoff))
         .annotate(day=time_trunc("created_at", days))
         .values("day")
         .annotate(count=Count("id"))
@@ -403,7 +493,11 @@ def build_content_data(days):
         "range_days": days,
         "time_interval": get_time_interval(days),
         "publishing_interval": "day" if days == 1 else get_time_interval(days),
-        "views_over_time": [{"day": row["day"], "count": row["count"]} for row in views_over_time],
+        "views_over_time": fill_time_buckets(
+            [{"day": row["day"], "count": row["count"]} for row in views_over_time],
+            days,
+            defaults={"count": 0},
+        ),
         "genre_performance": genre_performance,
         "story_type_breakdown": [
             {
@@ -423,12 +517,19 @@ def build_content_data(days):
             }
             for row in completion_split
         ],
-        "publishing_over_time": [
-            {"day": row["day"], "count": row["count"]} for row in publishing_over_time
-        ],
-        "blog_publishing_over_time": [
-            {"day": row["day"], "count": row["count"]} for row in blog_publishing_over_time
-        ],
+        # date_only mirrors the time_trunc() call that grouped these: the
+        # source is a DateField, so its buckets are dates at every interval.
+        "publishing_over_time": fill_time_buckets(
+            [{"day": row["day"], "count": row["count"]} for row in publishing_over_time],
+            days,
+            defaults={"count": 0},
+            date_only=True,
+        ),
+        "blog_publishing_over_time": fill_time_buckets(
+            [{"day": row["day"], "count": row["count"]} for row in blog_publishing_over_time],
+            days,
+            defaults={"count": 0},
+        ),
         "blog_posts_count": blog_posts_count,
         "stories_count": stories_count,
         "audiobooks_count": audiobooks_count,
@@ -443,7 +544,7 @@ def build_content_data(days):
 def build_engagement_data(days):
     cutoff = get_cutoff(days)
 
-    progress_qs = ReadingProgress.objects.filter(updated_at__gte=cutoff)
+    progress_qs = audience_only(ReadingProgress.objects.filter(updated_at__gte=cutoff))
     bucket_defs = [
         ("0-25%", 0.0, 0.25),
         ("25-50%", 0.25, 0.5),
@@ -456,22 +557,22 @@ def build_engagement_data(days):
     ]
 
     chapter_dropoff = (
-        ChapterReadingProgress.objects.filter(updated_at__gte=cutoff)
+        audience_only(ChapterReadingProgress.objects.filter(updated_at__gte=cutoff))
         .values("chapter__order")
         .annotate(avg_progress=Avg("progress"), readers=Count("user", distinct=True))
         .order_by("chapter__order")[:20]
     )
 
-    audio_listen_through = AudioReadingProgress.objects.filter(updated_at__gte=cutoff).aggregate(
+    audio_listen_through = audience_only(AudioReadingProgress.objects.filter(updated_at__gte=cutoff)).aggregate(
         avg_progress=Avg("progress"), listeners=Count("user", distinct=True)
     )
 
-    video_watch_through = VideoWatchProgress.objects.filter(updated_at__gte=cutoff).aggregate(
+    video_watch_through = audience_only(VideoWatchProgress.objects.filter(updated_at__gte=cutoff)).aggregate(
         avg_progress=Avg("progress"), watchers=Count("user", distinct=True)
     )
 
     favorites_over_time = (
-        Favorite.objects.filter(created_at__gte=cutoff)
+        audience_only(Favorite.objects.filter(created_at__gte=cutoff))
         .annotate(day=time_trunc("created_at", days))
         .values("day")
         .annotate(count=Count("id"))
@@ -479,20 +580,26 @@ def build_engagement_data(days):
     )
 
     rating_distribution = (
-        Review.objects.filter(created_at__gte=cutoff).values("rating").annotate(count=Count("id")).order_by("rating")
+        audience_only(Review.objects.filter(created_at__gte=cutoff))
+        .values("rating")
+        .annotate(count=Count("id"))
+        .order_by("rating")
     )
 
     rating_trend = (
-        Review.objects.filter(created_at__gte=cutoff)
+        audience_only(Review.objects.filter(created_at__gte=cutoff))
         .annotate(day=time_trunc("created_at", days))
         .values("day")
         .annotate(avg_rating=Avg("rating"), count=Count("id"))
         .order_by("day")
     )
 
-    views_count = StoryView.objects.filter(created_at__gte=cutoff).count()
+    views_count = audience_only(StoryView.objects.filter(created_at__gte=cutoff)).count()
     readers_count = (
-        ReadingProgress.objects.filter(updated_at__gte=cutoff).values("user_id", "story_id").distinct().count()
+        audience_only(ReadingProgress.objects.filter(updated_at__gte=cutoff))
+        .values("user_id", "story_id")
+        .distinct()
+        .count()
     )
 
     return {
@@ -515,12 +622,27 @@ def build_engagement_data(days):
             "avg_progress": round(video_watch_through["avg_progress"] or 0, 3),
             "watchers": video_watch_through["watchers"] or 0,
         },
-        "favorites_over_time": [{"day": row["day"], "count": row["count"]} for row in favorites_over_time],
+        "favorites_over_time": fill_time_buckets(
+            [{"day": row["day"], "count": row["count"]} for row in favorites_over_time],
+            days,
+            defaults={"count": 0},
+        ),
         "rating_distribution": list(rating_distribution),
-        "rating_trend": [
-            {"day": row["day"], "avg_rating": round(row["avg_rating"] or 0, 2), "count": row["count"]}
-            for row in rating_trend
-        ],
+        # avg_rating fills with None, not 0: a day with no reviews has no
+        # average, and a 0 would drag the line down to the floor as if every
+        # reviewer that day gave zero stars. None draws a break instead.
+        "rating_trend": fill_time_buckets(
+            [
+                {
+                    "day": row["day"],
+                    "avg_rating": round(row["avg_rating"] or 0, 2),
+                    "count": row["count"],
+                }
+                for row in rating_trend
+            ],
+            days,
+            defaults={"avg_rating": None, "count": 0},
+        ),
         "view_to_read_conversion": {
             "views": views_count,
             "readers": readers_count,
@@ -532,33 +654,43 @@ def build_engagement_data(days):
 def build_users_data(days):
     cutoff = get_cutoff(days)
 
+    # Operator accounts are excluded from every user metric here. record_login()
+    # fires on the admin login endpoint too, so without this an admin's own
+    # sessions inflate active_users and skew the login-frequency histogram —
+    # an admin logs in far more often than any reader.
+    audience_users = User.objects.filter(is_superuser=False, is_staff=False)
+
     signups_over_time = (
-        User.objects.filter(date_joined__gte=cutoff)
+        audience_users.filter(date_joined__gte=cutoff)
         .annotate(day=time_trunc("date_joined", days))
         .values("day")
         .annotate(count=Count("id"))
         .order_by("day")
     )
 
-    active_users = User.objects.filter(last_login__gte=cutoff).count()
+    active_users = audience_users.filter(last_login__gte=cutoff).count()
 
     login_bucket_defs = [("0", 0, 1), ("1-2", 1, 3), ("3-5", 3, 6), ("6-10", 6, 11), ("11+", 11, None)]
     login_frequency_buckets = []
     for label, lo, hi in login_bucket_defs:
-        bucket_qs = User.objects.filter(login_count__gte=lo)
+        bucket_qs = audience_users.filter(login_count__gte=lo)
         if hi is not None:
             bucket_qs = bucket_qs.filter(login_count__lt=hi)
         login_frequency_buckets.append({"bucket": label, "count": bucket_qs.count()})
 
-    joined_in_range = User.objects.filter(date_joined__gte=cutoff)
+    joined_in_range = audience_users.filter(date_joined__gte=cutoff)
     joined_count = joined_in_range.count()
     verified_count = joined_in_range.filter(otp_verified=True).count()
 
     return {
         "range_days": days,
         "time_interval": get_time_interval(days),
-        "signups_over_time": [{"day": row["day"], "count": row["count"]} for row in signups_over_time],
-        "total_users": User.objects.count(),
+        "signups_over_time": fill_time_buckets(
+            [{"day": row["day"], "count": row["count"]} for row in signups_over_time],
+            days,
+            defaults={"count": 0},
+        ),
+        "total_users": audience_users.count(),
         "active_users": active_users,
         "login_frequency_buckets": login_frequency_buckets,
         "otp_conversion": {
@@ -572,7 +704,7 @@ def build_users_data(days):
 def build_geography_data(days):
     cutoff = get_cutoff(days)
 
-    logins = UserLoginLocation.objects.filter(created_at__gte=cutoff)
+    logins = audience_only(UserLoginLocation.objects.filter(created_at__gte=cutoff))
     resolved = logins.exclude(country="")
 
     by_country = (
@@ -624,9 +756,14 @@ def build_geography_data(days):
             }
             for row in by_city
         ],
-        "logins_over_time": [
-            {"day": row["day"], "count": row["count"], "users": row["users"]} for row in logins_over_time
-        ],
+        "logins_over_time": fill_time_buckets(
+            [
+                {"day": row["day"], "count": row["count"], "users": row["users"]}
+                for row in logins_over_time
+            ],
+            days,
+            defaults={"count": 0, "users": 0},
+        ),
     }
 
 
@@ -641,6 +778,11 @@ def build_submissions_data(days):
         .annotate(count=Count("id"))
         .order_by("day")
     )
+
+    counts_by_day_status = {
+        (row["day"], row["status"]): row["count"] for row in submissions_over_time
+    }
+    submission_statuses = sorted({status for _, status in counts_by_day_status})
 
     funnel_rows = list(submissions_qs.values("status").annotate(count=Count("id")))
     total = sum(row["count"] for row in funnel_rows) or 0
@@ -674,9 +816,15 @@ def build_submissions_data(days):
     return {
         "range_days": days,
         "time_interval": get_time_interval(days),
+        # Two-dimensional (day x status), so it needs the cross-product rather
+        # than fill_time_buckets: the dashboard pivots these rows into one line
+        # per status, and a status missing from a day would break that line
+        # exactly like a missing day breaks a single-series chart. Statuses come
+        # from the rows in range, so a status nobody used adds no empty line.
         "submissions_over_time": [
-            {"day": row["day"], "status": row["status"], "count": row["count"]}
-            for row in submissions_over_time
+            {"day": day, "status": status, "count": counts_by_day_status.get((day, status), 0)}
+            for day in time_bucket_keys(days)
+            for status in submission_statuses
         ],
         "funnel": funnel,
         "avg_time_to_review_hours": avg_time_to_review_hours,
@@ -685,9 +833,23 @@ def build_submissions_data(days):
     }
 
 
+# The zero state of one daily_activity row. Doubles as the fill value for days
+# with no events at all, so an empty day and a day whose events were all of one
+# kind are shaped identically.
+EMPTY_DAILY_ACTIVITY = {
+    "ad_impressions": 0,
+    "downloads": 0,
+    "completions": 0,
+    "reading_minutes": 0,
+    "listening_minutes": 0,
+    "watching_minutes": 0,
+    "read_along_minutes": 0,
+}
+
+
 def build_audience_data(days):
     cutoff = get_cutoff(days)
-    events = AnalyticsEvent.objects.filter(created_at__gte=cutoff)
+    events = audience_only(AnalyticsEvent.objects.filter(created_at__gte=cutoff))
 
     daily_events = (
         events.annotate(day=time_trunc("created_at", days))
@@ -699,16 +861,7 @@ def build_audience_data(days):
     for row in daily_events:
         entry = daily.setdefault(
             row["day"],
-            {
-                "day": row["day"],
-                "ad_impressions": 0,
-                "downloads": 0,
-                "completions": 0,
-                "reading_minutes": 0,
-                "listening_minutes": 0,
-                "watching_minutes": 0,
-                "read_along_minutes": 0,
-            },
+            {"day": row["day"], **EMPTY_DAILY_ACTIVITY},
         )
         event_type = row["event_type"]
         if event_type == AnalyticsEvent.EVENT_AD_IMPRESSION:
@@ -738,20 +891,11 @@ def build_audience_data(days):
     ):
         entry = daily.setdefault(
             row["day"],
-            {
-                "day": row["day"],
-                "ad_impressions": 0,
-                "downloads": 0,
-                "completions": 0,
-                "reading_minutes": 0,
-                "listening_minutes": 0,
-                "watching_minutes": 0,
-                "read_along_minutes": 0,
-            },
+            {"day": row["day"], **EMPTY_DAILY_ACTIVITY},
         )
         entry["read_along_minutes"] = round((row["duration_seconds"] or 0) / 60, 1)
 
-    visit_events = AnalyticsEvent.objects.filter(event_type=AnalyticsEvent.EVENT_VISIT)
+    visit_events = audience_only(AnalyticsEvent.objects.filter(event_type=AnalyticsEvent.EVENT_VISIT))
     authenticated_first = {
         f"u:{row['user_id']}": row["first_seen"]
         for row in visit_events.filter(user_id__isnull=False)
@@ -1006,8 +1150,12 @@ def build_audience_data(days):
             "total_page_views": total_page_views,
             "median_browsing_session_minutes": median_browsing_session_minutes,
         },
-        "daily_activity": list(daily.values()),
-        "visitor_retention": new_returning,
+        "daily_activity": fill_time_buckets(
+            list(daily.values()), days, defaults=EMPTY_DAILY_ACTIVITY
+        ),
+        "visitor_retention": fill_time_buckets(
+            new_returning, days, defaults={"new_visitors": 0, "returning_visitors": 0}
+        ),
         "ad_placements": [
             {
                 "path": row["metadata__path"] or "unknown",
@@ -1389,19 +1537,19 @@ def build_story_detail_data(story, days):
     # that by (user, ip) catches the case of the same visitor crossing that
     # window more than once in the selected range.
     page_opens = (
-        story.view_events.filter(created_at__gte=cutoff)
+        audience_only(story.view_events.filter(created_at__gte=cutoff))
         .values("user_id", "ip_address")
         .distinct()
         .count()
     )
 
-    progress_qs = ReadingProgress.objects.filter(story=story, updated_at__gte=cutoff)
+    progress_qs = audience_only(ReadingProgress.objects.filter(story=story, updated_at__gte=cutoff))
     started_reading = progress_qs.filter(progress__gt=0).count()
     completed_reading = progress_qs.filter(progress__gte=0.99).count()
     avg_progress = progress_qs.aggregate(avg=Avg("progress"))["avg"] or 0
 
     chapter_breakdown = (
-        ChapterReadingProgress.objects.filter(story=story, updated_at__gte=cutoff)
+        audience_only(ChapterReadingProgress.objects.filter(story=story, updated_at__gte=cutoff))
         .values("chapter__order", "chapter__title", "chapter__slug")
         .annotate(
             readers=Count("user", distinct=True),
@@ -1411,7 +1559,7 @@ def build_story_detail_data(story, days):
         .order_by("chapter__order")
     )
 
-    events = AnalyticsEvent.objects.filter(story=story, created_at__gte=cutoff)
+    events = audience_only(AnalyticsEvent.objects.filter(story=story, created_at__gte=cutoff))
     reading_seconds = events.filter(event_type=AnalyticsEvent.EVENT_READING_SESSION).aggregate(
         total=Sum("duration_seconds")
     )["total"] or 0
@@ -1420,7 +1568,9 @@ def build_story_detail_data(story, days):
     has_audio = story.audios.exists()
     audio_data = None
     if has_audio:
-        audio_progress_qs = AudioReadingProgress.objects.filter(story=story, updated_at__gte=cutoff)
+        audio_progress_qs = audience_only(
+            AudioReadingProgress.objects.filter(story=story, updated_at__gte=cutoff)
+        )
         listening_events = events.filter(event_type=AnalyticsEvent.EVENT_LISTENING_SESSION)
         listening_seconds = listening_events.aggregate(total=Sum("duration_seconds"))["total"] or 0
         read_along_seconds = listening_events.filter(metadata__format="read_along").aggregate(
@@ -1436,7 +1586,9 @@ def build_story_detail_data(story, days):
     has_video = story.videos.exists()
     video_data = None
     if has_video:
-        video_progress_qs = VideoWatchProgress.objects.filter(story=story, updated_at__gte=cutoff)
+        video_progress_qs = audience_only(
+            VideoWatchProgress.objects.filter(story=story, updated_at__gte=cutoff)
+        )
         watching_seconds = events.filter(event_type=AnalyticsEvent.EVENT_WATCHING_SESSION).aggregate(
             total=Sum("duration_seconds")
         )["total"] or 0
@@ -1456,10 +1608,13 @@ def build_story_detail_data(story, days):
         "avg_progress": round(avg_progress, 3),
         "reading_minutes": round(reading_seconds / 60, 1),
         "completions_tracked": completions_tracked,
-        "favorites_count": story.favorites.filter(created_at__gte=cutoff).count(),
-        "reviews_count": story.reviews.filter(created_at__gte=cutoff).count(),
+        "favorites_count": audience_only(story.favorites.filter(created_at__gte=cutoff)).count(),
+        "reviews_count": audience_only(story.reviews.filter(created_at__gte=cutoff)).count(),
         "avg_rating_in_range": round(
-            story.reviews.filter(created_at__gte=cutoff).aggregate(avg=Avg("rating"))["avg"] or 0, 2
+            audience_only(story.reviews.filter(created_at__gte=cutoff))
+            .aggregate(avg=Avg("rating"))["avg"]
+            or 0,
+            2,
         ),
         "chapter_breakdown": [
             {
@@ -1482,18 +1637,25 @@ def build_story_detail_data(story, days):
 def build_blog_detail_data(blog, days):
     cutoff = get_cutoff(days)
 
-    visit_qs = AnalyticsEvent.objects.filter(
-        event_type=AnalyticsEvent.EVENT_VISIT,
-        metadata__path=f"/blog/{blog.slug}",
-        created_at__gte=cutoff,
+    # Visits now carry the blog FK directly; the metadata__path match is kept
+    # as an OR so rows written before DefaultLayout started sending blog_slug
+    # still count here.
+    visit_qs = audience_only(
+        AnalyticsEvent.objects.filter(
+            Q(blog=blog) | Q(metadata__path=f"/blog/{blog.slug}"),
+            event_type=AnalyticsEvent.EVENT_VISIT,
+            created_at__gte=cutoff,
+        )
     )
     page_open_identities = {
         f"u:{user_id}" if user_id else f"v:{visitor_id}"
         for user_id, visitor_id in visit_qs.values_list("user_id", "visitor_id")
     }
 
-    reading_sessions = AnalyticsEvent.objects.filter(
-        event_type=AnalyticsEvent.EVENT_READING_SESSION, blog=blog, created_at__gte=cutoff
+    reading_sessions = audience_only(
+        AnalyticsEvent.objects.filter(
+            event_type=AnalyticsEvent.EVENT_READING_SESSION, blog=blog, created_at__gte=cutoff
+        )
     )
     reader_identities = {
         f"u:{user_id}" if user_id else f"v:{visitor_id}"
@@ -1506,7 +1668,7 @@ def build_blog_detail_data(blog, days):
     # its docstring), so this is a subset of reader_identities above, not
     # the full picture. Surfaced separately and clearly labeled rather than
     # blended into "started reading", which stays anonymous-inclusive.
-    depth_qs = BlogReadingProgress.objects.filter(blog=blog, updated_at__gte=cutoff)
+    depth_qs = audience_only(BlogReadingProgress.objects.filter(blog=blog, updated_at__gte=cutoff))
     bucket_defs = [
         ("0-25%", 0.0, 0.25),
         ("25-50%", 0.25, 0.5),
