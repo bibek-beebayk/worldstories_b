@@ -22,7 +22,9 @@ import anthropic
 import openpyxl
 from pydantic import ValidationError as PydanticValidationError
 
+from apps.stats.models import StoryCompletion
 from apps.story.api import StoryMapAPIView, StoryViewSet, open_s3_audio_stream
+from apps.story.models import Mood, StoryMood
 from apps.story.ai_generation import GenerationError, _GenerationOutput, _to_plain_text, generate
 from apps.story.ai_generation_jobs import _concatenated_chapter_text, run_generate_blog_excerpt, run_generate_field
 from apps.story.book_fetch import (
@@ -5048,3 +5050,374 @@ class StoryCompletionScreenApiTests(APITestCase):
         for section in response.data["sections"]:
             slugs = [story["slug"] for story in section["stories"]]
             self.assertNotIn(already_read.slug, slugs, section["key"])
+
+
+class SurpriseMeApiTests(APITestCase):
+    """One story, at random from a shortlist the existing ranking produced —
+    a uniformly random story from the whole catalogue is not a surprise."""
+
+    def setUp(self):
+        cache.clear()
+        self.user = User.objects.create_user(
+            email="surprised@example.com", username="surprised", password="test-password"
+        )
+
+    def _story(self, slug, minutes=None, rating=0.0):
+        story = Story.objects.create(
+            title=slug, slug=slug, is_published=True, rating=rating
+        )
+        if minutes is not None:
+            Story.objects.filter(pk=story.pk).update(cached_chapter_reading_minutes=minutes)
+            story.refresh_from_db()
+        return story
+
+    def _surprise(self, **params):
+        query = "&".join(f"{key}={value}" for key, value in params.items())
+        return self.client.get(f"/api/stories/surprise/?{query}")
+
+    def test_it_returns_a_story_for_a_signed_out_reader(self):
+        self._story("something-good", rating=4.5)
+
+        response = self._surprise()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["story"]["slug"], "something-good")
+
+    def test_it_never_suggests_the_story_being_read(self):
+        current = self._story("the-one-im-reading")
+        self._story("a-different-one")
+
+        for _ in range(5):
+            response = self._surprise(exclude=current.slug)
+            self.assertEqual(response.data["story"]["slug"], "a-different-one")
+
+    def test_it_returns_nothing_rather_than_the_excluded_story(self):
+        current = self._story("the-only-story")
+
+        response = self._surprise(exclude=current.slug)
+
+        self.assertIsNone(response.data["story"])
+
+    def test_it_prefers_something_unread(self):
+        finished = self._story("already-finished", rating=5.0)
+        self._story("not-yet-read", rating=1.0)
+        StoryCompletion.objects.create(
+            user=self.user, story=finished, source=StoryCompletion.SOURCE_CHAPTERS
+        )
+        self.client.force_authenticate(self.user)
+
+        for _ in range(5):
+            self.assertEqual(self._surprise().data["story"]["slug"], "not-yet-read")
+
+    def test_it_falls_back_to_a_finished_story_rather_than_nothing(self):
+        """§8.1: exclude completed *where possible*. A reader who has finished
+        everything should still get a suggestion."""
+        finished = self._story("the-only-one")
+        StoryCompletion.objects.create(
+            user=self.user, story=finished, source=StoryCompletion.SOURCE_CHAPTERS
+        )
+        self.client.force_authenticate(self.user)
+
+        self.assertEqual(self._surprise().data["story"]["slug"], "the-only-one")
+
+    def test_the_time_filter_keeps_its_promise(self):
+        self._story("a-quick-one", minutes=4)
+        self._story("a-long-one", minutes=90)
+
+        for _ in range(5):
+            response = self._surprise(max_minutes=5)
+            self.assertEqual(response.data["story"]["slug"], "a-quick-one")
+
+    def test_it_says_nothing_rather_than_break_the_time_promise(self):
+        """"Surprise me, in under five minutes" with nothing that short is
+        honestly answered with nothing, not with something twice as long."""
+        self._story("a-long-one", minutes=90)
+
+        self.assertIsNone(self._surprise(max_minutes=5).data["story"])
+
+    def test_a_story_of_unknown_length_is_never_offered_under_a_time_promise(self):
+        self._story("length-unknown")
+
+        self.assertIsNone(self._surprise(max_minutes=10).data["story"])
+
+    def test_an_unparseable_time_filter_is_ignored_rather_than_fatal(self):
+        self._story("anything")
+
+        self.assertIsNotNone(self._surprise(max_minutes="soon").data["story"])
+
+    def test_it_varies_between_calls(self):
+        for index in range(12):
+            self._story(f"option-{index}", rating=4.0)
+
+        seen = {self._surprise().data["story"]["slug"] for _ in range(15)}
+
+        self.assertGreater(len(seen), 1)
+
+
+class MoodApiTests(APITestCase):
+    """The mood layer, and the review rule that keeps unreviewed machine
+    guesses out of what readers see (§8.5)."""
+
+    def setUp(self):
+        cache.clear()
+        self.funny = Mood.objects.get(slug="funny")
+        self.scary = Mood.objects.get(slug="scary")
+
+    def _story(self, slug):
+        return Story.objects.create(title=slug, slug=slug, is_published=True)
+
+    def test_the_vocabulary_is_seeded_by_migration(self):
+        slugs = set(Mood.objects.filter(active=True).values_list("slug", flat=True))
+
+        self.assertEqual(len(slugs), 10)
+        self.assertIn("thought-provoking", slugs)
+
+    def test_moods_do_not_replace_genres_or_categories(self):
+        """§8.3 — the existing taxonomies are untouched by this layer."""
+        story = self._story("still-has-genres")
+        genre = Genre.objects.create(name="Folklore", slug="folklore-mood-test")
+        story.genres.add(genre)
+        StoryMood.objects.create(story=story, mood=self.funny)
+
+        story.refresh_from_db()
+        self.assertEqual(list(story.genres.values_list("slug", flat=True)), ["folklore-mood-test"])
+        self.assertEqual(list(story.moods.values_list("slug", flat=True)), ["funny"])
+
+    def test_an_administrator_assignment_is_visible_immediately(self):
+        story = self._story("set-by-hand")
+        StoryMood.objects.create(story=story, mood=self.funny, source=StoryMood.SOURCE_ADMIN)
+
+        response = self.client.get("/api/stories/?moods=funny")
+
+        self.assertEqual(
+            [row["slug"] for row in response.data["results"]], ["set-by-hand"]
+        )
+
+    def test_an_unreviewed_ai_suggestion_is_stored_but_never_shown(self):
+        """The point of §8.5: a bulk classification run must not leak into
+        readers' browsing before anyone has looked at it."""
+        story = self._story("machine-guessed")
+        assignment = StoryMood.objects.create(
+            story=story, mood=self.funny, source=StoryMood.SOURCE_AI, reviewed=False
+        )
+
+        response = self.client.get("/api/stories/?moods=funny")
+
+        self.assertEqual(response.data["results"], [])
+        self.assertTrue(StoryMood.objects.filter(pk=assignment.pk).exists())
+        self.assertFalse(assignment.is_public)
+
+    def test_a_reviewed_ai_suggestion_becomes_visible(self):
+        story = self._story("machine-then-confirmed")
+        StoryMood.objects.create(
+            story=story, mood=self.funny, source=StoryMood.SOURCE_AI, reviewed=True
+        )
+
+        response = self.client.get("/api/stories/?moods=funny")
+
+        self.assertEqual(
+            [row["slug"] for row in response.data["results"]], ["machine-then-confirmed"]
+        )
+
+    def test_the_mood_list_counts_only_what_readers_can_see(self):
+        shown = self._story("counted")
+        hidden = self._story("not-counted")
+        StoryMood.objects.create(story=shown, mood=self.funny, source=StoryMood.SOURCE_ADMIN)
+        StoryMood.objects.create(
+            story=hidden, mood=self.funny, source=StoryMood.SOURCE_AI, reviewed=False
+        )
+
+        response = self.client.get(reverse("mood-list"))
+
+        counts = {row["slug"]: row["stories_count"] for row in response.data["moods"]}
+        # An inflated count would lead a reader to a mood whose stories then
+        # do not appear.
+        self.assertEqual(counts["funny"], 1)
+        self.assertEqual(counts["scary"], 0)
+
+    def test_an_unpublished_story_is_not_counted(self):
+        story = Story.objects.create(title="Draft", slug="draft-mood", is_published=False)
+        StoryMood.objects.create(story=story, mood=self.scary, source=StoryMood.SOURCE_ADMIN)
+
+        response = self.client.get(reverse("mood-list"))
+
+        counts = {row["slug"]: row["stories_count"] for row in response.data["moods"]}
+        self.assertEqual(counts["scary"], 0)
+
+    def test_a_story_can_carry_several_moods(self):
+        story = self._story("both")
+        StoryMood.objects.create(story=story, mood=self.funny)
+        StoryMood.objects.create(story=story, mood=self.scary)
+
+        for slug in ("funny", "scary"):
+            response = self.client.get(f"/api/stories/?moods={slug}")
+            self.assertEqual([row["slug"] for row in response.data["results"]], ["both"])
+
+    def test_filtering_by_several_moods_returns_each_story_once(self):
+        story = self._story("tagged-twice")
+        StoryMood.objects.create(story=story, mood=self.funny)
+        StoryMood.objects.create(story=story, mood=self.scary)
+
+        response = self.client.get("/api/stories/?moods=funny,scary")
+
+        self.assertEqual([row["slug"] for row in response.data["results"]], ["tagged-twice"])
+
+    def test_an_unknown_mood_matches_nothing_rather_than_everything(self):
+        self._story("some-story")
+
+        response = self.client.get("/api/stories/?moods=nonsense")
+
+        self.assertEqual(response.data["results"], [])
+
+    def test_an_empty_mood_filter_is_ignored(self):
+        self._story("some-story")
+
+        response = self.client.get("/api/stories/?moods=")
+
+        self.assertEqual(len(response.data["results"]), 1)
+
+
+class MoodAdminApiTests(APITestCase):
+    """The admin surface for §8.5 — without somewhere to review suggestions,
+    "allow admin review" is a database column rather than a workflow."""
+
+    def setUp(self):
+        cache.clear()
+        self.admin = User.objects.create_user(
+            email="moodadmin@example.com", username="moodadmin", password="test-password",
+            is_superuser=True, is_staff=True, is_active=True,
+        )
+        self.reader = User.objects.create_user(
+            email="moodreader@example.com", username="moodreader", password="test-password"
+        )
+        self.client.force_authenticate(self.admin)
+        self.funny = Mood.objects.get(slug="funny")
+        self.scary = Mood.objects.get(slug="scary")
+        self.story = Story.objects.create(title="A Story", slug="a-mood-story", is_published=True)
+
+    def test_it_lists_the_vocabulary_with_both_counts(self):
+        StoryMood.objects.create(story=self.story, mood=self.funny, source=StoryMood.SOURCE_ADMIN)
+        other = Story.objects.create(title="Other", slug="other-mood", is_published=True)
+        StoryMood.objects.create(
+            story=other, mood=self.funny, source=StoryMood.SOURCE_AI, reviewed=False
+        )
+
+        response = self.client.get(reverse("admin-mood-list"))
+
+        rows = {row["slug"]: row for row in response.data}
+        # The visible count matches what readers see; pending is the other half
+        # of the picture.
+        self.assertEqual(rows["funny"]["stories_count"], 1)
+        self.assertEqual(rows["funny"]["pending_review_count"], 1)
+
+    def test_an_admin_can_create_a_mood_and_gets_a_slug(self):
+        response = self.client.post(
+            reverse("admin-mood-list"), {"name": "Bittersweet", "icon": "🍂"}, format="json"
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["slug"], "bittersweet")
+
+    def test_creating_two_moods_with_the_same_name_does_not_collide(self):
+        self.client.post(reverse("admin-mood-list"), {"name": "Bittersweet"}, format="json")
+        second = self.client.post(reverse("admin-mood-list"), {"name": "Bittersweet"}, format="json")
+
+        self.assertEqual(second.status_code, 201)
+        self.assertEqual(second.data["slug"], "bittersweet-2")
+
+    def test_assigning_moods_to_a_story_replaces_the_whole_set(self):
+        url = reverse("admin-mood-assignments", kwargs={"story_id": self.story.id})
+        self.client.post(url, {"moods": [self.funny.id, self.scary.id]}, format="json")
+
+        response = self.client.post(url, {"moods": [self.scary.id]}, format="json")
+
+        self.assertEqual([row["mood_slug"] for row in response.data], ["scary"])
+
+    def test_an_admin_assignment_is_public_immediately(self):
+        url = reverse("admin-mood-assignments", kwargs={"story_id": self.story.id})
+
+        response = self.client.post(url, {"moods": [self.funny.id]}, format="json")
+
+        self.assertEqual(response.data[0]["source"], StoryMood.SOURCE_ADMIN)
+        self.assertTrue(response.data[0]["is_public"])
+
+    def test_re_saving_a_story_does_not_relabel_a_reviewed_suggestion(self):
+        """Otherwise the review record erases itself the first time anyone
+        touches the story."""
+        StoryMood.objects.create(
+            story=self.story, mood=self.funny, source=StoryMood.SOURCE_AI, reviewed=True,
+            note="checked by an editor",
+        )
+        url = reverse("admin-mood-assignments", kwargs={"story_id": self.story.id})
+
+        response = self.client.post(url, {"moods": [self.funny.id]}, format="json")
+
+        self.assertEqual(response.data[0]["source"], StoryMood.SOURCE_AI)
+        self.assertTrue(response.data[0]["reviewed"])
+        self.assertEqual(response.data[0]["note"], "checked by an editor")
+
+    def test_an_unknown_mood_id_is_ignored_rather_than_fatal(self):
+        url = reverse("admin-mood-assignments", kwargs={"story_id": self.story.id})
+
+        response = self.client.post(url, {"moods": [self.funny.id, 99999]}, format="json")
+
+        self.assertEqual([row["mood_slug"] for row in response.data], ["funny"])
+
+    def test_assignments_rejects_a_non_list_payload(self):
+        url = reverse("admin-mood-assignments", kwargs={"story_id": self.story.id})
+
+        response = self.client.post(url, {"moods": "funny"}, format="json")
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_the_review_queue_shows_only_unreviewed_suggestions(self):
+        pending = StoryMood.objects.create(
+            story=self.story, mood=self.funny, source=StoryMood.SOURCE_AI, reviewed=False
+        )
+        StoryMood.objects.create(
+            story=self.story, mood=self.scary, source=StoryMood.SOURCE_AI, reviewed=True
+        )
+
+        response = self.client.get(reverse("admin-mood-pending-review"))
+
+        self.assertEqual([row["id"] for row in response.data], [pending.id])
+        self.assertEqual(response.data[0]["story_title"], "A Story")
+
+    def test_approving_a_suggestion_makes_it_visible_to_readers(self):
+        pending = StoryMood.objects.create(
+            story=self.story, mood=self.funny, source=StoryMood.SOURCE_AI, reviewed=False
+        )
+
+        response = self.client.post(
+            reverse("admin-mood-review-assignment", kwargs={"assignment_id": pending.id}),
+            {"approved": True},
+            format="json",
+        )
+
+        self.assertTrue(response.data["reviewed"])
+        self.assertTrue(response.data["is_public"])
+        public = self.client.get("/api/stories/?moods=funny")
+        self.assertEqual([row["slug"] for row in public.data["results"]], ["a-mood-story"])
+
+    def test_rejecting_a_suggestion_removes_it(self):
+        pending = StoryMood.objects.create(
+            story=self.story, mood=self.funny, source=StoryMood.SOURCE_AI, reviewed=False
+        )
+
+        response = self.client.post(
+            reverse("admin-mood-review-assignment", kwargs={"assignment_id": pending.id}),
+            {"approved": False},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(StoryMood.objects.filter(pk=pending.id).exists())
+
+    def test_the_whole_mood_admin_is_superuser_only(self):
+        self.client.force_authenticate(self.reader)
+
+        for url in (
+            reverse("admin-mood-list"),
+            reverse("admin-mood-pending-review"),
+        ):
+            self.assertEqual(self.client.get(url, format="json").status_code, 403, url)

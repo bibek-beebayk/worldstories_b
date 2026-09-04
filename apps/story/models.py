@@ -264,6 +264,83 @@ class Theme(models.Model):
         return self.name
 
 
+class Mood(models.Model):
+    """How a story *feels to read* — funny, scary, comforting.
+
+    A fourth taxonomy alongside Genre, Category, Tag and Theme, added
+    deliberately rather than casually. Theme is the closest neighbour and is
+    documented as "emotional register / real-world subject matter" (grief,
+    coming of age); Mood is the reading experience, and the two genuinely
+    diverge — a story *about* grief can be comforting to read. The source
+    document (§8.3) is explicit that mood must not replace genres or
+    categories, and this does not.
+
+    Unlike Tag, the vocabulary is small and closed: it is seeded by migration
+    and answers one question, "what are you in the mood for?", which stops
+    working the moment the list is long enough to need scrolling.
+    """
+
+    name = models.CharField(max_length=50)
+    slug = models.SlugField(max_length=60, unique=True)
+    description = models.CharField(max_length=200, blank=True)
+    icon = models.CharField(max_length=8, blank=True)
+    active = models.BooleanField(default=True, db_index=True)
+    order = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        ordering = ["order", "name"]
+
+    def __str__(self):
+        return self.name
+
+
+class StoryMood(models.Model):
+    """One mood assigned to one story, and where that assignment came from.
+
+    A through model rather than a plain M2M because §8.5 requires provenance:
+    an AI classification must be distinguishable from a human decision and must
+    be reviewable. `is_public` is the rule that gives that requirement teeth —
+    an unreviewed machine guess is stored but never shown, so a bulk
+    classification run cannot leak into readers' browsing before anyone has
+    looked at it.
+    """
+
+    SOURCE_ADMIN = "admin"
+    SOURCE_AI = "ai"
+    SOURCE_CHOICES = [
+        (SOURCE_ADMIN, "Set by an administrator"),
+        (SOURCE_AI, "Suggested by AI, pending review"),
+    ]
+
+    # String references: Story is declared further down this module.
+    story = models.ForeignKey("Story", on_delete=models.CASCADE, related_name="story_moods")
+    mood = models.ForeignKey("Mood", on_delete=models.CASCADE, related_name="story_moods")
+    source = models.CharField(max_length=10, choices=SOURCE_CHOICES, default=SOURCE_ADMIN)
+    # Only meaningful for AI suggestions; an administrator setting a mood has
+    # reviewed it by definition.
+    reviewed = models.BooleanField(default=False)
+    note = models.CharField(max_length=200, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ("story", "mood")
+        indexes = [
+            models.Index(fields=["mood", "story"], name="story_moodassign_idx"),
+        ]
+
+    @property
+    def is_public(self) -> bool:
+        """Whether readers may see this assignment.
+
+        An administrator's choice is public immediately. A machine's is not
+        until someone has confirmed it.
+        """
+        return self.source == self.SOURCE_ADMIN or self.reviewed
+
+    def __str__(self):
+        return f"{self.story} — {self.mood} ({self.source})"
+
+
 class Author(models.Model):
     name = models.CharField(max_length=100)
     bio = models.TextField(blank=True, null=True)
@@ -392,6 +469,9 @@ class Story(models.Model):
     # read". Kept fresh by the Chapter signals in signals.py and backfilled by
     # the backfill_chapter_reading_times command.
     cached_chapter_reading_minutes = models.PositiveIntegerField(blank=True, null=True)
+    # Declared with an explicit through model so every assignment carries its
+    # provenance — see StoryMood.
+    moods = models.ManyToManyField("Mood", through="StoryMood", related_name="stories", blank=True)
     is_completed = models.BooleanField(default=False)
     is_original = models.BooleanField(default=False, db_index=True)
     # Manual homepage-hero position (1-5, superuser-set). Null = not manually

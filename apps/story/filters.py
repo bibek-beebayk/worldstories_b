@@ -1,6 +1,13 @@
 from django_filters import rest_framework as filters
 from django.db.models import Q
-from .models import Story
+from .models import Story, StoryMood
+
+def public_story_mood_q():
+    """Mood assignments a reader may see: an administrator's choice, or a
+    machine suggestion someone has since confirmed. See StoryMood.is_public,
+    which this mirrors at query level."""
+    return Q(story_moods__source=StoryMood.SOURCE_ADMIN) | Q(story_moods__reviewed=True)
+
 
 class StoryFilter(filters.FilterSet):
     status = filters.CharFilter(method="filter_status", label="Status")
@@ -13,6 +20,7 @@ class StoryFilter(filters.FilterSet):
     has_video = filters.CharFilter(method="filter_has_video", label="Has video")
     has_summary = filters.CharFilter(method="filter_has_summary", label="Has summary")
     is_original = filters.CharFilter(method="filter_is_original", label="WorldStories Original")
+    moods = filters.CharFilter(method="filter_moods", label="Moods")
     sort = filters.CharFilter(method="filter_sort", label="Sort")
     q = filters.CharFilter(method="filter_q", label="Query")
 
@@ -30,6 +38,21 @@ class StoryFilter(filters.FilterSet):
     def filter_categories(self, queryset, name, value):
         category_ids = [category.strip() for category in value.split(",")]
         return queryset.filter(categories__id__in=category_ids).distinct()
+
+    def filter_moods(self, queryset, name, value):
+        """Filter by mood slug, ignoring assignments nobody has reviewed.
+
+        An AI suggestion is stored but is not a fact about the story until an
+        administrator has confirmed it (§8.5) — so it must not steer what a
+        reader is shown. `public_story_mood_q()` is the single definition of
+        that rule; do not re-express it inline anywhere.
+        """
+        slugs = [slug.strip() for slug in value.split(",") if slug.strip()]
+        if not slugs:
+            return queryset
+        return queryset.filter(
+            public_story_mood_q(), story_moods__mood__slug__in=slugs
+        ).distinct()
 
     def filter_language(self, queryset, name, value):
         if not value or value.lower() == "all":

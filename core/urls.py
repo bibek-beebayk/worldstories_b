@@ -37,6 +37,7 @@ router.register("admin/categories", story_api.CategoryAdminViewSet, basename="ad
 router.register("admin/genres", story_api.GenreAdminViewSet, basename="admin-genre")
 router.register("admin/tags", story_api.TagAdminViewSet, basename="admin-tag")
 router.register("admin/themes", story_api.ThemeAdminViewSet, basename="admin-theme")
+router.register("admin/moods", story_api.MoodAdminViewSet, basename="admin-mood")
 router.register("admin/story-types", story_api.StoryTypeAdminViewSet, basename="admin-story-type")
 router.register("admin/users", users_api.UserAdminViewSet, basename="admin-user")
 router.register("admin/blog", story_api.BlogAdminViewSet, basename="admin-blog")
@@ -196,6 +197,7 @@ urlpatterns = [
     path("api/trending/", story_api.TrendingDataAPIView.as_view(), name="trending-data"),
     path("api/discover/", story_api.DiscoverDataAPIView.as_view(), name="discover-data"),
     path("api/story-map/", story_api.StoryMapAPIView.as_view(), name="story-map-data"),
+    path("api/moods/", story_api.MoodListAPIView.as_view(), name="mood-list"),
     path(
         "api/analytics/events/",
         stats_views.AnalyticsEventCreateAPIView.as_view(),

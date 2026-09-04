@@ -1,5 +1,6 @@
 import mimetypes
 import os
+import random
 import re
 import uuid
 
@@ -11,6 +12,7 @@ from django.db.models import Q
 from django.db.models.functions import Coalesce
 from django.http import FileResponse, HttpResponse, StreamingHttpResponse
 from django.db import transaction
+from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.utils.text import slugify
 from django.utils.decorators import method_decorator
@@ -23,9 +25,18 @@ from rest_framework.permissions import BasePermission
 from rest_framework.filters import SearchFilter
 
 from apps.story.filters import StoryFilter
-from apps.stats.models import ReadingProgress, AudioReadingProgress, VideoWatchProgress
+from apps.stats.models import (
+    AudioReadingProgress,
+    ReadingProgress,
+    StoryCompletion,
+    VideoWatchProgress,
+)
 from apps.users.models import User
-from apps.users.recommendations import completion_recommendations, recommend_because_finished
+from apps.users.recommendations import (
+    completion_recommendations,
+    recommend_because_finished,
+    recommend_stories_for,
+)
 from .models import (
     default_story_type_id,
     Genre,
@@ -53,6 +64,8 @@ from .models import (
     published_story_q,
     LANGUAGE_CHOICES,
     COUNTRY_CHOICES,
+    Mood,
+    StoryMood,
 )
 from .epub_import_jobs import executor as epub_import_executor, run_epub_import
 from .rich_text import rich_text_has_content
@@ -82,6 +95,8 @@ from .serializers import (
     AdminTagSerializer,
     ThemeSerializer,
     ThemeDetailSerializer,
+    AdminMoodSerializer,
+    AdminStoryMoodSerializer,
     AdminThemeSerializer,
     StoryTypeSerializer,
     AdminStoryTypeSerializer,
@@ -128,6 +143,11 @@ from core.libs.pagination import PageNumberPagination
 
 
 VIEW_DEDUPE_WINDOW = timedelta(hours=24)
+
+# How many ranked stories "Surprise Me" picks from. Wide enough that pressing
+# it twice rarely repeats, narrow enough that every result is one the ranking
+# would have been happy to recommend anyway.
+SURPRISE_SHORTLIST = 40
 
 # Named crawlers/link-preview scrapers, plus the generic markers that catch the
 # long tail nobody maintains a list for (unknown search bots, scrapers, HTTP
@@ -582,6 +602,69 @@ class StoryViewSet(ReadOnlyModelViewSet):
 
     # No retrieve() override: it existed only to call _register_view, which
     # the browser-fired beacon below now owns.
+    @action(detail=False, methods=["get"], url_path="surprise")
+    def surprise(self, request):
+        """One story, picked for this reader, at random from a good shortlist.
+
+        "Random" only within a shortlist the existing recommendation path has
+        already ranked (§8.1 asks to reuse it): a uniformly random story from
+        the whole catalogue is not a surprise, it is a shrug. Signed-out readers
+        get the popular-and-well-rated shortlist instead, which is the best
+        available ranking with no taste signal to work from.
+
+        `exclude` keeps the story the reader is looking at out of its own
+        suggestion. `max_minutes` is §8.2's time filter, applied to the
+        denormalized reading-time columns — the live estimate word-counts every
+        chapter and cannot be filtered on.
+        """
+        exclude_slug = request.query_params.get("exclude") or ""
+        try:
+            max_minutes = int(request.query_params.get("max_minutes", ""))
+        except (TypeError, ValueError):
+            max_minutes = None
+
+        candidates = None
+        if request.user and request.user.is_authenticated:
+            # Already excludes everything this reader has engaged with.
+            ranked = list(recommend_stories_for(request.user, limit=SURPRISE_SHORTLIST))
+            candidates = [story for story in ranked if story.slug != exclude_slug]
+
+        if not candidates:
+            queryset = Story.objects.published().for_card_list()
+            if exclude_slug:
+                queryset = queryset.exclude(slug=exclude_slug)
+            if request.user and request.user.is_authenticated:
+                # Nothing left after the personalized pass — fall back to the
+                # whole catalogue rather than returning nothing, but still keep
+                # finished stories out where any alternative exists (§8.1).
+                completed_ids = StoryCompletion.objects.filter(
+                    user=request.user
+                ).values_list("story_id", flat=True)
+                unread = queryset.exclude(id__in=completed_ids)
+                queryset = unread if unread.exists() else queryset
+            candidates = list(queryset.order_by("-rating", "-views", "-id")[:SURPRISE_SHORTLIST])
+
+        if max_minutes:
+            within_budget = [
+                story
+                for story in candidates
+                if (story.cached_chapter_reading_minutes or story.cached_file_reading_minutes or 0)
+                and (story.cached_chapter_reading_minutes or story.cached_file_reading_minutes)
+                <= max_minutes
+            ]
+            # An empty result is the honest answer to "surprise me, in under
+            # five minutes" when nothing that short exists — better than
+            # quietly handing back something twice that long.
+            candidates = within_budget
+
+        if not candidates:
+            return Response({"story": None})
+
+        story = random.choice(candidates)
+        return Response(
+            {"story": StoryListSerializer(story, context={"request": request}).data}
+        )
+
     @action(detail=True, methods=["post"], url_path="view")
     def register_view(self, request, slug=None):
         """Browser-fired view beacon. Counting here rather than in ``retrieve``
@@ -1987,6 +2070,108 @@ def _unique_theme_slug(name: str) -> str:
     return slug
 
 
+def _unique_mood_slug(name: str) -> str:
+    base_slug = slugify(name) or "mood"
+    slug = base_slug
+    index = 2
+    while Mood.objects.filter(slug=slug).exists():
+        slug = f"{base_slug}-{index}"
+        index += 1
+    return slug
+
+
+class MoodAdminViewSet(ModelViewSet):
+    """Management CRUD for the admin panel's Moods page.
+
+    Mirrors TagAdminViewSet/ThemeAdminViewSet, with one addition the other
+    taxonomies do not need: the assignment actions below, which exist because
+    a mood assignment carries provenance (§8.5) and an AI suggestion has to be
+    reviewable rather than merely present.
+    """
+
+    queryset = Mood.objects.all().order_by("order", "name")
+    serializer_class = AdminMoodSerializer
+    permission_classes = [IsSuperUser]
+    pagination_class = None
+    filter_backends = [SearchFilter]
+    search_fields = ["name"]
+
+    def perform_create(self, serializer):
+        serializer.save(slug=_unique_mood_slug(serializer.validated_data["name"]))
+
+    @action(detail=False, methods=["get"], url_path="pending-review")
+    def pending_review(self, request):
+        """Machine suggestions nobody has looked at yet.
+
+        This queue is the whole point of storing `source`: without somewhere to
+        see unreviewed suggestions, "allow admin review" is a database column
+        rather than a workflow.
+        """
+        pending = (
+            StoryMood.objects.filter(source=StoryMood.SOURCE_AI, reviewed=False)
+            .select_related("story", "mood")
+            .order_by("-created_at")
+        )
+        return Response(AdminStoryMoodSerializer(pending, many=True).data)
+
+    @action(detail=False, methods=["get", "post"], url_path=r"assignments/(?P<story_id>\d+)")
+    def assignments(self, request, story_id=None):
+        """Read or replace one story's moods.
+
+        POST replaces the whole set rather than adding to it, so the admin form
+        can send what the editor sees. Assignments already present keep their
+        provenance — re-saving a form must not silently relabel a reviewed AI
+        suggestion as an administrator's own choice, or the review record would
+        erase itself the first time anyone touched the story.
+        """
+        story = get_object_or_404(Story, pk=story_id)
+
+        if request.method == "GET":
+            existing = story.story_moods.select_related("mood").order_by("mood__order")
+            return Response(AdminStoryMoodSerializer(existing, many=True).data)
+
+        mood_ids = request.data.get("moods", [])
+        if not isinstance(mood_ids, list):
+            return Response(
+                {"detail": "moods must be a list of mood ids."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        valid_ids = set(Mood.objects.filter(id__in=mood_ids).values_list("id", flat=True))
+
+        with transaction.atomic():
+            story.story_moods.exclude(mood_id__in=valid_ids).delete()
+            existing_ids = set(story.story_moods.values_list("mood_id", flat=True))
+            StoryMood.objects.bulk_create(
+                [
+                    StoryMood(story=story, mood_id=mood_id, source=StoryMood.SOURCE_ADMIN)
+                    for mood_id in valid_ids - existing_ids
+                ]
+            )
+
+        refreshed = story.story_moods.select_related("mood").order_by("mood__order")
+        return Response(AdminStoryMoodSerializer(refreshed, many=True).data)
+
+    @action(detail=False, methods=["post"], url_path=r"assignments/(?P<assignment_id>\d+)/review")
+    def review_assignment(self, request, assignment_id=None):
+        """Approve or reject one machine suggestion.
+
+        Approving marks it reviewed, which is what makes it visible to readers;
+        rejecting deletes it. Both are explicit decisions by a person, which is
+        the whole of §8.5.
+        """
+        assignment = get_object_or_404(StoryMood, pk=assignment_id)
+        approved = bool(request.data.get("approved"))
+
+        if not approved:
+            assignment.delete()
+            return Response(status=status.HTTP_204_NO_CONTENT)
+
+        assignment.reviewed = True
+        assignment.note = request.data.get("note", assignment.note)
+        assignment.save(update_fields=["reviewed", "note"])
+        return Response(AdminStoryMoodSerializer(assignment).data)
+
+
 class ThemeAdminViewSet(ModelViewSet):
     """Full management CRUD for the admin panel's Themes page — same
     relationship to AdminThemeListCreateAPIView as TagAdminViewSet has to
@@ -2264,6 +2449,49 @@ class DiscoverDataAPIView(APIView):
                     many=True,
                     context={"request": request},
                 ).data,
+            }
+        )
+
+
+class MoodListAPIView(APIView):
+    """The mood vocabulary, with how many published stories each one has.
+
+    Counts only assignments readers may see (see `public_story_mood_q`), so an
+    unreviewed AI classification cannot inflate a count and lead someone to a
+    mood whose stories then do not appear.
+    """
+
+    def get(self, request):
+        moods = (
+            Mood.objects.filter(active=True)
+            .annotate(
+                stories_count=Count(
+                    "story_moods",
+                    filter=Q(
+                        story_moods__story__in=Story.objects.published(),
+                    )
+                    & (
+                        Q(story_moods__source=StoryMood.SOURCE_ADMIN)
+                        | Q(story_moods__reviewed=True)
+                    ),
+                    distinct=True,
+                )
+            )
+            .order_by("order", "name")
+        )
+        return Response(
+            {
+                "moods": [
+                    {
+                        "id": mood.id,
+                        "slug": mood.slug,
+                        "name": mood.name,
+                        "icon": mood.icon,
+                        "description": mood.description,
+                        "stories_count": mood.stories_count,
+                    }
+                    for mood in moods
+                ]
             }
         )
 

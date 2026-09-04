@@ -16,6 +16,8 @@ from .models import (
     Genre,
     Category,
     Chapter,
+    Mood,
+    StoryMood,
     Tag,
     Theme,
     Author,
@@ -234,6 +236,72 @@ class AdminThemeSerializer(serializers.ModelSerializer):
         model = Theme
         fields = ["id", "name", "slug", "stories_count"]
         read_only_fields = ["slug"]
+
+
+class AdminMoodSerializer(serializers.ModelSerializer):
+    """The mood vocabulary as the admin panel edits it.
+
+    `stories_count` counts only assignments readers can actually see, matching
+    the public mood list — an admin comparing the two should not find them
+    disagreeing. `pending_review_count` is the other half of that picture: how
+    many machine suggestions are waiting on someone.
+    """
+
+    stories_count = serializers.SerializerMethodField(read_only=True)
+    pending_review_count = serializers.SerializerMethodField(read_only=True)
+
+    def get_stories_count(self, obj):
+        return obj.story_moods.filter(
+            Q(source=StoryMood.SOURCE_ADMIN) | Q(reviewed=True)
+        ).count()
+
+    def get_pending_review_count(self, obj):
+        return obj.story_moods.filter(source=StoryMood.SOURCE_AI, reviewed=False).count()
+
+    class Meta:
+        model = Mood
+        fields = [
+            "id",
+            "name",
+            "slug",
+            "description",
+            "icon",
+            "active",
+            "order",
+            "stories_count",
+            "pending_review_count",
+        ]
+        read_only_fields = ["slug"]
+
+
+class AdminStoryMoodSerializer(serializers.ModelSerializer):
+    """One mood assignment, with the provenance §8.5 requires kept visible."""
+
+    mood_name = serializers.CharField(source="mood.name", read_only=True)
+    mood_slug = serializers.CharField(source="mood.slug", read_only=True)
+    mood_icon = serializers.CharField(source="mood.icon", read_only=True)
+    story_title = serializers.CharField(source="story.title", read_only=True)
+    story_slug = serializers.CharField(source="story.slug", read_only=True)
+    is_public = serializers.BooleanField(read_only=True)
+
+    class Meta:
+        model = StoryMood
+        fields = [
+            "id",
+            "story",
+            "story_title",
+            "story_slug",
+            "mood",
+            "mood_name",
+            "mood_slug",
+            "mood_icon",
+            "source",
+            "reviewed",
+            "note",
+            "is_public",
+            "created_at",
+        ]
+        read_only_fields = ["created_at"]
 
 
 class AdminCategorySerializer(serializers.ModelSerializer):
