@@ -152,6 +152,40 @@ class BlogReadingProgress(models.Model):
         return f"{self.user} - {self.blog} ({self.progress:.2%})"
 
 
+class QuickReadProgress(models.Model):
+    """Scroll depth through a story's Quick Read summary.
+
+    Quick Reads are Stories at the content-model level, but their summary is a
+    separate reading surface from the full story. Keeping its progress in a
+    dedicated table prevents a completed summary from changing the reader's
+    full-story progress while still giving admins the same depth reporting
+    available for blog posts.
+    """
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="quick_read_progress",
+    )
+    story = models.ForeignKey(
+        Story,
+        on_delete=models.CASCADE,
+        related_name="quick_read_progress",
+    )
+    progress = models.FloatField(default=0.0)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = ("user", "story")
+        indexes = [
+            models.Index(fields=["user", "story"]),
+            models.Index(fields=["story", "updated_at"]),
+        ]
+
+    def __str__(self):
+        return f"{self.user} - {self.story} [Quick Read] ({self.progress:.2%})"
+
+
 class AudioReadingProgress(models.Model):
     user = models.ForeignKey(
         settings.AUTH_USER_MODEL,

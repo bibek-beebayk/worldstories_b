@@ -22,6 +22,7 @@ from apps.stats.models import (
     AudioReadingProgress,
     VideoWatchProgress,
     BlogReadingProgress,
+    QuickReadProgress,
     ChapterReadingProgress,
     ReadingProgress,
 )
@@ -185,10 +186,13 @@ def build_content_rankings(days, kind):
     so admins can judge performance without relying on the score alone.
     """
     cutoff = get_cutoff(days)
-    is_story = kind in {"story", "audiobook"}
+    is_story = kind in {"story", "audiobook", "quick_read"}
+    is_quick_read = kind == "quick_read"
     title_queryset = Story.objects.published() if is_story else Blog.objects.published()
     if kind == "audiobook":
         title_queryset = title_queryset.filter(audios__isnull=False).distinct()
+    elif is_quick_read:
+        title_queryset = title_queryset.exclude(Q(summary__isnull=True) | Q(summary__exact=""))
     titles = list(title_queryset.values("id", "title", "slug").order_by("title"))
     title_ids = [row["id"] for row in titles]
     metrics = {
@@ -208,7 +212,7 @@ def build_content_rankings(days, kind):
         for title_id in title_ids
     }
 
-    if is_story:
+    if is_story and not is_quick_read:
         for row in (
             audience_only(StoryView.objects.filter(story_id__in=title_ids, created_at__gte=cutoff))
             .values("story_id")
@@ -225,14 +229,35 @@ def build_content_rankings(days, kind):
         AnalyticsEvent.EVENT_READ_ALONG_CUE_SEEK,
         AnalyticsEvent.EVENT_READ_ALONG_FOLLOW_TOGGLE,
     }
-    for title_id, event_type, user_id, visitor_id, duration in events.values_list(
-        id_field, "event_type", "user_id", "visitor_id", "duration_seconds"
+    for title_id, event_type, user_id, visitor_id, duration, metadata in events.values_list(
+        id_field, "event_type", "user_id", "visitor_id", "duration_seconds", "metadata"
     ):
         row = metrics[title_id]
         duration = duration or 0
+        metadata = metadata or {}
+        if is_quick_read:
+            if event_type == AnalyticsEvent.EVENT_QUICK_READ_OPENED:
+                row["views"] += 1
+            elif (
+                event_type == AnalyticsEvent.EVENT_READING_SESSION
+                and metadata.get("format") == "quick_read"
+            ):
+                row["reads"] += 1
+                row["reader_ids"].add(_content_identity(user_id, visitor_id))
+                row["reading_seconds"] += duration
+            elif event_type == AnalyticsEvent.EVENT_QUICK_READ_COMPLETED:
+                row["completions"] += 1
+                row["event_interactions"] += 1
+            elif event_type == AnalyticsEvent.EVENT_QUICK_READ_FULL_STORY_CLICKED:
+                row["event_interactions"] += 1
+            continue
+
         if not is_story and event_type == AnalyticsEvent.EVENT_VISIT:
             row["views"] += 1
-        elif event_type == AnalyticsEvent.EVENT_READING_SESSION:
+        elif (
+            event_type == AnalyticsEvent.EVENT_READING_SESSION
+            and metadata.get("format") != "quick_read"
+        ):
             row["reads"] += 1
             row["reader_ids"].add(_content_identity(user_id, visitor_id))
             row["reading_seconds"] += duration
@@ -251,7 +276,7 @@ def build_content_rankings(days, kind):
 
     favorites = {}
     reviews = {}
-    if is_story:
+    if is_story and not is_quick_read:
         favorites = dict(
             audience_only(Favorite.objects.filter(story_id__in=title_ids, created_at__gte=cutoff))
             .values_list("story_id")
@@ -489,6 +514,9 @@ def build_content_data(days):
         build_content_rankings(days, "audiobook"), "performance_score"
     )[:5]
     top_blogs = sort_content_rankings(build_content_rankings(days, "blog"), "performance_score")[:5]
+    top_quick_reads = sort_content_rankings(
+        build_content_rankings(days, "quick_read"), "performance_score"
+    )[:5]
 
     return {
         "range_days": days,
@@ -539,6 +567,7 @@ def build_content_data(days):
         "top_stories": top_stories,
         "top_audiobooks": top_audiobooks,
         "top_blogs": top_blogs,
+        "top_quick_reads": top_quick_reads,
     }
 
 
@@ -1446,7 +1475,7 @@ class AdminAnalyticsContentRankingsAPIView(APIView):
     def get(self, request):
         days = get_range_days(request)
         kind = request.query_params.get("kind", "story")
-        if kind not in {"story", "audiobook", "blog"}:
+        if kind not in {"story", "audiobook", "quick_read", "blog"}:
             kind = "story"
         sort = request.query_params.get("sort", "performance_score")
         if sort not in CONTENT_RANKING_SORTS:
@@ -1890,6 +1919,123 @@ def build_blog_detail_data(blog, days):
     }
 
 
+def build_quick_read_detail_time_series(story, days):
+    """Per-bucket Quick Read funnel and engaged reading time."""
+    now = timezone.now()
+    cutoff = get_cutoff(days)
+    interval = "hour" if days == 1 else "day"
+    step = timedelta(hours=1) if interval == "hour" else timedelta(days=1)
+    bucket_count = 24 if interval == "hour" else days
+    points = [
+        {
+            "period": (cutoff + step * index).isoformat(),
+            "opens": 0,
+            "completions": 0,
+            "full_story_clicks": 0,
+            "reading_minutes": 0.0,
+        }
+        for index in range(bucket_count)
+    ]
+
+    event_types = {
+        AnalyticsEvent.EVENT_QUICK_READ_OPENED,
+        AnalyticsEvent.EVENT_QUICK_READ_COMPLETED,
+        AnalyticsEvent.EVENT_QUICK_READ_FULL_STORY_CLICKED,
+        AnalyticsEvent.EVENT_READING_SESSION,
+    }
+    events = audience_only(
+        AnalyticsEvent.objects.filter(
+            story=story,
+            created_at__gte=cutoff,
+            created_at__lte=now,
+            event_type__in=event_types,
+        )
+    )
+    for event_type, duration, metadata, created_at in events.values_list(
+        "event_type", "duration_seconds", "metadata", "created_at"
+    ):
+        index = int((created_at - cutoff).total_seconds() // step.total_seconds())
+        if not 0 <= index < bucket_count:
+            continue
+        point = points[index]
+        if event_type == AnalyticsEvent.EVENT_QUICK_READ_OPENED:
+            point["opens"] += 1
+        elif event_type == AnalyticsEvent.EVENT_QUICK_READ_COMPLETED:
+            point["completions"] += 1
+        elif event_type == AnalyticsEvent.EVENT_QUICK_READ_FULL_STORY_CLICKED:
+            point["full_story_clicks"] += 1
+        elif (
+            event_type == AnalyticsEvent.EVENT_READING_SESSION
+            and (metadata or {}).get("format") == "quick_read"
+        ):
+            point["reading_minutes"] += (duration or 0) / 60
+
+    for point in points:
+        point["reading_minutes"] = round(point["reading_minutes"], 1)
+    return {"interval": interval, "points": points}
+
+
+def build_quick_read_detail_data(story, days):
+    cutoff = get_cutoff(days)
+    events = audience_only(
+        AnalyticsEvent.objects.filter(story=story, created_at__gte=cutoff)
+    )
+    opened = events.filter(event_type=AnalyticsEvent.EVENT_QUICK_READ_OPENED)
+    completed = events.filter(event_type=AnalyticsEvent.EVENT_QUICK_READ_COMPLETED)
+    clicked = events.filter(
+        event_type=AnalyticsEvent.EVENT_QUICK_READ_FULL_STORY_CLICKED
+    )
+    reading_sessions = events.filter(
+        event_type=AnalyticsEvent.EVENT_READING_SESSION,
+        metadata__format="quick_read",
+    )
+    reader_identities = {
+        _content_identity(user_id, visitor_id)
+        for user_id, visitor_id in opened.values_list("user_id", "visitor_id")
+    }
+    reading_seconds = reading_sessions.aggregate(total=Sum("duration_seconds"))["total"] or 0
+
+    progress_qs = audience_only(
+        QuickReadProgress.objects.filter(story=story, updated_at__gte=cutoff)
+    )
+    bucket_defs = [
+        ("0-25%", 0.0, 0.25),
+        ("25-50%", 0.25, 0.5),
+        ("50-75%", 0.5, 0.75),
+        ("75-100%", 0.75, 1.01),
+    ]
+    progress_distribution = [
+        {"bucket": label, "count": progress_qs.filter(progress__gte=lo, progress__lt=hi).count()}
+        for label, lo, hi in bucket_defs
+    ]
+
+    open_count = opened.count()
+    completed_count = completed.count()
+    clicked_count = clicked.count()
+    return {
+        "range_days": days,
+        "story": {"id": story.id, "title": story.title, "slug": story.slug},
+        "time_series": build_quick_read_detail_time_series(story, days),
+        "opens": open_count,
+        "unique_readers": len(reader_identities),
+        "completions": completed_count,
+        "completion_rate": round(completed_count / open_count, 3) if open_count else 0,
+        "full_story_clicks": clicked_count,
+        "full_story_conversion_rate": (
+            round(clicked_count / completed_count, 3) if completed_count else 0
+        ),
+        "clicks_after_completion": clicked.filter(
+            metadata__completed_summary=True
+        ).count(),
+        "reading_minutes": round(reading_seconds / 60, 1),
+        "readers_with_depth_tracked": progress_qs.count(),
+        "avg_progress": round(
+            progress_qs.aggregate(avg=Avg("progress"))["avg"] or 0, 3
+        ),
+        "progress_distribution": progress_distribution,
+    }
+
+
 class AdminStoryDetailAnalyticsAPIView(APIView):
     """One specific story's engagement, as opposed to the site-wide
     aggregates above — page opens, who started reading, how far they got,
@@ -1912,3 +2058,16 @@ class AdminBlogDetailAnalyticsAPIView(APIView):
     def get(self, request, blog_slug):
         blog = get_object_or_404(Blog.objects.published(), slug=blog_slug)
         return Response(build_blog_detail_data(blog, get_range_days(request)))
+
+
+class AdminQuickReadDetailAnalyticsAPIView(APIView):
+    """Engagement and conversion for one story's Quick Read summary."""
+
+    permission_classes = [IsSuperUser]
+
+    def get(self, request, story_slug):
+        story = get_object_or_404(
+            Story.objects.published().exclude(Q(summary__isnull=True) | Q(summary__exact="")),
+            slug=story_slug,
+        )
+        return Response(build_quick_read_detail_data(story, get_range_days(request)))

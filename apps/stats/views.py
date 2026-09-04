@@ -16,6 +16,7 @@ from apps.stats.models import (
     AudioReadingProgress,
     VideoWatchProgress,
     BlogReadingProgress,
+    QuickReadProgress,
     FileReadingProgress,
     StoryCompletion,
 )
@@ -29,6 +30,8 @@ from apps.stats.serializers import (
     VideoWatchProgressWriteSerializer,
     BlogReadingProgressSerializer,
     BlogReadingProgressWriteSerializer,
+    QuickReadProgressSerializer,
+    QuickReadProgressWriteSerializer,
     FileReadingProgressSerializer,
     FileReadingProgressWriteSerializer,
 )
@@ -341,6 +344,38 @@ class BlogReadingProgressAPIView(APIView):
         progress_obj.save()
 
         return Response(BlogReadingProgressSerializer(progress_obj).data)
+
+
+class QuickReadProgressAPIView(APIView):
+    """Tracks authenticated scroll depth through a Quick Read summary."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, story_slug):
+        story = get_object_or_404(Story.objects.published(), slug=story_slug)
+        progress = QuickReadProgress.objects.filter(user=request.user, story=story).first()
+        if not progress:
+            return Response({"detail": "Progress not found."}, status=status.HTTP_404_NOT_FOUND)
+        return Response(QuickReadProgressSerializer(progress).data)
+
+    def put(self, request, story_slug):
+        story = get_object_or_404(Story.objects.published(), slug=story_slug)
+        if not (story.summary or "").strip():
+            return Response(
+                {"detail": "This story has no Quick Read summary."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        serializer = QuickReadProgressWriteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        progress_obj, _ = QuickReadProgress.objects.get_or_create(
+            user=request.user, story=story
+        )
+        progress_obj.progress = max(
+            progress_obj.progress, serializer.validated_data["progress"]
+        )
+        progress_obj.save()
+        return Response(QuickReadProgressSerializer(progress_obj).data)
 
 
 class FileReadingProgressAPIView(APIView):

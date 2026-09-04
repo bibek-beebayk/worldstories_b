@@ -9,6 +9,7 @@ from apps.stats.models import (
     AudioReadingProgress,
     VideoWatchProgress,
     BlogReadingProgress,
+    QuickReadProgress,
     FileReadingProgress,
 )
 
@@ -77,6 +78,16 @@ class BlogReadingProgressSerializer(serializers.ModelSerializer):
 
 
 class BlogReadingProgressWriteSerializer(serializers.Serializer):
+    progress = serializers.FloatField(min_value=0.0, max_value=1.0)
+
+
+class QuickReadProgressSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = QuickReadProgress
+        fields = ["progress", "updated_at"]
+
+
+class QuickReadProgressWriteSerializer(serializers.Serializer):
     progress = serializers.FloatField(min_value=0.0, max_value=1.0)
 
 

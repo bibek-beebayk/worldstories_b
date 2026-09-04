@@ -29,6 +29,7 @@ from .models import (
     AudioReadingProgress,
     ChapterReadingProgress,
     FileReadingProgress,
+    QuickReadProgress,
     ReadingProgress,
     StoryCompletion,
     UserAchievement,
@@ -379,6 +380,109 @@ class StoryViewBeaconTests(APITestCase):
         self.assertEqual(StoryView.objects.count(), 0)
 
 
+class QuickReadAnalyticsApiTests(APITestCase):
+    def setUp(self):
+        cache.clear()
+        self.client = APIClient(HTTP_USER_AGENT=BROWSER_USER_AGENT)
+        self.admin = User.objects.create_user(
+            email="quick-admin@example.com",
+            username="quick-admin",
+            password="test-password",
+            is_superuser=True,
+            is_staff=True,
+        )
+        self.reader = User.objects.create_user(
+            email="quick-reader@example.com",
+            username="quick-reader",
+            password="test-password",
+        )
+        self.story = Story.objects.create(
+            title="Tracked Quick Read",
+            slug="tracked-quick-read",
+            summary="<p>A useful summary.</p>",
+            is_published=True,
+        )
+
+    def test_progress_is_saved_separately_and_only_moves_forward(self):
+        self.client.force_authenticate(self.reader)
+
+        first = self.client.put(
+            reverse("quick-read-progress", args=[self.story.slug]),
+            {"progress": 0.72},
+            format="json",
+        )
+        second = self.client.put(
+            reverse("quick-read-progress", args=[self.story.slug]),
+            {"progress": 0.25},
+            format="json",
+        )
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(second.data["progress"], 0.72)
+        self.assertEqual(
+            QuickReadProgress.objects.get(user=self.reader, story=self.story).progress,
+            0.72,
+        )
+        self.assertFalse(ReadingProgress.objects.filter(user=self.reader, story=self.story).exists())
+
+    def test_admin_receives_per_title_quick_read_funnel_and_depth(self):
+        for session_id in ("visit-one", "visit-two"):
+            AnalyticsEvent.objects.create(
+                event_type=AnalyticsEvent.EVENT_QUICK_READ_OPENED,
+                visitor_id="same-reader",
+                session_id=session_id,
+                story=self.story,
+            )
+        AnalyticsEvent.objects.create(
+            event_type=AnalyticsEvent.EVENT_QUICK_READ_COMPLETED,
+            visitor_id="same-reader",
+            story=self.story,
+        )
+        AnalyticsEvent.objects.create(
+            event_type=AnalyticsEvent.EVENT_QUICK_READ_FULL_STORY_CLICKED,
+            visitor_id="same-reader",
+            story=self.story,
+            metadata={"completed_summary": True},
+        )
+        AnalyticsEvent.objects.create(
+            event_type=AnalyticsEvent.EVENT_READING_SESSION,
+            visitor_id="same-reader",
+            story=self.story,
+            duration_seconds=150,
+            metadata={"format": "quick_read"},
+        )
+        QuickReadProgress.objects.create(user=self.reader, story=self.story, progress=0.76)
+        self.client.force_authenticate(self.admin)
+
+        response = self.client.get(
+            reverse("admin-analytics-quick-read-detail", args=[self.story.slug]),
+            {"days": 30},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["opens"], 2)
+        self.assertEqual(response.data["unique_readers"], 1)
+        self.assertEqual(response.data["completions"], 1)
+        self.assertEqual(response.data["completion_rate"], 0.5)
+        self.assertEqual(response.data["full_story_clicks"], 1)
+        self.assertEqual(response.data["full_story_conversion_rate"], 1.0)
+        self.assertEqual(response.data["clicks_after_completion"], 1)
+        self.assertEqual(response.data["reading_minutes"], 2.5)
+        self.assertEqual(response.data["avg_progress"], 0.76)
+        self.assertEqual(
+            sum(point["opens"] for point in response.data["time_series"]["points"]),
+            2,
+        )
+
+    def test_quick_read_analytics_is_superuser_only(self):
+        self.client.force_authenticate(self.reader)
+        response = self.client.get(
+            reverse("admin-analytics-quick-read-detail", args=[self.story.slug])
+        )
+        self.assertEqual(response.status_code, 403)
+
+
 class AdminAudienceAnalyticsApiTests(APITestCase):
     def setUp(self):
         cache.clear()
@@ -685,7 +789,7 @@ class AdminContentAnalyticsApiTests(APITestCase):
             youtube_url="https://youtu.be/dQw4w9WgXcQ",
             youtube_id="dQw4w9WgXcQ",
         )
-        Story.objects.create(
+        self.quick_read_story = Story.objects.create(
             title="Quick Read Story",
             slug="quick-read-story",
             is_published=True,
@@ -756,6 +860,51 @@ class AdminContentAnalyticsApiTests(APITestCase):
         self.assertEqual(ranking.status_code, 200)
         self.assertEqual(ranking.data["content_type"], "blog")
         self.assertEqual(ranking.data["results"][0]["id"], self.blog.id)
+
+    def test_quick_reads_have_separate_rankings_from_full_story_reads(self):
+        AnalyticsEvent.objects.create(
+            event_type=AnalyticsEvent.EVENT_QUICK_READ_OPENED,
+            visitor_id="quick-reader",
+            story=self.quick_read_story,
+        )
+        AnalyticsEvent.objects.create(
+            event_type=AnalyticsEvent.EVENT_READING_SESSION,
+            visitor_id="quick-reader",
+            story=self.quick_read_story,
+            duration_seconds=90,
+            metadata={"format": "quick_read"},
+        )
+        AnalyticsEvent.objects.create(
+            event_type=AnalyticsEvent.EVENT_QUICK_READ_COMPLETED,
+            visitor_id="quick-reader",
+            story=self.quick_read_story,
+        )
+        self.client.force_authenticate(self.admin)
+
+        quick_reads = self.client.get(
+            reverse("admin-analytics-content-rankings"),
+            {"kind": "quick_read", "days": 30},
+        )
+        stories = self.client.get(
+            reverse("admin-analytics-content-rankings"),
+            {"kind": "story", "days": 30},
+        )
+
+        self.assertEqual(quick_reads.status_code, 200)
+        quick_row = next(
+            row for row in quick_reads.data["results"]
+            if row["id"] == self.quick_read_story.id
+        )
+        story_row = next(
+            row for row in stories.data["results"]
+            if row["id"] == self.quick_read_story.id
+        )
+        self.assertEqual(quick_row["views"], 1)
+        self.assertEqual(quick_row["reads"], 1)
+        self.assertEqual(quick_row["reading_minutes"], 1.5)
+        self.assertEqual(quick_row["completions"], 1)
+        self.assertEqual(story_row["reads"], 0)
+        self.assertEqual(story_row["reading_minutes"], 0)
 
     def test_rankings_exclude_operator_activity_but_keep_anonymous(self):
         """Rows written before the ingest gate existed are still in the tables,

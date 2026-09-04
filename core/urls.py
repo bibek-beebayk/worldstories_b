@@ -254,6 +254,11 @@ urlpatterns = [
         name="admin-analytics-blog-detail",
     ),
     path(
+        "api/admin/analytics/quick-reads/<slug:story_slug>/",
+        story_analytics_api.AdminQuickReadDetailAnalyticsAPIView.as_view(),
+        name="admin-analytics-quick-read-detail",
+    ),
+    path(
         "api/admin/analytics/engagement-metrics/",
         story_analytics_api.AdminAnalyticsEngagementMetricsAPIView.as_view(),
         name="admin-analytics-engagement-metrics",
@@ -292,6 +297,11 @@ urlpatterns = [
         "api/blog-reading-progress/<slug:blog_slug>/",
         stats_views.BlogReadingProgressAPIView.as_view(),
         name="blog-reading-progress",
+    ),
+    path(
+        "api/quick-read-progress/<slug:story_slug>/",
+        stats_views.QuickReadProgressAPIView.as_view(),
+        name="quick-read-progress",
     ),
     path("api/library-shelves/", story_api.LibraryShelvesAPIView.as_view(), name="library-shelves"),
     path("api/sitemap.xml", sitemap, name="sitemap"),
