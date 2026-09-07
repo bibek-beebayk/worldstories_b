@@ -5,7 +5,17 @@ from core.settings.base import BASE_DIR, MIDDLEWARE
 
 DEBUG = False
 
-ALLOWED_HOSTS = ["worldstories-b-production.up.railway.app"]
+# Extra hosts can be added at deploy time via EXTRA_ALLOWED_HOSTS
+# (comma-separated) so attaching a custom domain — which the TikTok developer
+# console effectively requires, since domain ownership cannot be verified on a
+# shared *.up.railway.app subdomain — does not need a code change and redeploy.
+_EXTRA_HOSTS = [
+    host.strip()
+    for host in os.environ.get("EXTRA_ALLOWED_HOSTS", "").split(",")
+    if host.strip()
+]
+
+ALLOWED_HOSTS = ["worldstories-b-production.up.railway.app"] + _EXTRA_HOSTS
 
 # HTTPS / cookie hardening. Railway terminates TLS at a proxy in front of the
 # app and forwards plain HTTP internally, so SECURE_PROXY_SSL_HEADER must
