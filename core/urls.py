@@ -189,6 +189,74 @@ def sitemap(request):
     return HttpResponse(xml, content_type="application/xml")
 
 
+def nepali_sitemap(request):
+    """Sitemap for the standalone Nepali companion site.
+
+    Separate from `sitemap()` on purpose: the two properties are indexed
+    independently in Search Console, so this must contain only this site's own
+    URLs on its own domain. Sharing the mother site's `SITE_URL` would rewrite
+    every entry to the wrong host, which is why this reads its own env var.
+
+    Two things are still undecided (see WORLDSTORIES_NEPALI_TODO.md, Open
+    Decisions 1 and 3): the domain, and whether the paths are Latin-script or
+    Devanagari. Both are env vars rather than literals so neither blocks this
+    route, and changing them later needs no redeploy of the mother site.
+
+    Stories are selected by the `show_in_nepali_site` flag, not by language —
+    an editorial choice, not a property of the text.
+    """
+    site_url = os.environ.get("NP_SITE_URL", "").rstrip("/")
+    if not site_url:
+        # Better an explicit, cacheable failure than a sitemap full of URLs
+        # pointing at the wrong domain, which Search Console would happily
+        # index before anyone noticed.
+        return HttpResponse(
+            "NP_SITE_URL is not configured.",
+            status=503,
+            content_type="text/plain",
+        )
+
+    catalogue_path = os.environ.get("NP_CATALOGUE_PATH", "/kathaharu").strip("/")
+    story_prefix = os.environ.get("NP_STORY_PATH_PREFIX", "katha").strip("/")
+
+    entries = [
+        f"<url><loc>{escape(site_url + '/')}</loc></url>",
+        f"<url><loc>{escape(f'{site_url}/{catalogue_path}')}</loc></url>",
+    ]
+
+    stories = (
+        Story.objects.published()
+        .filter(show_in_nepali_site=True)
+        # Carried over from the mother site's sitemap: AI-generated "Summary"
+        # entries are thin by design and are not offered to search engines.
+        .exclude(story_type__name="Summary")
+        .only("slug", "site_published_date")
+        .order_by("slug")
+    )
+    for story in stories.iterator(chunk_size=2000):
+        last_modified = (
+            f"<lastmod>{story.site_published_date.isoformat()}</lastmod>"
+            if story.site_published_date
+            else ""
+        )
+        entries.append(
+            f"<url><loc>{escape(f'{site_url}/{story_prefix}/{story.slug}')}</loc>"
+            f"{last_modified}</url>"
+        )
+
+    # Deliberately no chapter, tag, theme, genre, category, author or blog
+    # entries: none of those pages exist on the Nepali site, and a sitemap
+    # listing URLs that 404 is worse than a small one.
+
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+        + "".join(entries)
+        + "</urlset>"
+    )
+    return HttpResponse(xml, content_type="application/xml")
+
+
 urlpatterns = [
     path("admin/", admin.site.urls),
     path("api/session-auth/", include("rest_framework.urls")),
@@ -305,5 +373,7 @@ urlpatterns = [
     ),
     path("api/library-shelves/", story_api.LibraryShelvesAPIView.as_view(), name="library-shelves"),
     path("api/sitemap.xml", sitemap, name="sitemap"),
+    # Nepali companion site — its own sitemap, indexed as a separate property.
+    path("api/sitemap-np.xml", nepali_sitemap, name="nepali-sitemap"),
     path("ckeditor5/", include("django_ckeditor_5.urls")),
 ] + static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)

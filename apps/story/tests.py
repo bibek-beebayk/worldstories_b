@@ -1,5 +1,6 @@
 import csv
 import io
+import os
 from datetime import date, datetime, timedelta, timezone as datetime_timezone
 from io import BytesIO
 from types import SimpleNamespace
@@ -10,7 +11,7 @@ from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db import IntegrityError, transaction
 from django.http import QueryDict
-from django.test import RequestFactory, SimpleTestCase, TestCase, TransactionTestCase
+from django.test import RequestFactory, SimpleTestCase, TestCase, TransactionTestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 from ebooklib import epub
@@ -2266,6 +2267,66 @@ class PublicAuthorApiTests(APITestCase):
 
         self.assertEqual(len(response.data["results"]), len(unfiltered))
 
+    def test_genre_directory_scopes_counts_to_the_nepali_site(self):
+        """The filter dropdown must offer only genres with something behind it,
+        and the counts beside them must be that site's counts, not global."""
+        from apps.story.models import Genre
+
+        flagged_genre = Genre.objects.create(name="Zeta Flagged", slug="zeta-flagged")
+        unflagged_genre = Genre.objects.create(name="Zeta Unflagged", slug="zeta-unflagged")
+
+        flagged = Story.objects.get(slug="published-book")
+        flagged.show_in_nepali_site = True
+        flagged.save(update_fields=["show_in_nepali_site"])
+        flagged.genres.add(flagged_genre)
+
+        other = Story.objects.create(
+            title="Not on the Nepali site", slug="not-on-np-site", is_published=True
+        )
+        other.genres.add(unflagged_genre)
+
+        unscoped = {g["slug"]: g["stories_count"] for g in self.client.get(reverse("genre-list")).data}
+        scoped = {
+            g["slug"]: g["stories_count"]
+            for g in self.client.get(reverse("genre-list"), {"show_in_nepali_site": "true"}).data
+        }
+
+        self.assertIn("zeta-flagged", unscoped)
+        self.assertIn("zeta-unflagged", unscoped)
+
+        # A genre with no flagged stories disappears entirely rather than
+        # offering a filter that returns nothing.
+        self.assertIn("zeta-flagged", scoped)
+        self.assertNotIn("zeta-unflagged", scoped)
+        self.assertEqual(scoped["zeta-flagged"], 1)
+
+    def test_genre_count_matches_the_story_list_it_filters(self):
+        """The number on the chip has to be the number of rows you get when you
+        click it — otherwise the dropdown lies."""
+        from apps.story.models import Genre
+
+        genre = Genre.objects.create(name="Zeta Counted", slug="zeta-counted")
+        flagged = Story.objects.get(slug="published-book")
+        flagged.show_in_nepali_site = True
+        flagged.save(update_fields=["show_in_nepali_site"])
+        flagged.genres.add(genre)
+        unflagged = Story.objects.create(
+            title="Unflagged sibling", slug="unflagged-sibling", is_published=True
+        )
+        unflagged.genres.add(genre)
+
+        chip = next(
+            g
+            for g in self.client.get(reverse("genre-list"), {"show_in_nepali_site": "true"}).data
+            if g["slug"] == "zeta-counted"
+        )
+        listed = self.client.get(
+            reverse("story-list"),
+            {"show_in_nepali_site": "true", "genres": genre.id},
+        ).data["pagination"]["count"]
+
+        self.assertEqual(chip["stories_count"], listed)
+
     def test_story_list_language_filter_returns_matching_translation(self):
         english = Story.objects.get(slug="published-book")
         spanish = Story.objects.create(
@@ -2280,6 +2341,100 @@ class PublicAuthorApiTests(APITestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual([story["slug"] for story in response.data["results"]], [spanish.slug])
+
+
+class NepaliSitemapTests(APITestCase):
+    """The Nepali site is indexed as its own Search Console property, so this
+    sitemap must contain only its own URLs, on its own domain."""
+
+    def setUp(self):
+        self.url = reverse("nepali-sitemap")
+        self.flagged = Story.objects.create(
+            title="फ्ल्याग गरिएको",
+            slug="np-flagged",
+            is_published=True,
+            show_in_nepali_site=True,
+        )
+        self.unflagged = Story.objects.create(
+            title="Not flagged", slug="np-unflagged", is_published=True
+        )
+
+    # Django's default mail_admins handler fires on any 5xx once DEBUG is
+    # False (as it is under the test runner) and renders the debug traceback
+    # template, which trips a copy() incompatibility in Django 5.0 on Python
+    # 3.14. Unrelated to this view — muted so the assertion can run.
+    @patch("django.utils.log.AdminEmailHandler.emit")
+    def test_refuses_to_emit_urls_without_a_configured_domain(self, _emit):
+        """A sitemap on the wrong host is worse than no sitemap — Search
+        Console would index it before anyone noticed."""
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("NP_SITE_URL", None)
+            response = self.client.get(self.url)
+        self.assertEqual(response.status_code, 503)
+
+    def test_lists_only_flagged_stories_on_the_new_domain(self):
+        with patch.dict(os.environ, {"NP_SITE_URL": "https://ne.example.test"}):
+            response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response["Content-Type"], "application/xml")
+        body = response.content.decode()
+
+        self.assertIn("https://ne.example.test/katha/np-flagged", body)
+        self.assertNotIn("np-unflagged", body)
+        # Homepage and catalogue.
+        self.assertIn("<loc>https://ne.example.test/</loc>", body)
+        self.assertIn("https://ne.example.test/kathaharu", body)
+        # No mother-site URL may leak in.
+        self.assertNotIn("worldstories.net", body)
+        self.assertNotIn("/story/", body)
+
+    def test_paths_are_configurable_so_the_slug_decision_is_not_baked_in(self):
+        with patch.dict(
+            os.environ,
+            {
+                "NP_SITE_URL": "https://ne.example.test",
+                "NP_CATALOGUE_PATH": "stories",
+                "NP_STORY_PATH_PREFIX": "s",
+            },
+        ):
+            body = self.client.get(self.url).content.decode()
+
+        self.assertIn("https://ne.example.test/stories", body)
+        self.assertIn("https://ne.example.test/s/np-flagged", body)
+
+    def test_unpublished_and_summary_stories_are_excluded(self):
+        summary_type, _ = StoryType.objects.get_or_create(name="Summary")
+        Story.objects.create(
+            title="Flagged summary",
+            slug="np-summary",
+            is_published=True,
+            show_in_nepali_site=True,
+            story_type=summary_type,
+        )
+        Story.objects.create(
+            title="Flagged draft",
+            slug="np-draft",
+            is_published=False,
+            show_in_nepali_site=True,
+        )
+
+        with patch.dict(os.environ, {"NP_SITE_URL": "https://ne.example.test"}):
+            body = self.client.get(self.url).content.decode()
+
+        self.assertNotIn("np-summary", body)
+        self.assertNotIn("np-draft", body)
+        self.assertIn("np-flagged", body)
+
+    def test_the_mother_sitemap_is_unaffected(self):
+        with patch.dict(os.environ, {"SITE_URL": "https://worldstories.test"}):
+            body = self.client.get(reverse("sitemap")).content.decode()
+
+        # The mother site still lists everything published, flagged or not, on
+        # its own domain and its own paths.
+        self.assertIn("https://worldstories.test/story/np-unflagged", body)
+        self.assertIn("https://worldstories.test/story/np-flagged", body)
+        self.assertNotIn("/katha/", body)
 
 
 class OriginalPublicationDateValidationTests(SimpleTestCase):

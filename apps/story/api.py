@@ -394,6 +394,41 @@ class ThemeViewSet(ReadOnlyModelViewSet):
         return ThemeSerializer
 
 
+def wants_nepali_site(request) -> bool:
+    """Is this request asking for the Nepali companion site's subset?
+
+    One definition, shared by the story list and the taxonomy directories, so
+    the three endpoints cannot drift on what counts as "true". Anything other
+    than a recognised truthy value means "no filter" rather than "empty", so a
+    typo shows the full catalogue instead of an apparently-broken site.
+    """
+    return (
+        request.query_params.get("show_in_nepali_site", "").strip().lower()
+        in {"true", "1"}
+    )
+
+
+def taxonomy_directory_queryset(model, request):
+    """Public Genre/Category directory queryset.
+
+    Counts only currently-visible stories and hides taxonomies with none —
+    unchanged behaviour. When the Nepali site asks for its own subset, both
+    the count *and* the visibility test narrow to flagged stories, so the
+    filter dropdown offers only genres that have something behind them and the
+    numbers beside them are the numbers that site will actually show.
+    """
+    story_filter = published_story_q("stories")
+    if wants_nepali_site(request):
+        story_filter &= Q(stories__show_in_nepali_site=True)
+    return (
+        model.objects.annotate(
+            published_stories_count=Count("stories", filter=story_filter, distinct=True)
+        )
+        .filter(published_stories_count__gt=0)
+        .order_by("name")
+    )
+
+
 class GenreViewSet(ReadOnlyModelViewSet):
     """Public genre directory — list behavior unchanged from the old
     GenreListAPIView it replaces, plus a slug-keyed retrieve backing the new
@@ -403,17 +438,7 @@ class GenreViewSet(ReadOnlyModelViewSet):
     pagination_class = None
 
     def get_queryset(self):
-        return (
-            Genre.objects.annotate(
-                published_stories_count=Count(
-                    "stories",
-                    filter=published_story_q("stories"),
-                    distinct=True,
-                )
-            )
-            .filter(published_stories_count__gt=0)
-            .order_by("name")
-        )
+        return taxonomy_directory_queryset(Genre, self.request)
 
     def get_serializer_class(self):
         if self.action == "retrieve":
@@ -430,17 +455,7 @@ class CategoryViewSet(ReadOnlyModelViewSet):
     pagination_class = None
 
     def get_queryset(self):
-        return (
-            Category.objects.annotate(
-                published_stories_count=Count(
-                    "stories",
-                    filter=published_story_q("stories"),
-                    distinct=True,
-                )
-            )
-            .filter(published_stories_count__gt=0)
-            .order_by("name")
-        )
+        return taxonomy_directory_queryset(Category, self.request)
 
     def get_serializer_class(self):
         if self.action == "retrieve":
@@ -542,10 +557,7 @@ class StoryViewSet(ReadOnlyModelViewSet):
             # otherwise a flagged story whose group also holds an unflagged
             # English edition loses to it and vanishes. See
             # with_preferred_translation_only's docstring.
-            nepali_only = (
-                self.request.query_params.get("show_in_nepali_site", "").strip().lower()
-                in {"true", "1"}
-            )
+            nepali_only = wants_nepali_site(self.request)
             queryset = with_preferred_translation_only(
                 queryset,
                 preferred_language=self.request.query_params.get("language"),
