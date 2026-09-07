@@ -233,6 +233,17 @@ class StoryAdmin(admin.ModelAdmin):
             },
         ),
         (
+            "Companion sites",
+            {
+                "fields": ("show_in_nepali_site",),
+                "description": (
+                    "Curated opt-in for the standalone Nepali site. Independent of "
+                    "the story's language — a Nepali story is not automatically "
+                    "listed there, and a story need not be in Nepali to be."
+                ),
+            },
+        ),
+        (
             "Media & Files",
             {
                 "fields": ("cover_image", "cover_image_file", "pdf_file", "epub_file"),
@@ -263,6 +274,7 @@ class StoryAdmin(admin.ModelAdmin):
         "author",
         "submitted_by",
         "is_completed",
+        "show_in_nepali_site",
         "rating",
         "views",
         "original_published_date_display",
@@ -287,6 +299,7 @@ class StoryAdmin(admin.ModelAdmin):
         "story_type",
         "language",
         "is_completed",
+        "show_in_nepali_site",
         "site_published_date",
         "genres",
         "categories",

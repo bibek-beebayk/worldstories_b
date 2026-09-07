@@ -582,6 +582,24 @@ class Story(models.Model):
     moods = models.ManyToManyField("Mood", through="StoryMood", related_name="stories", blank=True)
     is_completed = models.BooleanField(default=False)
     is_original = models.BooleanField(default=False, db_index=True)
+    # Curated opt-in for the standalone Nepali companion site. Deliberately a
+    # flag rather than `language == "ne"`: the two are not the same question.
+    # A story can be in Nepali and still not belong on that site (a draft
+    # translation, an in-copyright summary), and an editor may want a
+    # non-Nepali story there for context. Indexed because the Nepali site
+    # filters every list query on it.
+    show_in_nepali_site = models.BooleanField(
+        default=False,
+        # A real database default, not just a Python one. Django's AddField
+        # drops the temporary default it uses to backfill, which leaves the
+        # column NOT NULL with no default — so any INSERT that omits it fails.
+        # That includes historical models in migration tests (see
+        # apps/stats/test_migrations.py, which rewinds the stats app and gets a
+        # Story model that predates this field) and any raw/bulk load.
+        db_default=models.Value(False),
+        db_index=True,
+        help_text="Show this story on the Nepali companion site.",
+    )
     # Manual homepage-hero position (1-5, superuser-set). Null = not manually
     # featured — HomeDataAPIView backfills any remaining hero slots with its
     # existing automatic top-by-views/rating pick. Unique so two stories can
@@ -658,7 +676,7 @@ class DailyStory(models.Model):
         return f"{self.date}: {self.story.title}"
 
 
-def with_preferred_translation_only(queryset, preferred_language=None):
+def with_preferred_translation_only(queryset, preferred_language=None, candidate_filter=None):
     """Given a queryset of Story rows, keep only one row per translation_group.
     When a language is requested, choose within that language; otherwise use
     the English edition if the group has one, then its oldest (lowest id)
@@ -672,11 +690,21 @@ def with_preferred_translation_only(queryset, preferred_language=None):
     already be filtering on the same condition (as every current caller
     does) — otherwise a group could "win" on an edition the outer filter
     would exclude anyway, and vanish from the results entirely.
+
+    ``candidate_filter`` is a ``Q`` narrowing the same way for any *other*
+    restriction the caller has applied to ``queryset``. The Nepali site is the
+    first case that needs it: it lists only ``show_in_nepali_site=True`` rows,
+    and without narrowing the candidates too, a flagged Nepali story whose
+    translation group also holds an unflagged English edition would lose to
+    that English row (English sorts first) and then be filtered out — the
+    story would silently disappear rather than appear once.
     """
     candidates = Story.objects.filter(
         published_story_q(),
         translation_group=models.OuterRef("translation_group"),
     )
+    if candidate_filter is not None:
+        candidates = candidates.filter(candidate_filter)
     if preferred_language and preferred_language != "all":
         candidates = candidates.filter(language=preferred_language)
 

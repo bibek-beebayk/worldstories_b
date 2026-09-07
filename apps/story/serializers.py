@@ -1274,6 +1274,7 @@ class StoryAdminSerializer(serializers.ModelSerializer):
             "cached_file_reading_minutes",
             "is_completed",
             "is_original",
+            "show_in_nepali_site",
             "genres",
             "categories",
             "tags",

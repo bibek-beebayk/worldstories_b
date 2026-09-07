@@ -537,9 +537,19 @@ class StoryViewSet(ReadOnlyModelViewSet):
                 ),
             )
         if self.action == "list":
+            # When the Nepali site asks for its own catalogue, the candidate
+            # set for translation collapsing has to be narrowed the same way —
+            # otherwise a flagged story whose group also holds an unflagged
+            # English edition loses to it and vanishes. See
+            # with_preferred_translation_only's docstring.
+            nepali_only = (
+                self.request.query_params.get("show_in_nepali_site", "").strip().lower()
+                in {"true", "1"}
+            )
             queryset = with_preferred_translation_only(
                 queryset,
                 preferred_language=self.request.query_params.get("language"),
+                candidate_filter=Q(show_in_nepali_site=True) if nepali_only else None,
             )
             # StoryListSerializer reads these; keeps the browse grid off a
             # per-row .count()/.exists() (see StoryQuerySet.for_card_list).
@@ -1209,6 +1219,10 @@ class StoryAdminViewSet(ModelViewSet):
         is_original = params.get("is_original")
         if is_original in {"true", "false"}:
             queryset = queryset.filter(is_original=is_original == "true")
+
+        show_in_nepali_site = params.get("show_in_nepali_site")
+        if show_in_nepali_site in {"true", "false"}:
+            queryset = queryset.filter(show_in_nepali_site=show_in_nepali_site == "true")
 
         has_summary = params.get("has_summary")
         if has_summary in {"true", "false"}:

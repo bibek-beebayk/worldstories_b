@@ -20,6 +20,9 @@ class StoryFilter(filters.FilterSet):
     has_video = filters.CharFilter(method="filter_has_video", label="Has video")
     has_summary = filters.CharFilter(method="filter_has_summary", label="Has summary")
     is_original = filters.CharFilter(method="filter_is_original", label="WorldStories Original")
+    show_in_nepali_site = filters.CharFilter(
+        method="filter_show_in_nepali_site", label="On the Nepali site"
+    )
     moods = filters.CharFilter(method="filter_moods", label="Moods")
     sort = filters.CharFilter(method="filter_sort", label="Sort")
     q = filters.CharFilter(method="filter_q", label="Query")
@@ -38,6 +41,21 @@ class StoryFilter(filters.FilterSet):
     def filter_categories(self, queryset, name, value):
         category_ids = [category.strip() for category in value.split(",")]
         return queryset.filter(categories__id__in=category_ids).distinct()
+
+    def filter_show_in_nepali_site(self, queryset, name, value):
+        """Curated opt-in for the Nepali companion site.
+
+        Separate from `language` on purpose — being written in Nepali and
+        belonging on that site are different editorial questions. Accepts only
+        "true"/"false"; anything else is ignored rather than treated as false,
+        so a typo cannot silently empty the catalogue.
+        """
+        normalised = (value or "").strip().lower()
+        if normalised in {"true", "1"}:
+            return queryset.filter(show_in_nepali_site=True)
+        if normalised in {"false", "0"}:
+            return queryset.filter(show_in_nepali_site=False)
+        return queryset
 
     def filter_moods(self, queryset, name, value):
         """Filter by mood slug, ignoring assignments nobody has reviewed.

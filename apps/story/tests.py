@@ -2206,6 +2206,66 @@ class PublicAuthorApiTests(APITestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual([story["slug"] for story in response.data["results"]], ["story-with-summary"])
 
+    def test_nepali_site_flag_filters_the_public_list(self):
+        flagged = Story.objects.get(slug="published-book")
+        flagged.show_in_nepali_site = True
+        flagged.save(update_fields=["show_in_nepali_site"])
+
+        response = self.client.get(reverse("story-list"), {"show_in_nepali_site": "true"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([s["slug"] for s in response.data["results"]], [flagged.slug])
+
+    def test_nepali_site_flag_is_independent_of_language(self):
+        """A Nepali story is not on the site unless it is flagged, and a
+        non-Nepali story is if it is — the two are separate questions."""
+        nepali_unflagged = Story.objects.create(
+            title="नेपाली कथा",
+            slug="nepali-unflagged",
+            language="ne",
+            is_published=True,
+        )
+        english_flagged = Story.objects.get(slug="published-book")
+        english_flagged.show_in_nepali_site = True
+        english_flagged.save(update_fields=["show_in_nepali_site"])
+
+        response = self.client.get(reverse("story-list"), {"show_in_nepali_site": "true"})
+        slugs = [s["slug"] for s in response.data["results"]]
+
+        self.assertIn(english_flagged.slug, slugs)
+        self.assertNotIn(nepali_unflagged.slug, slugs)
+
+    def test_flagged_translation_survives_an_unflagged_sibling(self):
+        """The regression this flag is most likely to hit.
+
+        Translation collapsing keeps one row per group and prefers English.
+        If the candidate set is not narrowed by the same flag, a flagged
+        Nepali edition loses to its unflagged English sibling and is then
+        filtered out — the story disappears from the site entirely rather
+        than appearing once.
+        """
+        english = Story.objects.get(slug="published-book")  # unflagged, English
+        nepali = Story.objects.create(
+            title="नेपाली संस्करण",
+            slug="nepali-edition",
+            translation_group=english.translation_group,
+            language="ne",
+            is_published=True,
+            show_in_nepali_site=True,
+        )
+
+        response = self.client.get(reverse("story-list"), {"show_in_nepali_site": "true"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([s["slug"] for s in response.data["results"]], [nepali.slug])
+
+    def test_unrecognised_nepali_site_value_does_not_empty_the_catalogue(self):
+        """A typo must not silently return nothing — that reads as an outage."""
+        unfiltered = self.client.get(reverse("story-list")).data["results"]
+        response = self.client.get(reverse("story-list"), {"show_in_nepali_site": "yes"})
+
+        self.assertEqual(len(response.data["results"]), len(unfiltered))
+
     def test_story_list_language_filter_returns_matching_translation(self):
         english = Story.objects.get(slug="published-book")
         spanish = Story.objects.create(
