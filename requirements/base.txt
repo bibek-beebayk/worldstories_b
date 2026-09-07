@@ -20,3 +20,17 @@ nh3
 anthropic
 markdown
 openpyxl
+
+# --- social_media_analytics (Facebook/Instagram/TikTok/YouTube analytics) ---
+# Background sync jobs. Added to the existing project (core/celery.py) rather
+# than as a parallel setup — the project had no broker before this feature.
+celery
+redis
+# YouTube Data API v3 + YouTube Analytics API v2 OAuth and client.
+# google-auth is already required above.
+google-auth-oauthlib
+google-api-python-client
+# Fernet encryption for stored platform tokens (apps/social_media_analytics/
+# fields.py). django-encrypted-model-fields is unmaintained against Django 5,
+# so the equivalent is implemented directly on cryptography.
+cryptography

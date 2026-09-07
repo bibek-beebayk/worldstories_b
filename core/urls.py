@@ -192,6 +192,13 @@ def sitemap(request):
 urlpatterns = [
     path("admin/", admin.site.urls),
     path("api/session-auth/", include("rest_framework.urls")),
+    # Personal social-media analytics (Facebook/Instagram/TikTok/YouTube).
+    # Its own prefix so it never collides with the on-site analytics routes
+    # served by apps.stats and apps.story below.
+    path(
+        "api/social-media-analytics/",
+        include("apps.social_media_analytics.api.urls"),
+    ),
     path("api/", include(router.urls)),
     path("api/auth/refresh/", TokenRefreshView.as_view(), name="token_refresh"),
     path("api/home/", story_api.HomeDataAPIView.as_view(), name="home-data"),

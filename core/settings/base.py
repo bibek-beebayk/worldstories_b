@@ -7,6 +7,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 PROJECT_ROOT = BASE_DIR.parent
 load_dotenv(PROJECT_ROOT / ".env")
 from django.utils import timezone
+from celery.schedules import crontab
 
 SECRET_KEY = os.environ["SECRET_KEY"]
 
@@ -37,6 +38,10 @@ INSTALLED_APPS = [
     "apps.users",
     "apps.story",
     "apps.stats",
+    # Personal social-media analytics (Facebook/Instagram/TikTok/YouTube).
+    # Deliberately separate from apps.stats, which owns the on-site
+    # /api/analytics/ and /api/admin/analytics/ routes.
+    "apps.social_media_analytics",
     # "apps.blog"
 ]
 
@@ -515,3 +520,111 @@ JAZZMIN_SETTINGS = {
     # Add a language dropdown into the admin
     # "language_chooser": True,
 }
+
+
+# ---------------------------------------------------------------------------
+# Celery — added with the social_media_analytics app (the project had no
+# background-task setup before). See core/celery.py.
+# ---------------------------------------------------------------------------
+
+# Broker resolution order:
+#   1. CELERY_BROKER_URL          - explicit override, wins everywhere
+#   2. REDIS_PRIVATE_URL          - Railway's internal network (no egress cost)
+#   3. REDIS_URL                   - Railway's public proxy URL, also the
+#                                    conventional name on Heroku/Render/Fly
+#   4. localhost                   - local development
+# Railway's Redis plugin injects the REDIS_* names automatically once a Redis
+# service is attached, so no manual variable is needed in the common case.
+CELERY_BROKER_URL = (
+    os.environ.get("CELERY_BROKER_URL")
+    or os.environ.get("REDIS_PRIVATE_URL")
+    or os.environ.get("REDIS_URL")
+    or "redis://127.0.0.1:6379/0"
+)
+CELERY_RESULT_BACKEND = os.environ.get("CELERY_RESULT_BACKEND", CELERY_BROKER_URL)
+CELERY_ACCEPT_CONTENT = ["json"]
+CELERY_TASK_SERIALIZER = "json"
+CELERY_RESULT_SERIALIZER = "json"
+CELERY_TIMEZONE = TIME_ZONE
+CELERY_TASK_TRACK_STARTED = True
+# A full platform sync walks paginated APIs; give it room but not forever.
+CELERY_TASK_SOFT_TIME_LIMIT = int(os.environ.get("CELERY_TASK_SOFT_TIME_LIMIT", "1500"))
+CELERY_TASK_TIME_LIMIT = int(os.environ.get("CELERY_TASK_TIME_LIMIT", "1800"))
+
+# Hour (UTC) at which the daily social-media syncs run. One hour apart so the
+# four platform jobs don't contend for the worker pool.
+SOCIAL_ANALYTICS_SYNC_HOUR = int(os.environ.get("SOCIAL_ANALYTICS_SYNC_HOUR", "3"))
+# Minutes past the hour for each platform, so a slow Meta run doesn't delay
+# YouTube. Overridable as a comma-separated list: meta,youtube,tiktok.
+_sync_offsets = os.environ.get("SOCIAL_ANALYTICS_SYNC_OFFSETS", "0,20,40").split(",")
+_META_MIN, _YT_MIN, _TT_MIN = (int(x) for x in (_sync_offsets + ["0", "20", "40"])[:3])
+
+CELERY_BEAT_SCHEDULE = {
+    "social-analytics-sync-meta": {
+        "task": "social_media_analytics.sync_meta",
+        "schedule": crontab(hour=SOCIAL_ANALYTICS_SYNC_HOUR, minute=_META_MIN),
+    },
+    "social-analytics-sync-youtube": {
+        "task": "social_media_analytics.sync_youtube",
+        "schedule": crontab(hour=SOCIAL_ANALYTICS_SYNC_HOUR, minute=_YT_MIN),
+    },
+    "social-analytics-sync-tiktok": {
+        "task": "social_media_analytics.sync_tiktok",
+        "schedule": crontab(hour=SOCIAL_ANALYTICS_SYNC_HOUR, minute=_TT_MIN),
+    },
+    # Meta long-lived user tokens last ~60 days and TikTok access tokens 24h;
+    # this proactive pass keeps every platform's credential alive without the
+    # user reconnecting.
+    "social-analytics-refresh-tokens": {
+        "task": "social_media_analytics.refresh_expiring_tokens",
+        "schedule": crontab(hour="*/6", minute=10),
+    },
+}
+
+
+# ---------------------------------------------------------------------------
+# Social media analytics — platform OAuth credentials (spec 3.7)
+# ---------------------------------------------------------------------------
+
+# Fernet key protecting stored platform tokens. Generate with:
+#   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+SOCIAL_ANALYTICS_FIELD_ENCRYPTION_KEY = os.environ.get(
+    "SOCIAL_ANALYTICS_FIELD_ENCRYPTION_KEY", ""
+)
+
+# Where the provider sends the browser after OAuth completes. The backend
+# hosts the redirect; the Flutter app never receives a code.
+SOCIAL_ANALYTICS_PUBLIC_BASE_URL = os.environ.get(
+    "SOCIAL_ANALYTICS_PUBLIC_BASE_URL", "http://127.0.0.1:8000"
+).rstrip("/")
+
+# Meta (one app covers both the Facebook Page and the linked Instagram
+# Business/Creator account).
+META_APP_ID = os.environ.get("META_APP_ID", "")
+META_APP_SECRET = os.environ.get("META_APP_SECRET", "")
+META_GRAPH_API_VERSION = os.environ.get("META_GRAPH_API_VERSION", "v21.0")
+META_REDIRECT_URI = os.environ.get(
+    "META_REDIRECT_URI",
+    f"{SOCIAL_ANALYTICS_PUBLIC_BASE_URL}/api/social-media-analytics/oauth/meta/callback/",
+)
+
+# YouTube. Separate from the project-wide GOOGLE_CLIENT_ID used for site
+# sign-in: different scopes, different consent screen, different redirect.
+YOUTUBE_CLIENT_ID = os.environ.get("YOUTUBE_CLIENT_ID", "")
+YOUTUBE_CLIENT_SECRET = os.environ.get("YOUTUBE_CLIENT_SECRET", "")
+YOUTUBE_REDIRECT_URI = os.environ.get(
+    "YOUTUBE_REDIRECT_URI",
+    f"{SOCIAL_ANALYTICS_PUBLIC_BASE_URL}/api/social-media-analytics/oauth/youtube/callback/",
+)
+
+# TikTok Login Kit. Note the parameter is a "client key", not a client id.
+TIKTOK_CLIENT_KEY = os.environ.get("TIKTOK_CLIENT_KEY", "")
+TIKTOK_CLIENT_SECRET = os.environ.get("TIKTOK_CLIENT_SECRET", "")
+TIKTOK_REDIRECT_URI = os.environ.get(
+    "TIKTOK_REDIRECT_URI",
+    f"{SOCIAL_ANALYTICS_PUBLIC_BASE_URL}/api/social-media-analytics/oauth/tiktok/callback/",
+)
+
+# Deep link the OAuth callback bounces back to so the Flutter app knows the
+# connect finished. Falls back to a plain HTML confirmation page when unset.
+SOCIAL_ANALYTICS_APP_REDIRECT = os.environ.get("SOCIAL_ANALYTICS_APP_REDIRECT", "")

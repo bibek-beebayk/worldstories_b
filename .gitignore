@@ -16,3 +16,8 @@ tunnel.txt
 .env
 .env.*
 !.env.example
+
+# Celery (added with apps/social_media_analytics)
+celerybeat-schedule
+celerybeat-schedule.*
+celerybeat.pid
