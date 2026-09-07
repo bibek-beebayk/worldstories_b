@@ -1,23 +1,5 @@
 *.pyc
-__pycache__
 .idea
-.vscode/
 core/settings/env.py
 *.sqlite3
-
-# Never bake local secrets into the image. base.py calls load_dotenv() on this
-# file, and while python-dotenv does not override real environment variables,
-# a copied .env still ships the local encryption key and DB password inside
-# the image layers.
-.env
-.env.*
-!.env.example
-
-# Build context bloat: the local virtualenv and the dev debug log are large
-# and are rebuilt/irrelevant inside the container.
-env/
-venv/
-*.log
-media/
-static/
-.git/
+.vscode/
