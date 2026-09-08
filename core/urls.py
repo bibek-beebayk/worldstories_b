@@ -13,6 +13,7 @@ from rest_framework_simplejwt.views import TokenRefreshView
 from apps.story import api as story_api
 from apps.story import analytics_api as story_analytics_api
 from apps.stats import views as stats_views
+from apps.stats import nepalikatha as nepalikatha_api
 from apps.users import api as users_api
 from apps.story.models import Author, Story, Blog, Tag, Theme, Genre, Category, published_story_q
 
@@ -258,6 +259,8 @@ def nepali_sitemap(request):
 
 
 urlpatterns = [
+    path("api/nepalikatha/events/", nepalikatha_api.NepalikathaEventAPIView.as_view(), name="nepalikatha-events"),
+    path("api/admin/analytics/nepalikatha/", nepalikatha_api.AdminNepalikathaAnalyticsAPIView.as_view(), name="admin-analytics-nepalikatha"),
     path("admin/", admin.site.urls),
     path("api/session-auth/", include("rest_framework.urls")),
     path("api/", include(router.urls)),

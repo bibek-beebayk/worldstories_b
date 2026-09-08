@@ -569,3 +569,21 @@ class UserAchievement(models.Model):
     def __str__(self):
         state = "completed" if self.completed else f"{self.progress}/{self.achievement.target_value}"
         return f"{self.user} — {self.achievement.name} ({state})"
+
+
+class NepalikathaEvent(models.Model):
+    """Companion-site telemetry only; never feeds main-site events or progress."""
+
+    event_id = models.UUIDField(unique=True)
+    event_type = models.CharField(max_length=12, choices=[("visit", "Visit"), ("read", "Active reading")])
+    visitor_id = models.UUIDField(db_index=True)
+    session_id = models.UUIDField(db_index=True)
+    path = models.CharField(max_length=500)
+    story = models.ForeignKey(Story, null=True, blank=True, on_delete=models.SET_NULL, related_name="nepalikatha_events")
+    # Preserve the ranking identity if a shared story is subsequently deleted.
+    story_slug = models.CharField(max_length=255, blank=True, default="")
+    duration_seconds = models.PositiveSmallIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        indexes = [models.Index(fields=["event_type", "created_at"], name="np_event_type_time_idx")]

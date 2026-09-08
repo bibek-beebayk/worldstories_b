@@ -149,6 +149,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework import status
 from rest_framework.exceptions import ValidationError
 from core.libs.pagination import PageNumberPagination
+from core.libs.site_sources import is_nepalikatha_request
 
 
 VIEW_DEDUPE_WINDOW = timedelta(hours=24)
@@ -246,11 +247,12 @@ def is_analytics_excluded_user(request):
     return bool(user and user.is_authenticated and (user.is_superuser or user.is_staff))
 
 
-def is_untracked_request(request):
+def is_untracked_request(request, *, companion=False):
     """Single gate for every analytics write: real, human, non-operator traffic
-    only. Kept in one place so the view counter and the event ingest endpoint
-    can't drift apart on what counts as a tracked visitor."""
-    return is_bot_request(request) or is_analytics_excluded_user(request)
+    only. Main-site writers also reject companion-site origins; the dedicated
+    companion endpoint opts into its own stream while retaining bot/operator exclusion."""
+    return (is_bot_request(request) or is_analytics_excluded_user(request)
+            or (not companion and is_nepalikatha_request(request)))
 
 
 # Chapters/audios are managed as a full per-story list in the admin panel
