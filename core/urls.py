@@ -60,7 +60,6 @@ def sitemap(request):
             "/story-map",
             "/audiobooks",
             "/watch",
-            "/authors",
             "/tags",
             "/themes",
             "/contest",
@@ -110,12 +109,6 @@ def sitemap(request):
         entries.append(
             f"<url><loc>{escape(f'{site_url}/blog/{blog.slug}')}</loc>"
             f"<lastmod>{blog.created_at.date().isoformat()}</lastmod></url>"
-        )
-
-    authors = Author.objects.all().only("id")
-    for author in authors.iterator():
-        entries.append(
-            f"<url><loc>{escape(f'{site_url}/authors/{author.id}')}</loc></url>"
         )
 
     # Tag/theme pages were orphaned (unreachable from the site) and thin (no
