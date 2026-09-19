@@ -19,6 +19,7 @@ class StoryFilter(filters.FilterSet):
     has_audio = filters.CharFilter(method="filter_has_audio", label="Has audio")
     has_video = filters.CharFilter(method="filter_has_video", label="Has video")
     has_summary = filters.CharFilter(method="filter_has_summary", label="Has summary")
+    has_read_along = filters.CharFilter(method="filter_has_read_along", label="Has read-along")
     is_original = filters.CharFilter(method="filter_is_original", label="WorldStories Original")
     show_in_nepali_site = filters.CharFilter(
         method="filter_show_in_nepali_site", label="On the Nepali site"
@@ -109,6 +110,34 @@ class StoryFilter(filters.FilterSet):
             return queryset.filter(no_summary)
         return queryset
 
+    def filter_has_read_along(self, queryset, name, value):
+        """Approximates AudioSerializer.get_read_along_available (audio_file
+        present + transcript has real content) at the DB level: a plain
+        emptiness check rather than the serializer's rich-text-content parse,
+        so a transcript holding only empty CKEditor markup (e.g. "<p></p>")
+        would count here but not there. Close enough for list filtering;
+        the per-audio value returned to the client still comes from the
+        serializer, which is where read-along availability actually gets
+        enforced.
+
+        The four conditions are combined into one Q so Django joins to a
+        single `audios` row per check (an existence test: "some audio has
+        both a file and a transcript") — chaining separate filter()/exclude()
+        calls here would instead let each condition match a *different* audio
+        row, which is not what "has a read-along track" means.
+        """
+        has_read_along_q = (
+            Q(audios__audio_file__isnull=False)
+            & ~Q(audios__audio_file__exact="")
+            & Q(audios__transcript__isnull=False)
+            & ~Q(audios__transcript__exact="")
+        )
+        if value.lower() == "true":
+            return queryset.filter(has_read_along_q).distinct()
+        if value.lower() == "false":
+            return queryset.exclude(has_read_along_q).distinct()
+        return queryset
+
     def filter_is_original(self, queryset, name, value):
         if value.lower() == "true":
             return queryset.filter(is_original=True)
@@ -143,4 +172,4 @@ class StoryFilter(filters.FilterSet):
 
     class Meta:
         model = Story
-        fields = ["status", "genres", "categories", "language", "story_type", "country", "has_audio", "has_video", "has_summary", "is_original", "sort", "q"]
+        fields = ["status", "genres", "categories", "language", "story_type", "country", "has_audio", "has_video", "has_summary", "has_read_along", "is_original", "sort", "q"]

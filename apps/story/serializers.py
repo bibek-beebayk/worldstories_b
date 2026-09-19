@@ -404,6 +404,7 @@ class StoryListSerializer(serializers.ModelSerializer):
     # has_audio()/has_video() methods, which call .exists() and N+1 per row).
     has_audio = serializers.SerializerMethodField()
     has_video = serializers.SerializerMethodField()
+    has_read_along = serializers.SerializerMethodField()
     reading_time_minutes = serializers.SerializerMethodField()
 
     @staticmethod
@@ -432,6 +433,17 @@ class StoryListSerializer(serializers.ModelSerializer):
 
     def get_has_video(self, obj):
         return self._has_related(obj, "videos")
+
+    def get_has_read_along(self, obj):
+        # Off the same "audios" prefetch has_audio already uses — no extra
+        # query. Mirrors AudioSerializer.get_read_along_available's own
+        # per-track rule (audio_file present + transcript has real content),
+        # not just StoryFilter.filter_has_read_along's cheaper DB-side
+        # emptiness check, since this runs in Python against already-loaded
+        # rows and can afford the exact rich-text parse.
+        prefetched = self._prefetched(obj, "audios")
+        rows = prefetched if prefetched is not None else obj.audios.all()
+        return any(audio.audio_file and rich_text_has_content(audio.transcript) for audio in rows)
 
     # Name only (not the full nested author object list responses use
     # elsewhere) — just enough for cards/fallback covers to credit the
@@ -491,6 +503,7 @@ class StoryListSerializer(serializers.ModelSerializer):
             "views",
             "has_audio",
             "has_video",
+            "has_read_along",
             "genres",
             "categories",
             "author",
