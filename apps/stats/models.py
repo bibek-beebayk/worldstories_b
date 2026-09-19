@@ -370,6 +370,18 @@ class AnalyticsEvent(models.Model):
     duration_seconds = models.FloatField(default=0)
     value = models.FloatField(default=0)
     metadata = models.JSONField(default=dict, blank=True)
+    # Coarse request provenance, written only by AnalyticsEventWriteSerializer
+    # (never taken from the client payload) so bot share can be measured after
+    # the fact. No raw IP or full User-Agent is ever stored: the country comes
+    # from Cloudflare's CF-IPCountry header, the IP is kept only as a keyed
+    # hash, and the UA is reduced to a coarse family bucket. Events the server
+    # raises itself leave all of these blank.
+    country_code = models.CharField(max_length=2, blank=True, default="", db_index=True)
+    ip_hash = models.CharField(max_length=64, blank=True, default="", db_index=True)
+    ua_family = models.CharField(max_length=32, blank=True, default="")
+    # Set by the flag_suspected_bots management command, never at ingest.
+    # Dashboard audience metrics exclude these rows; nothing is deleted.
+    is_suspected_bot = models.BooleanField(default=False, db_index=True)
     created_at = models.DateTimeField(auto_now_add=True, db_index=True)
 
     class Meta:

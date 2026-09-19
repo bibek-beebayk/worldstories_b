@@ -51,6 +51,14 @@ def audience_only(queryset):
     return queryset.filter(AUDIENCE_Q)
 
 
+def audience_events(queryset):
+    """audience_only() for AnalyticsEvent querysets, which additionally drops
+    rows flagged by the flag_suspected_bots command. Kept separate because
+    audience_only() is also applied to models with a user FK that have no
+    is_suspected_bot column."""
+    return audience_only(queryset).filter(is_suspected_bot=False)
+
+
 ALLOWED_RANGE_DAYS = (1, 7, 30, 90, 365)
 DEFAULT_RANGE_DAYS = 30
 CACHE_SECONDS = 60 * 5
@@ -220,7 +228,7 @@ def build_content_rankings(days, kind):
         ):
             metrics[row["story_id"]]["views"] = row["count"]
 
-    events = audience_only(AnalyticsEvent.objects.filter(created_at__gte=cutoff))
+    events = audience_events(AnalyticsEvent.objects.filter(created_at__gte=cutoff))
     events = events.filter(story_id__in=title_ids) if is_story else events.filter(blog_id__in=title_ids)
     id_field = "story_id" if is_story else "blog_id"
     event_interaction_types = {
@@ -382,7 +390,7 @@ def build_detail_time_series(days, *, story=None, blog=None):
             if bucket:
                 bucket["views"] += 1
 
-    events = audience_only(AnalyticsEvent.objects.filter(created_at__gte=cutoff, created_at__lte=now))
+    events = audience_events(AnalyticsEvent.objects.filter(created_at__gte=cutoff, created_at__lte=now))
     events = events.filter(story=story) if story is not None else events.filter(blog=blog)
     interaction_types = {
         AnalyticsEvent.EVENT_COMPLETION,
@@ -848,7 +856,7 @@ def build_engagement_metrics_data(days):
     a bad one.
     """
     cutoff = get_cutoff(days)
-    events = audience_only(AnalyticsEvent.objects.filter(created_at__gte=cutoff))
+    events = audience_events(AnalyticsEvent.objects.filter(created_at__gte=cutoff))
 
     def count(event_type):
         return events.filter(event_type=event_type).count()
@@ -1062,7 +1070,7 @@ EMPTY_DAILY_ACTIVITY = {
 
 def build_audience_data(days):
     cutoff = get_cutoff(days)
-    events = audience_only(AnalyticsEvent.objects.filter(created_at__gte=cutoff))
+    events = audience_events(AnalyticsEvent.objects.filter(created_at__gte=cutoff))
 
     daily_events = (
         events.annotate(day=time_trunc("created_at", days))
@@ -1108,7 +1116,7 @@ def build_audience_data(days):
         )
         entry["read_along_minutes"] = round((row["duration_seconds"] or 0) / 60, 1)
 
-    visit_events = audience_only(AnalyticsEvent.objects.filter(event_type=AnalyticsEvent.EVENT_VISIT))
+    visit_events = audience_events(AnalyticsEvent.objects.filter(event_type=AnalyticsEvent.EVENT_VISIT))
     authenticated_first = {
         f"u:{row['user_id']}": row["first_seen"]
         for row in visit_events.filter(user_id__isnull=False)
@@ -1278,12 +1286,36 @@ def build_audience_data(days):
         .annotate(count=Count("id"))
         .order_by("-count")
     )
-    referral_sources = list(
+    # Grouped in SQL by the raw value, then merged here: a visit with the key
+    # missing/blank and one with "direct" are the same source, as are
+    # differently-cased or padded spellings. "internal" is in-app navigation,
+    # not a way the visitor arrived, so it is left out of this table.
+    referral_counts = {}
+    for row in (
         events.filter(event_type=AnalyticsEvent.EVENT_VISIT)
         .values("metadata__referral_source")
         .annotate(count=Count("id"))
-        .order_by("-count")
+    ):
+        source = str(row["metadata__referral_source"] or "").strip().lower() or "direct"
+        if source == "internal":
+            continue
+        referral_counts[source] = referral_counts.get(source, 0) + row["count"]
+    referral_sources = sorted(referral_counts.items(), key=lambda item: (-item[1], item[0]))
+    countries = list(
+        events.exclude(country_code="")
+        .values("country_code")
+        .annotate(visitors=Count("visitor_id", distinct=True))
+        .order_by("-visitors", "country_code")[:15]
     )
+    ua_families = list(
+        events.exclude(ua_family="")
+        .values("ua_family")
+        .annotate(visitors=Count("visitor_id", distinct=True))
+        .order_by("-visitors", "ua_family")
+    )
+    suspected_bot_events = audience_only(
+        AnalyticsEvent.objects.filter(created_at__gte=cutoff, is_suspected_bot=True)
+    ).count()
     top_downloads = list(
         events.filter(event_type=AnalyticsEvent.EVENT_DOWNLOAD, story_id__isnull=False)
         .values("story_id", "story__title", "story__slug")
@@ -1362,6 +1394,7 @@ def build_audience_data(days):
             else 0,
             "total_page_views": total_page_views,
             "median_browsing_session_minutes": median_browsing_session_minutes,
+            "suspected_bot_events": suspected_bot_events,
         },
         "daily_activity": fill_time_buckets(
             list(daily.values()), days, defaults=EMPTY_DAILY_ACTIVITY
@@ -1400,11 +1433,13 @@ def build_audience_data(days):
             for row in ad_impressions_by_content_type
         ],
         "referral_sources": [
-            {
-                "referral_source": row["metadata__referral_source"] or "direct",
-                "count": row["count"],
-            }
-            for row in referral_sources
+            {"referral_source": source, "count": count} for source, count in referral_sources
+        ],
+        "countries": [
+            {"country_code": row["country_code"], "visitors": row["visitors"]} for row in countries
+        ],
+        "ua_families": [
+            {"ua_family": row["ua_family"], "visitors": row["visitors"]} for row in ua_families
         ],
         "top_downloads": [
             {
@@ -1614,6 +1649,8 @@ SECTION_TABLE_KEYS = {
         "completion_types",
         "ad_impressions_by_content_type",
         "referral_sources",
+        "countries",
+        "ua_families",
         "top_downloads",
         "top_listened",
         "top_read_along",
@@ -1784,7 +1821,7 @@ def build_story_detail_data(story, days):
         .order_by("chapter__order")
     )
 
-    events = audience_only(AnalyticsEvent.objects.filter(story=story, created_at__gte=cutoff))
+    events = audience_events(AnalyticsEvent.objects.filter(story=story, created_at__gte=cutoff))
     reading_seconds = events.filter(event_type=AnalyticsEvent.EVENT_READING_SESSION).aggregate(
         total=Sum("duration_seconds")
     )["total"] or 0
@@ -1865,7 +1902,7 @@ def build_blog_detail_data(blog, days):
     # Visits now carry the blog FK directly; the metadata__path match is kept
     # as an OR so rows written before DefaultLayout started sending blog_slug
     # still count here.
-    visit_qs = audience_only(
+    visit_qs = audience_events(
         AnalyticsEvent.objects.filter(
             Q(blog=blog) | Q(metadata__path=f"/blog/{blog.slug}"),
             event_type=AnalyticsEvent.EVENT_VISIT,
@@ -1877,7 +1914,7 @@ def build_blog_detail_data(blog, days):
         for user_id, visitor_id in visit_qs.values_list("user_id", "visitor_id")
     }
 
-    reading_sessions = audience_only(
+    reading_sessions = audience_events(
         AnalyticsEvent.objects.filter(
             event_type=AnalyticsEvent.EVENT_READING_SESSION, blog=blog, created_at__gte=cutoff
         )
@@ -1943,7 +1980,7 @@ def build_quick_read_detail_time_series(story, days):
         AnalyticsEvent.EVENT_QUICK_READ_FULL_STORY_CLICKED,
         AnalyticsEvent.EVENT_READING_SESSION,
     }
-    events = audience_only(
+    events = audience_events(
         AnalyticsEvent.objects.filter(
             story=story,
             created_at__gte=cutoff,
@@ -1977,7 +2014,7 @@ def build_quick_read_detail_time_series(story, days):
 
 def build_quick_read_detail_data(story, days):
     cutoff = get_cutoff(days)
-    events = audience_only(
+    events = audience_events(
         AnalyticsEvent.objects.filter(story=story, created_at__gte=cutoff)
     )
     opened = events.filter(event_type=AnalyticsEvent.EVENT_QUICK_READ_OPENED)

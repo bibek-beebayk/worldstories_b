@@ -3,6 +3,7 @@ import json
 from rest_framework import serializers
 
 from apps.story.models import Chapter, Audio, Video, Story, Blog
+from apps.stats.request_meta import request_provenance
 from apps.stats.models import (
     AnalyticsEvent,
     ReadingProgress,
@@ -259,6 +260,9 @@ class AnalyticsEventWriteSerializer(serializers.Serializer):
             event_id=validated_data.pop("event_id"),
             defaults={
                 **validated_data,
+                # Server-derived only; not serializer fields, so a client
+                # payload can never set them.
+                **request_provenance(request),
                 "story": story,
                 "blog": blog,
                 "user": request.user if request.user.is_authenticated else None,

@@ -9,6 +9,10 @@ load_dotenv(PROJECT_ROOT / ".env")
 from django.utils import timezone
 
 SECRET_KEY = os.environ["SECRET_KEY"]
+# Keys the HMAC that anonymises client IPs on analytics events; falls back to
+# SECRET_KEY when unset. Rotating it changes every ip_hash (dedupe across the
+# rotation is lost), so set it once.
+ANALYTICS_IP_HASH_KEY = os.environ.get("ANALYTICS_IP_HASH_KEY", "")
 
 
 # Application definition

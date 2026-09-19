@@ -2158,3 +2158,314 @@ class EngagementMetricsApiTests(APITestCase):
         )
 
         self.assertEqual(response.status_code, 403)
+
+
+# --- Request provenance (country / ip_hash / ua_family) and bot-share tools ---
+
+import hashlib
+import hmac
+import io
+import zipfile
+from io import StringIO
+
+from django.conf import settings
+from django.core.management import call_command
+from django.test import RequestFactory
+
+from .request_meta import country_code_from_request, hash_ip, ua_family
+
+
+class RequestMetaHelperTests(SimpleTestCase):
+    def _request(self, **meta):
+        return RequestFactory().post("/", **meta)
+
+    def test_country_header_parsing(self):
+        cases = [
+            ({"HTTP_CF_IPCOUNTRY": "NP"}, "NP"),
+            ({"HTTP_CF_IPCOUNTRY": " np "}, "NP"),
+            ({"HTTP_CF_IPCOUNTRY": "XX"}, ""),
+            ({"HTTP_CF_IPCOUNTRY": "T1"}, ""),
+            ({"HTTP_CF_IPCOUNTRY": "USA"}, ""),
+            ({"HTTP_CF_IPCOUNTRY": "1A"}, ""),
+            ({"HTTP_CF_IPCOUNTRY": ""}, ""),
+            ({}, ""),
+        ]
+        for meta, expected in cases:
+            with self.subTest(meta=meta):
+                self.assertEqual(country_code_from_request(self._request(**meta)), expected)
+
+    def test_ip_hash_is_stable_keyed_and_not_the_ip(self):
+        first = hash_ip("203.0.113.7")
+        self.assertEqual(first, hash_ip("203.0.113.7"))
+        self.assertNotEqual(first, hash_ip("203.0.113.8"))
+        self.assertEqual(len(first), 64)
+        self.assertNotIn("203.0.113.7", first)
+        expected = hmac.new(
+            (getattr(settings, "ANALYTICS_IP_HASH_KEY", "") or settings.SECRET_KEY).encode(),
+            b"203.0.113.7",
+            hashlib.sha256,
+        ).hexdigest()
+        self.assertEqual(first, expected)
+        self.assertEqual(hash_ip(""), "")
+        self.assertEqual(hash_ip(None), "")
+
+    def test_ua_family_buckets(self):
+        cases = {
+            BROWSER_USER_AGENT: "chrome_desktop",
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 "
+            "(KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1": "safari_mobile",
+            "Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0": "firefox_desktop",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0": "edge_desktop",
+            "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) "
+            "SamsungBrowser/24.0 Chrome/117.0.0.0 Mobile Safari/537.36": "samsung_mobile",
+            "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Mobile Safari/537.36 [FB_IAB/FB4A;FBAV/450.0.0.0;]": "facebook_app_mobile",
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 "
+            "Mobile/15E148 Instagram 320.0.0.0": "instagram_app_mobile",
+            "curl/8.0": "other_desktop",
+            "": "",
+        }
+        for user_agent, expected in cases.items():
+            with self.subTest(user_agent=user_agent[:40]):
+                self.assertEqual(ua_family(user_agent), expected)
+
+
+class AnalyticsEventProvenanceTests(APITestCase):
+    def setUp(self):
+        cache.clear()
+        self.client = APIClient(HTTP_USER_AGENT=BROWSER_USER_AGENT)
+
+    def _payload(self, **overrides):
+        return {
+            "event_id": str(uuid4()),
+            "event_type": AnalyticsEvent.EVENT_VISIT,
+            "visitor_id": "provenance-visitor",
+            "metadata": {"path": "/"},
+            **overrides,
+        }
+
+    def test_server_derives_country_ip_hash_and_ua_family(self):
+        response = self.client.post(
+            reverse("analytics-events"),
+            self._payload(),
+            format="json",
+            HTTP_CF_IPCOUNTRY="np",
+            HTTP_X_FORWARDED_FOR="198.51.100.9, 10.0.0.1",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        event = AnalyticsEvent.objects.get()
+        self.assertEqual(event.country_code, "NP")
+        self.assertEqual(event.ip_hash, hash_ip("198.51.100.9"))
+        self.assertNotEqual(event.ip_hash, "198.51.100.9")
+        self.assertNotIn("198.51.100.9", event.ip_hash)
+        self.assertEqual(event.ua_family, "chrome_desktop")
+        self.assertFalse(event.is_suspected_bot)
+
+    def test_ip_hash_is_stable_across_events_from_one_ip(self):
+        for _ in range(2):
+            self.client.post(
+                reverse("analytics-events"), self._payload(event_id=str(uuid4())),
+                format="json", REMOTE_ADDR="192.0.2.44",
+            )
+        hashes = set(AnalyticsEvent.objects.values_list("ip_hash", flat=True))
+        self.assertEqual(len(hashes), 1)
+        self.assertNotIn("", hashes)
+
+    def test_unknown_or_missing_country_is_blank(self):
+        for header in ({"HTTP_CF_IPCOUNTRY": "XX"}, {"HTTP_CF_IPCOUNTRY": "T1"}, {}):
+            self.client.post(
+                reverse("analytics-events"), self._payload(event_id=str(uuid4())),
+                format="json", **header,
+            )
+        self.assertEqual(set(AnalyticsEvent.objects.values_list("country_code", flat=True)), {""})
+
+    def test_client_payload_cannot_set_provenance_fields(self):
+        self.client.post(
+            reverse("analytics-events"),
+            self._payload(
+                country_code="ZZ",
+                ip_hash="f" * 64,
+                ua_family="forged_desktop",
+                is_suspected_bot=True,
+            ),
+            format="json",
+            HTTP_CF_IPCOUNTRY="IN",
+            REMOTE_ADDR="192.0.2.50",
+        )
+        event = AnalyticsEvent.objects.get()
+        self.assertEqual(event.country_code, "IN")
+        self.assertEqual(event.ip_hash, hash_ip("192.0.2.50"))
+        self.assertEqual(event.ua_family, "chrome_desktop")
+        self.assertFalse(event.is_suspected_bot)
+
+    def test_bot_user_agent_is_still_dropped(self):
+        crawler = APIClient(HTTP_USER_AGENT="Mozilla/5.0 (compatible; Googlebot/2.1)")
+        response = crawler.post(
+            reverse("analytics-events"), self._payload(), format="json", HTTP_CF_IPCOUNTRY="US"
+        )
+        self.assertEqual(response.status_code, 202)
+        self.assertFalse(AnalyticsEvent.objects.exists())
+
+    def test_server_raised_events_leave_provenance_blank(self):
+        event = AnalyticsEvent.objects.create(
+            event_type=AnalyticsEvent.EVENT_STORY_COMPLETED,
+            visitor_id=AnalyticsEvent.SERVER_VISITOR_ID,
+        )
+        self.assertEqual((event.country_code, event.ip_hash, event.ua_family), ("", "", ""))
+
+
+class FlagSuspectedBotsCommandTests(APITestCase):
+    BOT_IP = "a" * 64
+    BUSY_IP = "b" * 64
+    SMALL_IP = "c" * 64
+
+    def _visit(self, visitor_id, ip_hash, user=None):
+        return AnalyticsEvent.objects.create(
+            event_type=AnalyticsEvent.EVENT_VISIT,
+            visitor_id=visitor_id,
+            ip_hash=ip_hash,
+            user=user,
+        )
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            email="member@example.com", username="member", password="test-password"
+        )
+        # 16 visitors, visits only: the shape that should be flagged.
+        for i in range(16):
+            self._visit(f"bot-{i}", self.BOT_IP)
+        # A logged-in row on the same IP must never be flagged.
+        self.user_event = self._visit("member-browser", self.BOT_IP, user=self.user)
+        # 16 visitors behind one IP (e.g. carrier NAT) but one actually read.
+        for i in range(16):
+            self._visit(f"nat-{i}", self.BUSY_IP)
+        AnalyticsEvent.objects.create(
+            event_type=AnalyticsEvent.EVENT_READING_SESSION,
+            visitor_id="nat-3",
+            ip_hash=self.BUSY_IP,
+            duration_seconds=30,
+        )
+        # Under the threshold.
+        for i in range(5):
+            self._visit(f"small-{i}", self.SMALL_IP)
+        # Old rows without a hash are ignored entirely.
+        AnalyticsEvent.objects.create(event_type=AnalyticsEvent.EVENT_VISIT, visitor_id="legacy")
+
+    def _run(self, *args):
+        out = StringIO()
+        call_command("flag_suspected_bots", *args, stdout=out)
+        return out.getvalue()
+
+    def test_dry_run_writes_nothing(self):
+        output = self._run()
+        self.assertIn("DRY RUN", output)
+        self.assertIn("Would flag 16 events from 16 visitors across 1 ip_hashes", output)
+        self.assertIn(self.BOT_IP[:8], output)
+        self.assertFalse(AnalyticsEvent.objects.filter(is_suspected_bot=True).exists())
+
+    def test_apply_flags_only_zero_engagement_anonymous_visitors(self):
+        output = self._run("--apply")
+        self.assertIn("Flagged 16 events", output)
+        flagged = AnalyticsEvent.objects.filter(is_suspected_bot=True)
+        self.assertEqual(flagged.count(), 16)
+        self.assertTrue(all(v.startswith("bot-") for v in flagged.values_list("visitor_id", flat=True)))
+        self.user_event.refresh_from_db()
+        self.assertFalse(self.user_event.is_suspected_bot)
+        self.assertFalse(AnalyticsEvent.objects.filter(ip_hash=self.BUSY_IP, is_suspected_bot=True).exists())
+        self.assertFalse(AnalyticsEvent.objects.filter(ip_hash=self.SMALL_IP, is_suspected_bot=True).exists())
+
+    def test_threshold_option_changes_what_is_flagged(self):
+        self._run("--apply", "--min-visitors-per-ip", "3")
+        self.assertTrue(AnalyticsEvent.objects.filter(ip_hash=self.SMALL_IP, is_suspected_bot=True).exists())
+        self.assertFalse(AnalyticsEvent.objects.filter(ip_hash=self.BUSY_IP, is_suspected_bot=True).exists())
+
+    def test_unflag_is_dry_run_until_applied(self):
+        self._run("--apply")
+        self._run("--unflag")
+        self.assertEqual(AnalyticsEvent.objects.filter(is_suspected_bot=True).count(), 16)
+        self._run("--unflag", "--apply")
+        self.assertFalse(AnalyticsEvent.objects.filter(is_suspected_bot=True).exists())
+
+
+class AudienceDashboardBotShareTests(APITestCase):
+    def setUp(self):
+        cache.clear()
+        self.admin = User.objects.create_user(
+            email="admin2@example.com", username="admin2", password="test-password",
+            is_superuser=True, is_staff=True,
+        )
+        self.client.force_authenticate(self.admin)
+
+    def _visit(self, visitor_id, **fields):
+        return AnalyticsEvent.objects.create(
+            event_type=AnalyticsEvent.EVENT_VISIT, visitor_id=visitor_id, **fields
+        )
+
+    def _audience(self):
+        cache.clear()
+        response = self.client.get(reverse("admin-analytics-audience"), {"days": 30})
+        self.assertEqual(response.status_code, 200)
+        return response.data
+
+    def test_flagged_rows_are_excluded_and_counted(self):
+        self._visit("human", country_code="NP", ua_family="chrome_mobile")
+        self._visit("bot-a", is_suspected_bot=True, country_code="US", ua_family="other_desktop")
+        self._visit("bot-b", is_suspected_bot=True, country_code="US", ua_family="other_desktop")
+
+        data = self._audience()
+
+        self.assertEqual(data["summary"]["visitors"], 1)
+        self.assertEqual(data["summary"]["total_page_views"], 1)
+        self.assertEqual(data["summary"]["suspected_bot_events"], 2)
+        self.assertEqual(data["countries"], [{"country_code": "NP", "visitors": 1}])
+        self.assertEqual(data["ua_families"], [{"ua_family": "chrome_mobile", "visitors": 1}])
+
+    def test_countries_and_ua_families_count_distinct_visitors_and_skip_blanks(self):
+        self._visit("v1", country_code="NP", ua_family="chrome_mobile")
+        self._visit("v1", country_code="NP", ua_family="chrome_mobile")
+        self._visit("v2", country_code="NP", ua_family="safari_mobile")
+        self._visit("v3", country_code="IN", ua_family="chrome_mobile")
+        self._visit("v4")
+
+        data = self._audience()
+
+        self.assertEqual(
+            data["countries"],
+            [{"country_code": "NP", "visitors": 2}, {"country_code": "IN", "visitors": 1}],
+        )
+        self.assertEqual(
+            data["ua_families"],
+            [{"ua_family": "chrome_mobile", "visitors": 2}, {"ua_family": "safari_mobile", "visitors": 1}],
+        )
+
+    def test_referral_sources_merge_direct_and_drop_internal(self):
+        self._visit("r1")  # key missing
+        self._visit("r2", metadata={"referral_source": "direct"})
+        self._visit("r3", metadata={"referral_source": " Direct "})
+        self._visit("r4", metadata={"referral_source": ""})
+        self._visit("r5", metadata={"referral_source": "internal"})
+        self._visit("r6", metadata={"referral_source": "Facebook"})
+        self._visit("r7", metadata={"referral_source": "facebook"})
+
+        data = self._audience()
+
+        sources = {row["referral_source"]: row["count"] for row in data["referral_sources"]}
+        self.assertEqual(sources, {"direct": 4, "facebook": 2})
+        self.assertEqual(data["referral_sources"][0]["referral_source"], "direct")
+
+    def test_export_includes_country_and_ua_family_tables(self):
+        self._visit("human", country_code="NP", ua_family="chrome_mobile")
+        cache.clear()
+
+        response = self.client.get(
+            reverse("admin-analytics-export"),
+            {"sections": "audience", "file_format": "csv", "days": 30},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        names = zipfile.ZipFile(io.BytesIO(response.content)).namelist()
+        self.assertIn("audience_countries.csv", names)
+        self.assertIn("audience_ua_families.csv", names)
+        self.assertIn("audience_summary.csv", names)
