@@ -10,7 +10,14 @@ from rest_framework.throttling import SimpleRateThrottle
 
 from apps.story.api import IsSuperUser, is_untracked_request
 from apps.story.models import Story, published_story_q
-from apps.story.analytics_api import get_range_days, get_cutoff, get_time_interval, time_trunc, fill_time_buckets
+from apps.story.analytics_api import (
+    fill_time_buckets,
+    filter_since,
+    get_cutoff,
+    get_range_days,
+    get_time_interval,
+    time_trunc,
+)
 from .models import NepalikathaEvent
 
 
@@ -71,7 +78,9 @@ class AdminNepalikathaAnalyticsAPIView(APIView):
 
     def get(self, request):
         days = get_range_days(request)
-        events = NepalikathaEvent.objects.filter(created_at__gte=get_cutoff(days), created_at__lte=timezone.now())
+        events = filter_since(
+            NepalikathaEvent.objects.filter(created_at__lte=timezone.now()), get_cutoff(days)
+        )
         reads = events.filter(event_type="read")
         seconds = reads.aggregate(total=Sum("duration_seconds"))["total"] or 0
         readers = reads.values("visitor_id").distinct().count()

@@ -13,7 +13,10 @@ from apps.story.models import (
     Chapter,
     DailyStory,
     Genre,
+    Favorite,
+    Review,
     Story,
+    StoryType,
     StoryJourney,
     StoryJourneyItem,
     StoryView,
@@ -749,6 +752,144 @@ class AdminAudienceAnalyticsApiTests(APITestCase):
         self.assertEqual(response.status_code, 403)
 
 
+class PerTitleLifetimeAnalyticsTests(APITestCase):
+    def setUp(self):
+        cache.clear()
+        self.admin = User.objects.create_user(
+            email="lifetime-admin@example.com", username="lifetime-admin",
+            password="test-password", is_superuser=True, is_staff=True,
+        )
+        self.reader = User.objects.create_user(
+            email="lifetime-reader@example.com", username="lifetime-reader",
+            password="test-password",
+        )
+        self.story_type = StoryType.objects.create(name="Lifetime Type")
+        self.story = Story.objects.create(
+            title="Lifetime Story", slug="lifetime-story", is_published=True, views=42,
+            story_type=self.story_type,
+        )
+        self.other_story = Story.objects.create(
+            title="Other Story", slug="other-story", is_published=True,
+            story_type=self.story_type,
+        )
+        self.client.force_authenticate(self.admin)
+
+    def _event(self, story, visitor_id, event_type, *, age_days=0, **fields):
+        event = AnalyticsEvent.objects.create(
+            story=story, visitor_id=visitor_id, event_type=event_type, **fields
+        )
+        if age_days:
+            AnalyticsEvent.objects.filter(pk=event.pk).update(
+                created_at=timezone.now() - timedelta(days=age_days)
+            )
+        return event
+
+    def test_all_is_unbounded_and_lifetime_is_range_independent(self):
+        self._event(
+            self.story, "old-reader", AnalyticsEvent.EVENT_READING_SESSION,
+            age_days=400, duration_seconds=120,
+        )
+        self._event(
+            self.story, "recent-reader", AnalyticsEvent.EVENT_READING_SESSION,
+            duration_seconds=60,
+        )
+        self._event(self.story, "human", AnalyticsEvent.EVENT_DOWNLOAD, age_days=400)
+        self._event(
+            self.story, "bot", AnalyticsEvent.EVENT_DOWNLOAD,
+            is_suspected_bot=True,
+        )
+        Chapter.objects.create(
+            story=self.story, title="Chapter", slug="chapter", content="x", order=1
+        )
+        progress = ReadingProgress.objects.create(user=self.reader, story=self.story, progress=1)
+        ReadingProgress.objects.filter(pk=progress.pk).update(
+            updated_at=timezone.now() - timedelta(hours=10)
+        )
+        completion = StoryCompletion.objects.create(
+            user=self.reader, story=self.story, source=StoryCompletion.SOURCE_CHAPTERS
+        )
+        StoryCompletion.objects.filter(pk=completion.pk).update(
+            completed_at=timezone.now() - timedelta(hours=4)
+        )
+        Favorite.objects.create(user=self.reader, story=self.story)
+        Review.objects.create(user=self.reader, story=self.story, rating=4)
+
+        all_data = self.client.get(
+            reverse("admin-analytics-story-detail", args=[self.story.slug]), {"days": "all"}
+        ).data
+        day_data = self.client.get(
+            reverse("admin-analytics-story-detail", args=[self.story.slug]), {"days": 1}
+        ).data
+
+        self.assertEqual(all_data["range_days"], "all")
+        self.assertEqual(all_data["reading_minutes"], 3)
+        self.assertEqual(day_data["reading_minutes"], 1)
+        self.assertEqual(all_data["lifetime"], day_data["lifetime"])
+        self.assertEqual(all_data["lifetime"]["total_views"], 42)
+        self.assertEqual(all_data["lifetime"]["total_downloads"], 1)
+        self.assertEqual(all_data["lifetime"]["median_time_to_completion_hours"], 6)
+        self.assertEqual(all_data["time_series"]["interval"], "month")
+        self.assertEqual(len(all_data["time_series"]["points"]), 24)
+
+    def test_referrals_and_countries_are_title_scoped_and_drop_bots(self):
+        self._event(
+            self.story, "story-reader", AnalyticsEvent.EVENT_VISIT,
+            country_code="NP", metadata={"referral_source": " Search "},
+        )
+        self._event(
+            self.other_story, "other-reader", AnalyticsEvent.EVENT_VISIT,
+            country_code="US", metadata={"referral_source": "other"},
+        )
+        self._event(
+            self.story, "bot", AnalyticsEvent.EVENT_VISIT,
+            country_code="GB", metadata={"referral_source": "bot"},
+            is_suspected_bot=True,
+        )
+
+        data = self.client.get(
+            reverse("admin-analytics-story-detail", args=[self.story.slug]), {"days": 30}
+        ).data
+
+        self.assertEqual(data["referral_sources"], [{"referral_source": "search", "count": 1}])
+        self.assertEqual(data["countries"], [{"country_code": "NP", "visitors": 1}])
+
+    def test_chapter_dropoff_normalizes_different_story_lengths(self):
+        long_reader = User.objects.create_user(
+            email="long-reader@example.com", username="long-reader", password="test-password"
+        )
+        long_story = Story.objects.create(
+            title="Long Story", slug="long-story", is_published=True,
+            story_type=self.story_type,
+        )
+        short_chapters = [
+            Chapter.objects.create(
+                story=self.story, title=f"Short {order}", slug=f"short-{order}",
+                content="x", order=order,
+            )
+            for order in range(1, 6)
+        ]
+        long_chapters = [
+            Chapter.objects.create(
+                story=long_story, title=f"Long {order}", slug=f"long-{order}",
+                content="x", order=order,
+            )
+            for order in range(1, 21)
+        ]
+        ChapterReadingProgress.objects.create(
+            user=self.reader, story=self.story, chapter=short_chapters[3], progress=0.8
+        )
+        ChapterReadingProgress.objects.create(
+            user=long_reader, story=long_story, chapter=long_chapters[15], progress=0.6
+        )
+
+        data = self.client.get(reverse("admin-analytics-engagement"), {"days": 30}).data
+        bucket = next(
+            row for row in data["chapter_dropoff"] if row["position_bucket"] == "75-100%"
+        )
+        self.assertEqual(bucket["readers"], 2)
+        self.assertEqual(bucket["avg_progress"], 0.7)
+
+
 class AdminContentAnalyticsApiTests(APITestCase):
     def setUp(self):
         cache.clear()
@@ -819,6 +960,11 @@ class AdminContentAnalyticsApiTests(APITestCase):
 
         last_90_days = self.client.get(reverse("admin-analytics-content"), {"days": 90})
         self.assertEqual(last_90_days.data["time_interval"], "week")
+
+        all_time = self.client.get(reverse("admin-analytics-content"), {"days": "all"})
+        self.assertEqual(all_time.status_code, 200)
+        self.assertEqual(all_time.data["range_days"], "all")
+        self.assertEqual(all_time.data["time_interval"], "month")
 
     def test_content_analytics_includes_ranked_story_and_blog_metrics(self):
         StoryView.objects.create(story=self.plain_story, ip_address="127.0.0.1")
