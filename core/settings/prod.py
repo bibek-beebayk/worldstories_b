@@ -34,6 +34,7 @@ _EXTRA_ORIGINS = [
 
 _ALLOWED_ORIGINS = [
     "https://worldstories-b-production.up.railway.app",
+    "https://api.worldstories.net",
     "https://worldstories-f.netlify.app",
     "http://localhost:8080",
     "http://127.0.0.1:8080",
