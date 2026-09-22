@@ -5,7 +5,7 @@ from core.settings.base import BASE_DIR, MIDDLEWARE
 
 DEBUG = False
 
-ALLOWED_HOSTS = ["worldstories-b-production.up.railway.app"]
+ALLOWED_HOSTS = ["worldstories-b-production.up.railway.app", "api.worldstories.net"]
 
 # HTTPS / cookie hardening. Railway terminates TLS at a proxy in front of the
 # app and forwards plain HTTP internally, so SECURE_PROXY_SSL_HEADER must
