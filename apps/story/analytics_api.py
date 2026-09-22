@@ -4,6 +4,7 @@ import json
 import statistics
 import zipfile
 from datetime import datetime, timedelta
+from unittest.mock import patch
 
 from django.db.models import Avg, Count, Min, Q, Sum
 from django.db.models.functions import TruncDate, TruncHour, TruncMonth, TruncWeek
@@ -98,6 +99,18 @@ def filter_since(queryset, cutoff, field="created_at"):
     if cutoff is None:
         return queryset
     return queryset.filter(**{f"{field}__gte": cutoff})
+
+
+def build_with_previous_period(builder, days, *args, **kwargs):
+    """Build the selected window and its immediately preceding equal window."""
+    current = builder(*args, days, **kwargs)
+    if days == "all":
+        current["comparison"] = None
+        return current
+    previous_end = timezone.now() - timedelta(days=days)
+    with patch("apps.story.analytics_api.timezone.now", return_value=previous_end):
+        current["comparison"] = builder(*args, days, **kwargs)
+    return current
 
 
 def resolve_interval(days, date_only=False):
@@ -1565,7 +1578,7 @@ class AdminAnalyticsContentAPIView(APIView):
 
     @method_decorator(cache_page(CACHE_SECONDS))
     def get(self, request):
-        return Response(build_content_data(get_range_days(request)))
+        return Response(build_with_previous_period(build_content_data, get_range_days(request)))
 
 
 class AdminAnalyticsContentRankingsAPIView(APIView):
@@ -1606,7 +1619,7 @@ class AdminAnalyticsEngagementAPIView(APIView):
 
     @method_decorator(cache_page(CACHE_SECONDS))
     def get(self, request):
-        return Response(build_engagement_data(get_range_days(request)))
+        return Response(build_with_previous_period(build_engagement_data, get_range_days(request)))
 
 
 class AdminAnalyticsUsersAPIView(APIView):
@@ -1614,7 +1627,7 @@ class AdminAnalyticsUsersAPIView(APIView):
 
     @method_decorator(cache_page(CACHE_SECONDS))
     def get(self, request):
-        return Response(build_users_data(get_range_days(request)))
+        return Response(build_with_previous_period(build_users_data, get_range_days(request)))
 
 
 class AdminAnalyticsGeographyAPIView(APIView):
@@ -1626,7 +1639,7 @@ class AdminAnalyticsGeographyAPIView(APIView):
 
     @method_decorator(cache_page(CACHE_SECONDS))
     def get(self, request):
-        return Response(build_geography_data(get_range_days(request)))
+        return Response(build_with_previous_period(build_geography_data, get_range_days(request)))
 
 
 class AdminAnalyticsEngagementMetricsAPIView(APIView):
@@ -1636,7 +1649,7 @@ class AdminAnalyticsEngagementMetricsAPIView(APIView):
 
     @method_decorator(cache_page(CACHE_SECONDS))
     def get(self, request):
-        return Response(build_engagement_metrics_data(get_range_days(request)))
+        return Response(build_with_previous_period(build_engagement_metrics_data, get_range_days(request)))
 
 
 class AdminAnalyticsSubmissionsAPIView(APIView):
@@ -1644,7 +1657,7 @@ class AdminAnalyticsSubmissionsAPIView(APIView):
 
     @method_decorator(cache_page(CACHE_SECONDS))
     def get(self, request):
-        return Response(build_submissions_data(get_range_days(request)))
+        return Response(build_with_previous_period(build_submissions_data, get_range_days(request)))
 
 
 class AdminAnalyticsAudienceAPIView(APIView):
@@ -1652,7 +1665,7 @@ class AdminAnalyticsAudienceAPIView(APIView):
 
     @method_decorator(cache_page(CACHE_SECONDS))
     def get(self, request):
-        return Response(build_audience_data(get_range_days(request)))
+        return Response(build_with_previous_period(build_audience_data, get_range_days(request)))
 
 
 EXPORT_SECTION_BUILDERS = {
@@ -2241,7 +2254,9 @@ class AdminStoryDetailAnalyticsAPIView(APIView):
 
     def get(self, request, story_slug):
         story = get_object_or_404(Story.objects.published(), slug=story_slug)
-        return Response(build_story_detail_data(story, get_range_days(request)))
+        return Response(build_with_previous_period(
+            build_story_detail_data, get_range_days(request), story
+        ))
 
 
 class AdminBlogDetailAnalyticsAPIView(APIView):
@@ -2253,7 +2268,9 @@ class AdminBlogDetailAnalyticsAPIView(APIView):
 
     def get(self, request, blog_slug):
         blog = get_object_or_404(Blog.objects.published(), slug=blog_slug)
-        return Response(build_blog_detail_data(blog, get_range_days(request)))
+        return Response(build_with_previous_period(
+            build_blog_detail_data, get_range_days(request), blog
+        ))
 
 
 class AdminQuickReadDetailAnalyticsAPIView(APIView):
@@ -2266,4 +2283,6 @@ class AdminQuickReadDetailAnalyticsAPIView(APIView):
             Story.objects.published().exclude(Q(summary__isnull=True) | Q(summary__exact="")),
             slug=story_slug,
         )
-        return Response(build_quick_read_detail_data(story, get_range_days(request)))
+        return Response(build_with_previous_period(
+            build_quick_read_detail_data, get_range_days(request), story
+        ))
