@@ -8,9 +8,18 @@ from django.core.management.base import BaseCommand
 # those objects' metadata in place (an S3 CopyObject onto themselves — no
 # content changes, no new upload) so old files get the same caching benefit
 # new uploads get automatically. Covers both the original cover uploads and
-# any already-warmed renditions (VersatileImageField nests renditions under
-# the same prefix, e.g. "story_covers/__sized__/...").
-COVER_PREFIXES = ["story_covers/", "blog_covers/"]
+# their warmed renditions — VersatileImageField's default
+# `sized_directory_name` puts renditions under a top-level "__sized__/"
+# directory that *mirrors* the original's path (e.g. a cover at
+# "story_covers/x.jpg" renders to "__sized__/story_covers/x-thumbnail-...jpg"),
+# not nested inside "story_covers/" itself, so that has to be scanned as its
+# own prefix.
+COVER_PREFIXES = [
+    "story_covers/",
+    "blog_covers/",
+    "__sized__/story_covers/",
+    "__sized__/blog_covers/",
+]
 
 
 class Command(BaseCommand):

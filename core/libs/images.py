@@ -113,16 +113,21 @@ def get_cover_image_url(cover_image_file, fallback_url, request, size=None):
     """
     if cover_image_file:
         image = cover_image_file
-        # Accessing a VersatileImageField rendition calls storage.exists(),
-        # which is a synchronous S3/R2 HeadObject request. A slow storage
-        # response used to block list serialization until gunicorn killed the
-        # worker. Production serves the original's public URL on the request
-        # path; renditions should be generated out of band and can be enabled
-        # explicitly where local/on-request generation is acceptable.
-        generate_on_request = getattr(
-            settings, "GENERATE_IMAGE_RENDITIONS_ON_REQUEST", True
-        )
-        if generate_on_request and size and hasattr(image, "thumbnail"):
+        if size and hasattr(image, "thumbnail"):
+            # `image.thumbnail[size]` only makes a synchronous S3/R2
+            # storage.exists() HeadObject call when the field's
+            # `create_on_demand` is True (see versatileimagefield's
+            # SizedImage.__getitem__) — that per-request call is what used to
+            # block list serialization until gunicorn killed the worker.
+            # When renditions are pre-warmed (Story/Blog.SIZES + the
+            # post_save warm signal, or the `warm_cover_images` backfill),
+            # forcing `create_on_demand` off here makes this pure string/path
+            # construction — the exact deterministic filename the warmer
+            # already created — with zero network calls either way.
+            generate_on_request = getattr(
+                settings, "GENERATE_IMAGE_RENDITIONS_ON_REQUEST", True
+            )
+            image.create_on_demand = generate_on_request
             image = image.thumbnail[size]
         url = image.url
         return request.build_absolute_uri(url) if request else url
