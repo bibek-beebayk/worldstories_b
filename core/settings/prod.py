@@ -99,6 +99,16 @@ AWS_DEFAULT_ACL = None
 AWS_QUERYSTRING_AUTH = False
 AWS_S3_FILE_OVERWRITE = False
 
+# Without this, objects uploaded to R2 carry no Cache-Control header, so every
+# request potentially re-fetches from R2/origin instead of being served from
+# a CDN edge cache — a real contributor to slow cover-image loads alongside
+# the on-request-generation issue below. 30 days: covers are effectively
+# immutable per URL (AWS_S3_FILE_OVERWRITE=False means a changed cover gets a
+# new key, not an overwritten one), so a long max-age is safe.
+AWS_S3_OBJECT_PARAMETERS = {
+    "CacheControl": "public, max-age=2592000, immutable",
+}
+
 # Never make public API response time depend on a synchronous R2 HeadObject
 # request for each cover-image rendition. Renditions can be warmed separately;
 # list serializers fall back to the original public object URL.

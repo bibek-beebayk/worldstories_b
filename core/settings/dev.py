@@ -75,6 +75,12 @@ AWS_DEFAULT_ACL = None
 AWS_QUERYSTRING_AUTH = False
 AWS_S3_FILE_OVERWRITE = False
 
+# Same bucket/CDN as prod (see prod.py's matching setting for why) — keep
+# uploads consistent regardless of which environment made them.
+AWS_S3_OBJECT_PARAMETERS = {
+    "CacheControl": "public, max-age=2592000, immutable",
+}
+
 R2_PUBLIC_BASE_URL = os.environ.get("R2_PUBLIC_BASE_URL", "").rstrip("/")
 AWS_S3_CUSTOM_DOMAIN = os.environ.get("AWS_S3_CUSTOM_DOMAIN", "")
 if not AWS_S3_CUSTOM_DOMAIN and R2_PUBLIC_BASE_URL:

@@ -1,19 +1,25 @@
 import calendar
+import logging
 import uuid
 
 from django.db import models
 from django_ckeditor_5.fields import CKEditor5Field
 from django.core.validators import FileExtensionValidator, MinValueValidator, MaxValueValidator
 from django.conf import settings
+from django.dispatch import receiver
 from django.utils import timezone
 from solo.models import SingletonModel
 from versatileimagefield.fields import VersatileImageField
 
+from core.libs.images import warm
 from core.libs.models import TimeStampModel
 from core.libs.validators import FileSizeValidator
 
 MAX_DOCUMENT_UPLOAD_SIZE = 50 * 1024 * 1024  # pdf/epub
 MAX_AUDIO_UPLOAD_SIZE = 150 * 1024 * 1024
+
+
+logger = logging.getLogger(__name__)
 
 
 def published_story_q(prefix=""):
@@ -545,6 +551,21 @@ class Story(models.Model):
     )
     cover_image = models.URLField(blank=True, null=True)
     cover_image_file = VersatileImageField(upload_to="story_covers/", blank=True, null=True)
+
+    # Rendition keys here must match the `thumbnail__{size}` strings that
+    # `get_cover_image_url()` (core/libs/images.py) requests via
+    # CARD_COVER_SIZE/LARGE_COVER_SIZE in apps/story/serializers.py — keep
+    # them in sync if either changes. Warmed post-save (see `warm_story_cover`
+    # below) so the resized rendition already exists in storage by the time a
+    # request asks for it; GENERATE_IMAGE_RENDITIONS_ON_REQUEST=False in prod
+    # then serves that pre-made file instead of the full original.
+    SIZES = {
+        "cover_image_file": {
+            "card": "thumbnail__480x640",
+            "large": "thumbnail__900x1200",
+        }
+    }
+
     pdf_file = models.FileField(
         upload_to="story_files/pdfs/",
         blank=True,
@@ -1242,6 +1263,15 @@ class Blog(TimeStampModel):
     excerpt_error = models.TextField(blank=True, null=True)
     content = CKEditor5Field('Text', config_name='extends')
     cover_image_file = VersatileImageField(upload_to="blog_covers/", blank=True, null=True)
+
+    # Keep in sync with BLOG_COVER_SIZE in apps/story/serializers.py — see the
+    # matching comment on Story.SIZES for why this exists.
+    SIZES = {
+        "cover_image_file": {
+            "card": "thumbnail__1200x630",
+        }
+    }
+
     author_name = models.CharField(max_length=150, blank=True, null=True)
     linked_stories = models.ManyToManyField(
         Story,
@@ -1275,3 +1305,36 @@ class Blog(TimeStampModel):
 
     def __str__(self):
         return self.title
+
+
+def _warm_cover_image(instance):
+    """
+    Generates and uploads the resized cover renditions right after save, so
+    they already exist in R2 by the time a request asks for one — see the
+    comment on Story.SIZES for the request-time incident this avoids. Runs
+    synchronously (there's no task queue in this project), which is fine here
+    because story/blog saves are an infrequent, staff-initiated admin action,
+    not a public per-request code path. Broad except: a flaky R2 call while
+    warming must not turn an editor's save into a 500 — worst case the
+    original-file fallback in get_cover_image_url() serves a slow image once
+    until the rendition is retried (e.g. by re-saving, or a future warm-up
+    management command).
+    """
+    try:
+        warm(instance)
+    except Exception:
+        logger.exception(
+            "Failed to warm cover image renditions for %s pk=%s",
+            instance.__class__.__name__,
+            instance.pk,
+        )
+
+
+@receiver(models.signals.post_save, sender=Story)
+def warm_story_cover(sender, instance, **kwargs):
+    _warm_cover_image(instance)
+
+
+@receiver(models.signals.post_save, sender=Blog)
+def warm_blog_cover(sender, instance, **kwargs):
+    _warm_cover_image(instance)
