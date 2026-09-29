@@ -1966,6 +1966,21 @@ class PublicAuthorApiTests(APITestCase):
         # solo_theme: only this story
         self.assertEqual(themes[solo_theme.slug]["stories_count"], 1)
 
+    def test_story_detail_marks_youtube_shorts_as_portrait(self):
+        current = Story.objects.get(slug="published-book")
+        Video.objects.create(
+            story=current,
+            title="Portrait narration",
+            slug="portrait-narration",
+            youtube_url="https://www.youtube.com/shorts/dQw4w9WgXcQ",
+            youtube_id="dQw4w9WgXcQ",
+        )
+
+        response = self.client.get(reverse("story-detail", args=[current.slug]))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["videos"][0]["aspect_ratio"], "9:16")
+
     def test_story_detail_query_count_is_flat_across_tag_and_theme_counts(self):
         from django.db import connection
         from django.test.utils import CaptureQueriesContext

@@ -1063,6 +1063,11 @@ class Video(models.Model):
     # Admin-entered (optional); refined client-side from the IFrame Player API
     # once a viewer actually plays the video.
     duration_seconds = models.FloatField(null=True, blank=True, default=None)
+    aspect_ratio = models.CharField(
+        max_length=5,
+        choices=(("16:9", "Landscape (16:9)"), ("9:16", "Portrait (9:16)")),
+        default="16:9",
+    )
     created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
@@ -1077,6 +1082,8 @@ class Video(models.Model):
             parsed = parse_youtube_id(self.youtube_url)
             if parsed:
                 self.youtube_id = parsed
+        if "/shorts/" in (self.youtube_url or "").lower():
+            self.aspect_ratio = "9:16"
         return super().save(*args, **kwargs)
 
     class Meta:

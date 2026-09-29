@@ -98,7 +98,15 @@ class VideoInline(admin.StackedInline):
     model = Video
     extra = 0
     classes = ("collapse",)
-    fields = ("title", "slug", "order", "youtube_url", "youtube_id", "duration_seconds")
+    fields = (
+        "title",
+        "slug",
+        "order",
+        "youtube_url",
+        "youtube_id",
+        "duration_seconds",
+        "aspect_ratio",
+    )
     readonly_fields = ("youtube_id",)
 
 

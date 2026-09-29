@@ -790,7 +790,15 @@ class ReadAlongSerializer(serializers.BaseSerializer):
 class VideoSerializer(serializers.ModelSerializer):
     class Meta:
         model = Video
-        fields = ["id", "title", "slug", "youtube_id", "order", "duration_seconds"]
+        fields = [
+            "id",
+            "title",
+            "slug",
+            "youtube_id",
+            "order",
+            "duration_seconds",
+            "aspect_ratio",
+        ]
 
 
 def similar_stories_candidates(story):
@@ -1879,7 +1887,17 @@ class VideoAdminSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Video
-        fields = ["id", "story", "title", "slug", "youtube_url", "youtube_id", "order", "duration_seconds"]
+        fields = [
+            "id",
+            "story",
+            "title",
+            "slug",
+            "youtube_url",
+            "youtube_id",
+            "order",
+            "duration_seconds",
+            "aspect_ratio",
+        ]
         read_only_fields = ["youtube_id"]
 
 
