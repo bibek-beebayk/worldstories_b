@@ -1556,6 +1556,9 @@ class AdminHeroTemplateSerializer(serializers.ModelSerializer):
         model = HeroTemplate
         exclude = ["created_at"]
         read_only_fields = ["is_default", "updated_at"]
+        # The two title parts render side by side; a trailing space is how an
+        # editor separates "Spooky " + "Stories" rather than a "WorldStories" wordmark.
+        extra_kwargs = {"title_prefix": {"trim_whitespace": False}}
 
 
 def serialize_hero(template, live_stats):

@@ -762,11 +762,13 @@ class HeroTemplate(TimeStampModel):
     ANIMATION_CLASSIC = "classic"
     ANIMATION_HALLOWEEN = "halloween"
     ANIMATION_WINTER = "winter"
+    ANIMATION_CHRISTMAS = "christmas"
     ANIMATION_NONE = "none"
     ANIMATION_CHOICES = [
         (ANIMATION_CLASSIC, "Classic — floating reading icons"),
         (ANIMATION_HALLOWEEN, "Halloween — drifting ghosts and flickering flames"),
         (ANIMATION_WINTER, "Winter — falling snow"),
+        (ANIMATION_CHRISTMAS, "Christmas — snow, trees, gifts and a twinkling star"),
         (ANIMATION_NONE, "None — static background"),
     ]
 

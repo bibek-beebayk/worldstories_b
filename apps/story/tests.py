@@ -6093,3 +6093,21 @@ class HeroTemplateTests(APITestCase):
         self.assertEqual(copy.cta_label, "Read now")
         self.assertFalse(copy.is_default)
         self.assertIsNone(copy.starts_at)
+
+
+class HeroTitleSpacingTests(APITestCase):
+    def test_title_prefix_keeps_its_trailing_space(self):
+        HeroTemplate.objects.all().delete()
+        admin = User.objects.create_user(
+            email="herospace@example.com", username="herospace",
+            password="test-password", is_superuser=True, is_staff=True, is_active=True,
+        )
+        self.client.force_authenticate(admin)
+        response = self.client.post(
+            reverse("admin-hero-template-list"),
+            {"name": "Halloween", "title_prefix": "Spooky ", "title_highlight": " Stories "},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.json()["title_prefix"], "Spooky ")
+        self.assertEqual(response.json()["title_highlight"], "Stories")
