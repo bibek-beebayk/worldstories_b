@@ -10,6 +10,7 @@ from django.utils.text import slugify
 from django.urls import reverse
 from datetime import date
 from core.libs.images import get_cover_image_url
+from apps.pages.models import SiteTheme
 from .models import (
     Audio,
     AudioTranscriptCue,
@@ -855,6 +856,7 @@ def similar_stories_candidates(story):
 
 class StoryDetailSerializer(serializers.ModelSerializer):
     cover_image = serializers.SerializerMethodField()
+    site_theme = serializers.SerializerMethodField()
     pdf_file = serializers.SerializerMethodField()
     epub_file = serializers.SerializerMethodField()
     story_type = serializers.CharField(source="story_type.name", read_only=True)
@@ -1024,7 +1026,19 @@ class StoryDetailSerializer(serializers.ModelSerializer):
             "listening_time_minutes",
             "watch_time_minutes",
             "similar_stories",
+            "site_theme",
         ]
+
+    def get_site_theme(self, obj):
+        """The look chosen for this story's page, in the same shape as a live
+        site theme, or None. Whole-site scope: on the story's page it applies
+        to everything, whatever page selection the theme has elsewhere."""
+        if obj.site_theme_id is None:
+            return None
+        # Imported here: apps.pages.serializers imports this module.
+        from apps.pages.serializers import public_site_theme_payload
+
+        return {**public_site_theme_payload(obj.site_theme), "apply_to": "site", "page_paths": []}
 
 
 class ReviewUserSerializer(serializers.Serializer):
@@ -1165,6 +1179,11 @@ class StoryAdminSerializer(serializers.ModelSerializer):
         queryset=Author.objects.all(), required=False, allow_null=True
     )
     story_type = serializers.PrimaryKeyRelatedField(queryset=StoryType.objects.all())
+    # The story editor sends "" for "no theme" (multipart form); DRF turns
+    # that into None for a nullable relation.
+    site_theme = serializers.PrimaryKeyRelatedField(
+        queryset=SiteTheme.objects.all(), required=False, allow_null=True
+    )
     genres = serializers.PrimaryKeyRelatedField(
         queryset=Genre.objects.all(), many=True, required=False
     )
@@ -1270,6 +1289,7 @@ class StoryAdminSerializer(serializers.ModelSerializer):
             "retrospective_confidence_note",
             "retrospective_error",
             "story_type",
+            "site_theme",
             "language",
             "country",
             "translations",
@@ -1588,6 +1608,17 @@ def serialize_hero(template, live_stats):
             "highlight_to": template.title_highlight_to,
         },
         "description": template.description,
+        "typography": {
+            "title_font": template.title_font,
+            "title_size": template.title_size,
+            "title_weight": template.title_weight,
+            "title_letter_spacing": template.title_letter_spacing,
+            "title_uppercase": template.title_uppercase,
+            "title_italic": template.title_italic,
+            "body_font": template.body_font,
+            "description_size": template.description_size,
+            "cta_uppercase": template.cta_uppercase,
+        },
         "info_lines": [
             {"icon": icon, "text": text}
             for icon, text in (

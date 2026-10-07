@@ -396,3 +396,43 @@ class SingleActiveSiteThemeTests(PageTestBase):
         self.client.patch(reverse("admin-site-theme-detail", kwargs={"pk": off.pk}), {"name": "Renamed"}, format="json")
         on.refresh_from_db()
         self.assertEqual(on.mode, "always")
+
+
+class StorySiteThemeTests(PageTestBase):
+    def setUp(self):
+        super().setUp()
+        self.theme = SiteTheme.objects.create(
+            name="Spooky", background_color="#120a1f", apply_to="pages", page_paths=["/pages/*"]
+        )
+        self.story = Story.objects.create(title="Haunted", slug="haunted", is_published=True)
+
+    def test_story_detail_carries_its_theme_as_whole_page(self):
+        self.story.site_theme = self.theme
+        self.story.save()
+        theme = self.client.get(reverse("story-detail", kwargs={"slug": "haunted"})).json()["site_theme"]
+        self.assertEqual(theme["background_color"], "#120a1f")
+        # Its page selection elsewhere doesn't limit it on the story's own page.
+        self.assertEqual((theme["apply_to"], theme["page_paths"]), ("site", []))
+        self.assertNotIn("name", theme)
+
+    def test_story_without_a_theme(self):
+        self.assertIsNone(self.client.get(reverse("story-detail", kwargs={"slug": "haunted"})).json()["site_theme"])
+
+    def test_admin_sets_and_clears_it_from_the_story_form(self):
+        self.client.force_authenticate(self.admin)
+        url = reverse("admin-story-detail", args=[self.story.id])
+        response = self.client.patch(url, {"site_theme": str(self.theme.id)}, format="multipart")
+        self.assertEqual(response.status_code, 200, response.data)
+        self.story.refresh_from_db()
+        self.assertEqual(self.story.site_theme, self.theme)
+        response = self.client.patch(url, {"site_theme": ""}, format="multipart")
+        self.assertEqual(response.status_code, 200, response.data)
+        self.story.refresh_from_db()
+        self.assertIsNone(self.story.site_theme)
+
+    def test_deleting_the_theme_clears_it_from_stories(self):
+        self.story.site_theme = self.theme
+        self.story.save()
+        self.theme.delete()
+        self.story.refresh_from_db()
+        self.assertIsNone(self.story.site_theme)

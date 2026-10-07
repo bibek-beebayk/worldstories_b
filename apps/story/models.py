@@ -12,6 +12,7 @@ from django.utils import timezone
 from solo.models import SingletonModel
 from versatileimagefield.fields import VersatileImageField
 
+from apps.pages.models import PAGE_FONT_CHOICES
 from core.libs.images import warm
 from core.libs.models import TimeStampModel
 from core.libs.validators import FileSizeValidator
@@ -632,6 +633,13 @@ class Story(models.Model):
     # TagViewSet / the sitemap all assume tag.stories, same as genres/categories.
     tags = models.ManyToManyField(Tag, blank=True, related_name="stories")
     themes = models.ManyToManyField(Theme, blank=True, related_name="stories")
+    # Optional look for this story's /read/<slug> page, chosen from the site
+    # themes (apps/pages). When set it always applies there, overriding
+    # whichever site theme is on — regardless of that theme's own on/off,
+    # schedule or page selection.
+    site_theme = models.ForeignKey(
+        "pages.SiteTheme", null=True, blank=True, on_delete=models.SET_NULL, related_name="stories"
+    )
     rating = models.FloatField(default=0.0)
     views = models.PositiveIntegerField(default=0)
     is_published = models.BooleanField(default=True)
@@ -772,6 +780,10 @@ class HeroTemplate(TimeStampModel):
         (ANIMATION_NONE, "None — static background"),
     ]
 
+    TITLE_SIZE_CHOICES = [("small", "Small"), ("medium", "Medium"), ("large", "Large"), ("xlarge", "Extra large")]
+    LETTER_SPACING_CHOICES = [("tight", "Tight"), ("normal", "Normal"), ("wide", "Wide"), ("wider", "Wider")]
+    TEXT_SIZE_CHOICES = [("small", "Small"), ("medium", "Medium"), ("large", "Large")]
+
     name = models.CharField(max_length=80)
     is_default = models.BooleanField(default=False, db_index=True)
     starts_at = models.DateTimeField(null=True, blank=True, db_index=True)
@@ -782,6 +794,23 @@ class HeroTemplate(TimeStampModel):
     title_highlight_from = hex_color_field("#ed405a")
     title_highlight_to = hex_color_field("#fbbf24")
     description = models.TextField(max_length=400, blank=True)
+
+    # Typography. Fonts come from the same Google Fonts list as page and site
+    # themes; "" keeps the site's own. Sizes are responsive presets the
+    # frontend maps to its breakpoints (HomeHero.tsx). Defaults reproduce the
+    # hero as it was before these existed.
+    title_font = models.CharField(max_length=40, choices=PAGE_FONT_CHOICES, blank=True)
+    title_size = models.CharField(max_length=10, choices=TITLE_SIZE_CHOICES, default="medium")
+    title_weight = models.PositiveSmallIntegerField(
+        default=700, validators=[MinValueValidator(100), MaxValueValidator(900)]
+    )
+    title_letter_spacing = models.CharField(max_length=10, choices=LETTER_SPACING_CHOICES, default="tight")
+    title_uppercase = models.BooleanField(default=False)
+    title_italic = models.BooleanField(default=False)
+    # Description, info lines, stats and the button.
+    body_font = models.CharField(max_length=40, choices=PAGE_FONT_CHOICES, blank=True)
+    description_size = models.CharField(max_length=10, choices=TEXT_SIZE_CHOICES, default="medium")
+    cta_uppercase = models.BooleanField(default=False)
 
     # Whole-row switches, so a template can drop a row without losing its
     # content. Within a shown row, a blank text/label hides just that item.

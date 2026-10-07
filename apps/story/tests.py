@@ -6111,3 +6111,44 @@ class HeroTitleSpacingTests(APITestCase):
         self.assertEqual(response.status_code, 201)
         self.assertEqual(response.json()["title_prefix"], "Spooky ")
         self.assertEqual(response.json()["title_highlight"], "Stories")
+
+
+class HeroTypographyTests(APITestCase):
+    def setUp(self):
+        cache.clear()
+        HeroTemplate.objects.all().delete()
+        self.admin = User.objects.create_user(
+            email="herotype@example.com", username="herotype",
+            password="test-password", is_superuser=True, is_staff=True, is_active=True,
+        )
+        self.template = HeroTemplate.objects.create(name="Regular", is_default=True)
+
+    def test_defaults_reproduce_the_original_hero(self):
+        typography = self.client.get(reverse("home-data")).json()["hero"]["typography"]
+        self.assertEqual(
+            typography,
+            {
+                "title_font": "", "title_size": "medium", "title_weight": 700,
+                "title_letter_spacing": "tight", "title_uppercase": False, "title_italic": False,
+                "body_font": "", "description_size": "medium", "cta_uppercase": False,
+            },
+        )
+
+    def test_admin_sets_typography(self):
+        self.client.force_authenticate(self.admin)
+        url = reverse("admin-hero-template-detail", kwargs={"pk": self.template.pk})
+        response = self.client.patch(
+            url,
+            {"title_font": "Creepster", "title_size": "xlarge", "title_weight": 400, "title_italic": True, "body_font": "Lora"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+        cache.clear()
+        typography = self.client.get(reverse("home-data")).json()["hero"]["typography"]
+        self.assertEqual((typography["title_font"], typography["title_size"], typography["body_font"]), ("Creepster", "xlarge", "Lora"))
+
+    def test_admin_rejects_unknown_fonts_and_bad_values(self):
+        self.client.force_authenticate(self.admin)
+        url = reverse("admin-hero-template-detail", kwargs={"pk": self.template.pk})
+        for payload in ({"title_font": "Comic Sans"}, {"title_weight": 1000}, {"title_size": "huge"}, {"description_size": "tiny"}):
+            self.assertEqual(self.client.patch(url, payload, format="json").status_code, 400, payload)
