@@ -49,21 +49,9 @@ FORBIDDEN_CSS = [
 ]
 
 
-class PageTheme(TimeStampModel):
-    """A reusable look for admin-built pages: colours, fonts, shape, layout,
-    background and scoped custom CSS. Pages without a theme use the site's."""
-
-    WIDTH_NARROW = "narrow"
-    WIDTH_NORMAL = "normal"
-    WIDTH_WIDE = "wide"
-    WIDTH_FULL = "full"
-    WIDTH_CHOICES = [
-        (WIDTH_NARROW, "Narrow (reading width)"),
-        (WIDTH_NORMAL, "Normal"),
-        (WIDTH_WIDE, "Wide"),
-        (WIDTH_FULL, "Full width"),
-    ]
-    SPACING_CHOICES = [("compact", "Compact"), ("normal", "Normal"), ("relaxed", "Relaxed")]
+class ThemeLook(TimeStampModel):
+    """The look shared by page themes and site themes: colours, fonts,
+    corner shape, a background image and custom CSS."""
 
     name = models.CharField(max_length=80)
 
@@ -80,18 +68,8 @@ class PageTheme(TimeStampModel):
     # Typography
     heading_font = models.CharField(max_length=40, choices=PAGE_FONT_CHOICES, blank=True)
     body_font = models.CharField(max_length=40, choices=PAGE_FONT_CHOICES, blank=True)
-    body_font_size = models.PositiveSmallIntegerField(
-        default=18, validators=[MinValueValidator(14), MaxValueValidator(24)]
-    )
-    heading_weight = models.PositiveSmallIntegerField(
-        default=700, validators=[MinValueValidator(300), MaxValueValidator(900)]
-    )
-    heading_uppercase = models.BooleanField(default=False)
 
-    # Shape and layout
     radius = models.PositiveSmallIntegerField(default=12, validators=[MaxValueValidator(40)])
-    content_width = models.CharField(max_length=10, choices=WIDTH_CHOICES, default=WIDTH_NORMAL)
-    section_spacing = models.CharField(max_length=10, choices=SPACING_CHOICES, default="normal")
 
     # Background
     background_image = models.URLField(blank=True)
@@ -100,10 +78,10 @@ class PageTheme(TimeStampModel):
         default=0, validators=[MaxValueValidator(95)]
     )
 
-    # Applied inside the page only — wrapped in the theme's own selector.
     custom_css = models.TextField(blank=True, max_length=MAX_CUSTOM_CSS)
 
     class Meta:
+        abstract = True
         ordering = ["name"]
 
     def __str__(self):
@@ -113,8 +91,8 @@ class PageTheme(TimeStampModel):
         for pattern, message in FORBIDDEN_CSS:
             if pattern.search(self.custom_css or ""):
                 raise ValidationError({"custom_css": message})
-        # The CSS is nested inside the theme's selector, so a stray "}" would
-        # close that wrapper and let later rules style the rest of the site.
+        # Page themes nest the CSS inside the page's selector, so a stray "}"
+        # would close that wrapper and let later rules style the rest of the site.
         depth = 0
         for char in self.custom_css or "":
             depth += {"{": 1, "}": -1}.get(char, 0)
@@ -122,6 +100,119 @@ class PageTheme(TimeStampModel):
                 break
         if depth != 0:
             raise ValidationError({"custom_css": "Unbalanced { } in custom CSS."})
+
+
+class PageTheme(ThemeLook):
+    """A reusable look for admin-built pages. Adds the page-only settings —
+    body text size, heading style, width and spacing — to ThemeLook. Its
+    custom CSS is scoped to the page. Pages without a theme use the site's."""
+
+    WIDTH_NARROW = "narrow"
+    WIDTH_NORMAL = "normal"
+    WIDTH_WIDE = "wide"
+    WIDTH_FULL = "full"
+    WIDTH_CHOICES = [
+        (WIDTH_NARROW, "Narrow (reading width)"),
+        (WIDTH_NORMAL, "Normal"),
+        (WIDTH_WIDE, "Wide"),
+        (WIDTH_FULL, "Full width"),
+    ]
+    SPACING_CHOICES = [("compact", "Compact"), ("normal", "Normal"), ("relaxed", "Relaxed")]
+
+    body_font_size = models.PositiveSmallIntegerField(
+        default=18, validators=[MinValueValidator(14), MaxValueValidator(24)]
+    )
+    heading_weight = models.PositiveSmallIntegerField(
+        default=700, validators=[MinValueValidator(300), MaxValueValidator(900)]
+    )
+    heading_uppercase = models.BooleanField(default=False)
+    content_width = models.CharField(max_length=10, choices=WIDTH_CHOICES, default=WIDTH_NORMAL)
+    section_spacing = models.CharField(max_length=10, choices=SPACING_CHOICES, default="normal")
+
+    class Meta(ThemeLook.Meta):
+        pass
+
+
+# A path a site theme applies to: an exact path ("/library") or a prefix
+# ending in "*" ("/story/*" — every story page). The admin panel is never themed.
+SITE_THEME_PATH = re.compile(r"^/[A-Za-z0-9\-._~/]*\*?$")
+MAX_SITE_THEME_PATHS = 50
+
+
+class SiteThemeQuerySet(models.QuerySet):
+    def make_only_active(self, theme):
+        """Switch off every theme but `theme` — only one site theme is ever
+        on. Locks the rows first so two editors activating different themes
+        at once can't both win."""
+        list(self.select_for_update().values_list("pk", flat=True))
+        self.exclude(pk=theme.pk).exclude(mode=SiteTheme.MODE_OFF).update(
+            mode=SiteTheme.MODE_OFF, updated_at=timezone.now()
+        )
+
+    def live(self, now=None):
+        now = now or timezone.now()
+        return self.filter(
+            Q(mode=SiteTheme.MODE_ALWAYS)
+            | Q(mode=SiteTheme.MODE_SCHEDULED, starts_at__lte=now, ends_at__gt=now)
+        )
+
+
+class SiteTheme(ThemeLook):
+    """A look for the whole public site, or for chosen pages of it — always
+    on, or for a scheduled window (Halloween week, a launch).
+
+    Only one is ever active (mode other than "off"): turning one on switches
+    the rest off (SiteThemeQuerySet.make_only_active, called on every save
+    path in the admin API).
+    """
+
+    MODE_OFF = "off"
+    MODE_ALWAYS = "always"
+    MODE_SCHEDULED = "scheduled"
+    MODE_CHOICES = [(MODE_OFF, "Off"), (MODE_ALWAYS, "Always on"), (MODE_SCHEDULED, "Scheduled")]
+
+    APPLY_SITE = "site"
+    APPLY_PAGES = "pages"
+    APPLY_CHOICES = [(APPLY_SITE, "Whole site"), (APPLY_PAGES, "Selected pages")]
+
+    mode = models.CharField(max_length=10, choices=MODE_CHOICES, default=MODE_OFF, db_index=True)
+    starts_at = models.DateTimeField(null=True, blank=True)
+    ends_at = models.DateTimeField(null=True, blank=True)
+    apply_to = models.CharField(max_length=10, choices=APPLY_CHOICES, default=APPLY_SITE)
+    page_paths = models.JSONField(default=list, blank=True)
+
+    objects = SiteThemeQuerySet.as_manager()
+
+    class Meta(ThemeLook.Meta):
+        pass
+
+    def clean(self):
+        super().clean()
+        errors = {}
+        if self.mode == self.MODE_SCHEDULED:
+            if not (self.starts_at and self.ends_at):
+                errors["ends_at"] = "A scheduled theme needs a start and an end."
+            elif self.ends_at <= self.starts_at:
+                errors["ends_at"] = "The end must be after the start."
+
+        if self.apply_to == self.APPLY_PAGES:
+            paths = self.page_paths
+            if not isinstance(paths, list) or not paths:
+                errors["page_paths"] = "Choose at least one page."
+            elif len(paths) > MAX_SITE_THEME_PATHS:
+                errors["page_paths"] = f"Use at most {MAX_SITE_THEME_PATHS} paths."
+            else:
+                for path in paths:
+                    if not isinstance(path, str) or not SITE_THEME_PATH.match(path) or "//" in path:
+                        errors["page_paths"] = (
+                            f'"{path}" isn\'t a valid path. Use one like /library, or /story/* for every story page.'
+                        )
+                        break
+                    if path == "/admin" or path.startswith("/admin/"):
+                        errors["page_paths"] = "The admin panel can't be themed."
+                        break
+        if errors:
+            raise ValidationError(errors)
 
 
 class Page(TimeStampModel):

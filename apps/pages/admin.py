@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from .models import Page, PageBlock, PageRedirect, PageTheme
+from .models import Page, PageBlock, PageRedirect, PageTheme, SiteTheme
 
 
 class PageBlockInline(admin.TabularInline):
@@ -30,4 +30,11 @@ class PageRedirectAdmin(admin.ModelAdmin):
 @admin.register(PageTheme)
 class PageThemeAdmin(admin.ModelAdmin):
     list_display = ("name", "content_width", "updated_at")
+    search_fields = ("name",)
+
+
+@admin.register(SiteTheme)
+class SiteThemeAdmin(admin.ModelAdmin):
+    list_display = ("name", "mode", "apply_to", "starts_at", "ends_at")
+    list_filter = ("mode", "apply_to")
     search_fields = ("name",)

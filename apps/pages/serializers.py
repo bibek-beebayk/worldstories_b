@@ -7,7 +7,7 @@ from rest_framework import serializers
 from apps.story.models import Story
 
 from .blocks import TEMPLATE_BLOCKS, clean_block
-from .models import Page, PageBlock, PageRedirect, PageTheme
+from .models import Page, PageBlock, PageRedirect, PageTheme, SiteTheme, ThemeLook
 
 
 class AdminPageThemeSerializer(serializers.ModelSerializer):
@@ -40,6 +40,49 @@ def public_theme_payload(theme):
     if theme is None:
         return None
     return {field: getattr(theme, field) for field in THEME_PUBLIC_FIELDS}
+
+
+class AdminSiteThemeSerializer(serializers.ModelSerializer):
+    status = serializers.SerializerMethodField()
+
+    def get_status(self, obj):
+        now = self.context.get("now") or timezone.now()
+        if obj.mode == SiteTheme.MODE_OFF:
+            return "off"
+        if obj.mode == SiteTheme.MODE_ALWAYS:
+            return "always"
+        if obj.starts_at and obj.starts_at > now:
+            return "scheduled"
+        if obj.ends_at and obj.ends_at <= now:
+            return "ended"
+        return "live"
+
+    def validate(self, attrs):
+        values = {f.name: getattr(self.instance, f.name) for f in SiteTheme._meta.concrete_fields} if self.instance else {}
+        try:
+            SiteTheme(**{**values, **attrs}).clean()
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(exc.message_dict)
+        return attrs
+
+    class Meta:
+        model = SiteTheme
+        exclude = ["created_at"]
+        read_only_fields = ["updated_at"]
+
+
+LOOK_FIELDS = [
+    f.name for f in ThemeLook._meta.get_fields() if f.concrete and f.name not in {"created_at", "updated_at", "name"}
+]
+
+
+def public_site_theme_payload(theme):
+    return {
+        "id": theme.id,
+        **{field: getattr(theme, field) for field in LOOK_FIELDS},
+        "apply_to": theme.apply_to,
+        "page_paths": theme.page_paths if theme.apply_to == SiteTheme.APPLY_PAGES else [],
+    }
 
 
 def page_status(page, now=None):

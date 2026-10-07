@@ -49,6 +49,7 @@ router.register("admin/blog", story_api.BlogAdminViewSet, basename="admin-blog")
 router.register("admin/story-queue", story_api.StoryQueueViewSet, basename="admin-story-queue")
 router.register("admin/pages", pages_api.PageAdminViewSet, basename="admin-page")
 router.register("admin/page-themes", pages_api.PageThemeAdminViewSet, basename="admin-page-theme")
+router.register("admin/site-themes", pages_api.SiteThemeAdminViewSet, basename="admin-site-theme")
 router.register("auth", users_api.AuthenticationViewSet, basename="auth")
 
 
@@ -272,6 +273,7 @@ urlpatterns = [
     path("api/auth/refresh/", TokenRefreshView.as_view(), name="token_refresh"),
     path("api/home/", story_api.HomeDataAPIView.as_view(), name="home-data"),
     path("api/pages/<slug:slug>/", pages_api.PublicPageAPIView.as_view(), name="public-page"),
+    path("api/site-themes/live/", pages_api.LiveSiteThemesAPIView.as_view(), name="live-site-themes"),
     path("api/trending/", story_api.TrendingDataAPIView.as_view(), name="trending-data"),
     path("api/discover/", story_api.DiscoverDataAPIView.as_view(), name="discover-data"),
     path("api/story-map/", story_api.StoryMapAPIView.as_view(), name="story-map-data"),

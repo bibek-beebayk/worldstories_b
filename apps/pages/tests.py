@@ -8,7 +8,7 @@ from rest_framework.test import APITestCase
 from apps.story.models import Genre, Story
 from apps.users.models import User
 
-from .models import Page, PageBlock, PageRedirect, PageTheme
+from .models import Page, PageBlock, PageRedirect, PageTheme, SiteTheme
 
 
 class PageTestBase(APITestCase):
@@ -246,3 +246,153 @@ class PageThemeTests(PageTestBase):
         self.assertEqual(response.status_code, 201)
         self.assertEqual(response.json()["name"], "Base (copy)")
         self.assertEqual(response.json()["primary_color"], "#123456")
+
+
+class SiteThemeTests(PageTestBase):
+    def setUp(self):
+        super().setUp()
+        self.now = timezone.now()
+
+    def _theme(self, name, **kwargs):
+        return SiteTheme.objects.create(name=name, **kwargs)
+
+    def _live(self):
+        cache.clear()
+        return self.client.get(reverse("live-site-themes")).json()
+
+    def test_only_live_themes_are_served(self):
+        self._theme("Off")
+        self._theme("Always", mode="always")
+        self._theme("Now", mode="scheduled", starts_at=self.now - timedelta(hours=1), ends_at=self.now + timedelta(hours=1))
+        self._theme("Later", mode="scheduled", starts_at=self.now + timedelta(days=1), ends_at=self.now + timedelta(days=2))
+        self._theme("Over", mode="scheduled", starts_at=self.now - timedelta(days=2), ends_at=self.now - timedelta(days=1))
+        self.assertEqual({t["id"] for t in self._live()}, set(SiteTheme.objects.filter(name__in=["Always", "Now"]).values_list("id", flat=True)))
+
+    def test_priority_scheduled_then_specific_pages_then_latest(self):
+        window = {"mode": "scheduled", "ends_at": self.now + timedelta(days=1)}
+        always_site = self._theme("Always site", mode="always")
+        sched_site_old = self._theme("Sched site old", starts_at=self.now - timedelta(days=3), **window)
+        sched_site_new = self._theme("Sched site new", starts_at=self.now - timedelta(days=1), **window)
+        sched_pages = self._theme(
+            "Sched pages", starts_at=self.now - timedelta(days=5), apply_to="pages", page_paths=["/library"], **window
+        )
+        self.assertEqual(
+            [t["id"] for t in self._live()],
+            [sched_pages.id, sched_site_new.id, sched_site_old.id, always_site.id],
+        )
+
+    def test_payload_has_look_and_scope_but_no_admin_fields(self):
+        self._theme("Spooky", mode="always", apply_to="pages", page_paths=["/pages/*"], heading_font="Creepster")
+        theme = self._live()[0]
+        self.assertEqual(theme["page_paths"], ["/pages/*"])
+        self.assertEqual(theme["heading_font"], "Creepster")
+        for hidden in ("name", "mode", "starts_at", "content_width"):
+            self.assertNotIn(hidden, theme)
+
+    def test_admin_requires_superuser(self):
+        self.client.force_authenticate(self.reader)
+        self.assertEqual(self.client.get(reverse("admin-site-theme-list")).status_code, 403)
+
+    def test_admin_validation(self):
+        self.client.force_authenticate(self.admin)
+        url = reverse("admin-site-theme-list")
+        cases = [
+            ({"mode": "scheduled"}, "ends_at"),
+            ({"mode": "scheduled", "starts_at": self.now.isoformat(), "ends_at": (self.now - timedelta(hours=1)).isoformat()}, "ends_at"),
+            ({"apply_to": "pages", "page_paths": []}, "page_paths"),
+            ({"apply_to": "pages", "page_paths": ["library"]}, "page_paths"),
+            ({"apply_to": "pages", "page_paths": ["/story/*/x*"]}, "page_paths"),
+            ({"apply_to": "pages", "page_paths": ["/admin/content"]}, "page_paths"),
+            ({"custom_css": "</style><script>x</script>"}, "custom_css"),
+            ({"primary_color": "red"}, "primary_color"),
+        ]
+        for payload, field in cases:
+            response = self.client.post(url, {"name": "Bad", **payload}, format="json")
+            self.assertEqual(response.status_code, 400, payload)
+            self.assertIn(field, response.json(), payload)
+
+    def test_admin_creates_and_reports_status(self):
+        self.client.force_authenticate(self.admin)
+        response = self.client.post(
+            reverse("admin-site-theme-list"),
+            {
+                "name": "Christmas",
+                "mode": "scheduled",
+                "starts_at": (self.now + timedelta(days=1)).isoformat(),
+                "ends_at": (self.now + timedelta(days=3)).isoformat(),
+                "apply_to": "pages",
+                "page_paths": ["/", "/story/*"],
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201, response.content)
+        self.assertEqual(response.json()["status"], "scheduled")
+
+    def test_duplicate_is_switched_off(self):
+        self.client.force_authenticate(self.admin)
+        theme = self._theme("Live", mode="always")
+        copy = self.client.post(reverse("admin-site-theme-duplicate", kwargs={"pk": theme.pk})).json()
+        self.assertEqual(copy["name"], "Live (copy)")
+        self.assertEqual(copy["mode"], "off")
+        self.assertEqual(copy["status"], "off")
+
+
+class SingleActiveSiteThemeTests(PageTestBase):
+    def setUp(self):
+        super().setUp()
+        self.client.force_authenticate(self.admin)
+        self.now = timezone.now()
+
+    def _url(self, theme, action):
+        return reverse(f"admin-site-theme-{action}", kwargs={"pk": theme.pk})
+
+    def test_activating_turns_every_other_theme_off(self):
+        on = SiteTheme.objects.create(name="On", mode="always")
+        sched = SiteTheme.objects.create(
+            name="Sched", mode="scheduled", starts_at=self.now, ends_at=self.now + timedelta(days=1)
+        )
+        new = SiteTheme.objects.create(name="New")
+        response = self.client.post(self._url(new, "activate"))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["mode"], "always")
+        on.refresh_from_db()
+        sched.refresh_from_db()
+        self.assertEqual((on.mode, sched.mode), ("off", "off"))
+
+    def test_activating_keeps_a_window_that_has_not_ended(self):
+        theme = SiteTheme.objects.create(
+            name="Xmas", starts_at=self.now + timedelta(days=1), ends_at=self.now + timedelta(days=3)
+        )
+        self.assertEqual(self.client.post(self._url(theme, "activate")).json()["mode"], "scheduled")
+
+    def test_activating_with_an_ended_window_just_turns_it_on(self):
+        theme = SiteTheme.objects.create(
+            name="Old", starts_at=self.now - timedelta(days=3), ends_at=self.now - timedelta(days=1)
+        )
+        body = self.client.post(self._url(theme, "activate")).json()
+        self.assertEqual((body["mode"], body["status"]), ("always", "always"))
+
+    def test_deactivate(self):
+        theme = SiteTheme.objects.create(name="On", mode="always")
+        self.assertEqual(self.client.post(self._url(theme, "deactivate")).json()["mode"], "off")
+
+    def test_turning_one_on_from_the_editor_also_turns_others_off(self):
+        on = SiteTheme.objects.create(name="On", mode="always")
+        other = SiteTheme.objects.create(name="Other")
+        self.client.patch(
+            reverse("admin-site-theme-detail", kwargs={"pk": other.pk}), {"mode": "always"}, format="json"
+        )
+        on.refresh_from_db()
+        self.assertEqual(on.mode, "off")
+        created = self.client.post(reverse("admin-site-theme-list"), {"name": "Born on", "mode": "always"}, format="json")
+        self.assertEqual(created.status_code, 201)
+        other.refresh_from_db()
+        self.assertEqual(other.mode, "off")
+        self.assertEqual(SiteTheme.objects.exclude(mode="off").count(), 1)
+
+    def test_saving_an_off_theme_leaves_the_active_one_alone(self):
+        on = SiteTheme.objects.create(name="On", mode="always")
+        off = SiteTheme.objects.create(name="Off")
+        self.client.patch(reverse("admin-site-theme-detail", kwargs={"pk": off.pk}), {"name": "Renamed"}, format="json")
+        on.refresh_from_db()
+        self.assertEqual(on.mode, "always")
