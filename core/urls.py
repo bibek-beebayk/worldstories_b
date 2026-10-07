@@ -15,6 +15,8 @@ from apps.story import analytics_api as story_analytics_api
 from apps.stats import views as stats_views
 from apps.stats import nepalikatha as nepalikatha_api
 from apps.users import api as users_api
+from apps.pages import api as pages_api
+from apps.pages.models import Page
 from apps.story.models import Author, Story, Blog, Tag, Theme, Genre, Category, published_story_q
 
 router = DefaultRouter()
@@ -40,10 +42,13 @@ router.register("admin/tags", story_api.TagAdminViewSet, basename="admin-tag")
 router.register("admin/themes", story_api.ThemeAdminViewSet, basename="admin-theme")
 router.register("admin/moods", story_api.MoodAdminViewSet, basename="admin-mood")
 router.register("admin/journeys", story_api.StoryJourneyAdminViewSet, basename="admin-journey")
+router.register("admin/hero-templates", story_api.HeroTemplateAdminViewSet, basename="admin-hero-template")
 router.register("admin/story-types", story_api.StoryTypeAdminViewSet, basename="admin-story-type")
 router.register("admin/users", users_api.UserAdminViewSet, basename="admin-user")
 router.register("admin/blog", story_api.BlogAdminViewSet, basename="admin-blog")
 router.register("admin/story-queue", story_api.StoryQueueViewSet, basename="admin-story-queue")
+router.register("admin/pages", pages_api.PageAdminViewSet, basename="admin-page")
+router.register("admin/page-themes", pages_api.PageThemeAdminViewSet, basename="admin-page-theme")
 router.register("auth", users_api.AuthenticationViewSet, basename="auth")
 
 
@@ -109,6 +114,13 @@ def sitemap(request):
         entries.append(
             f"<url><loc>{escape(f'{site_url}/blog/{blog.slug}')}</loc>"
             f"<lastmod>{blog.created_at.date().isoformat()}</lastmod></url>"
+        )
+
+    # Admin-built pages: only live ones the editor hasn't marked noindex.
+    for page in Page.objects.published().filter(noindex=False).only("slug", "updated_at"):
+        entries.append(
+            f"<url><loc>{escape(site_url + page.path)}</loc>"
+            f"<lastmod>{page.updated_at.date().isoformat()}</lastmod></url>"
         )
 
     # Tag/theme pages were orphaned (unreachable from the site) and thin (no
@@ -259,6 +271,7 @@ urlpatterns = [
     path("api/", include(router.urls)),
     path("api/auth/refresh/", TokenRefreshView.as_view(), name="token_refresh"),
     path("api/home/", story_api.HomeDataAPIView.as_view(), name="home-data"),
+    path("api/pages/<slug:slug>/", pages_api.PublicPageAPIView.as_view(), name="public-page"),
     path("api/trending/", story_api.TrendingDataAPIView.as_view(), name="trending-data"),
     path("api/discover/", story_api.DiscoverDataAPIView.as_view(), name="discover-data"),
     path("api/story-map/", story_api.StoryMapAPIView.as_view(), name="story-map-data"),

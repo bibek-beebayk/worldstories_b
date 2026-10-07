@@ -71,6 +71,7 @@ from .models import (
     StoryJourneyItem,
     StoryMood,
     StoryReaction,
+    HeroTemplate,
 )
 from .epub_import_jobs import executor as epub_import_executor, run_epub_import
 from .rich_text import rich_text_has_content
@@ -104,6 +105,8 @@ from .serializers import (
     AdminMoodSerializer,
     AdminStoryJourneyItemSerializer,
     AdminStoryJourneySerializer,
+    AdminHeroTemplateSerializer,
+    serialize_hero,
     AdminStoryMoodSerializer,
     get_cover_image_url,
     AdminThemeSerializer,
@@ -2095,6 +2098,52 @@ class StoryTypeViewSet(ReadOnlyModelViewSet):
     pagination_class = None
 
 
+class HeroTemplateAdminViewSet(ModelViewSet):
+    """Homepage hero templates for the admin panel.
+
+    Which template the site shows is decided by HeroTemplate.objects.current():
+    a scheduled one inside its window, otherwise the default. The public
+    homepage response is cached for DISCOVERY_CACHE_SECONDS, so a change shows
+    up within that long rather than instantly.
+    """
+
+    queryset = HeroTemplate.objects.all()
+    serializer_class = AdminHeroTemplateSerializer
+    permission_classes = [IsSuperUser]
+    pagination_class = None
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        now = timezone.now()
+        current = HeroTemplate.objects.current(now)
+        context.update({"now": now, "current_id": current.pk if current else None})
+        return context
+
+    @action(detail=True, methods=["post"], url_path="set-default")
+    def set_default(self, request, pk=None):
+        template = self.get_object()
+        with transaction.atomic():
+            HeroTemplate.objects.filter(is_default=True).exclude(pk=template.pk).update(is_default=False)
+            template.is_default = True
+            template.save(update_fields=["is_default", "updated_at"])
+        return Response(self.get_serializer(template).data)
+
+    @action(detail=True, methods=["post"])
+    def duplicate(self, request, pk=None):
+        """A copy to start a variant from — never the default and never
+        scheduled, so the copy can't change what the site shows until an
+        editor says so."""
+        source = self.get_object()
+        copy = HeroTemplate.objects.get(pk=source.pk)
+        copy.pk = None
+        copy.name = f"{source.name} (copy)"[:80]
+        copy.is_default = False
+        copy.starts_at = None
+        copy.ends_at = None
+        copy.save()
+        return Response(self.get_serializer(copy).data, status=status.HTTP_201_CREATED)
+
+
 class StoryTypeAdminViewSet(ModelViewSet):
     """Full story-type management (list/create/update/delete) for the admin
     panel. Deletion is blocked while the type is still referenced by any
@@ -2490,6 +2539,11 @@ class HomeDataAPIView(APIView):
         readers_count = (
             Story.objects.published().aggregate(total_readers=Sum("views")).get("total_readers") or 0
         )
+        stats = {
+            "creators": Author.objects.count(),
+            "stories": Story.objects.published().count(),
+            "readers": readers_count,
+        }
 
         return Response(
             {
@@ -2527,12 +2581,9 @@ class HomeDataAPIView(APIView):
                     "recommended": StoryListSerializer(
                         sidebar_recommended, many=True, context={"request": request}
                     ).data,
-                    "stats": {
-                        "creators": Author.objects.count(),
-                        "stories": Story.objects.published().count(),
-                        "readers": readers_count,
-                    },
+                    "stats": stats,
                 },
+                "hero": serialize_hero(HeroTemplate.objects.current(), stats),
             }
         )
 

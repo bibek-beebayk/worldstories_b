@@ -4,7 +4,8 @@ import uuid
 
 from django.db import models
 from django_ckeditor_5.fields import CKEditor5Field
-from django.core.validators import FileExtensionValidator, MinValueValidator, MaxValueValidator
+from django.core.exceptions import ValidationError
+from django.core.validators import FileExtensionValidator, MinValueValidator, MaxValueValidator, RegexValidator
 from django.conf import settings
 from django.dispatch import receiver
 from django.utils import timezone
@@ -695,6 +696,180 @@ class DailyStory(models.Model):
 
     def __str__(self):
         return f"{self.date}: {self.story.title}"
+
+
+hex_color_validator = RegexValidator(
+    r"^#[0-9a-fA-F]{6}$", "Use a 6-digit hex colour such as #ed405a."
+)
+
+
+def hex_color_field(default):
+    return models.CharField(max_length=7, default=default, validators=[hex_color_validator])
+
+
+# Icon and animation names are keys into the frontend's own registries
+# (src/components/home/heroPresets.tsx) — the backend only stores which one to
+# use, so an admin can't inject markup, CSS or script into the homepage. Keep
+# these lists in step with that file; an unknown name falls back to a default
+# icon/preset there rather than breaking the page.
+HERO_ICON_NAMES = [
+    "BookOpen", "BookOpenText", "Feather", "Globe2", "Headphones", "Languages",
+    "Mic2", "Star", "Sparkles", "Heart", "Users", "Clock3", "Music", "Trophy",
+    "Gift", "PartyPopper", "Crown", "Gem", "Rocket", "Zap", "Sun", "Moon",
+    "Cloud", "Leaf", "Flower2", "Snowflake", "TreePine", "Flame", "Ghost",
+    "Skull", "Candy", "Cat", "Castle", "WandSparkles",
+]
+HERO_ICON_CHOICES = [(name, name) for name in HERO_ICON_NAMES]
+
+
+def default_hero_icons():
+    return []
+
+
+class HeroTemplateQuerySet(models.QuerySet):
+    def scheduled_live(self, now=None):
+        now = now or timezone.now()
+        return self.filter(starts_at__lte=now, ends_at__gt=now)
+
+    def current(self, now=None):
+        """The template the homepage shows right now: a scheduled template
+        whose window contains `now` wins (Halloween, a launch week…), and
+        outside every window the default template is shown. None when neither
+        exists — the frontend then falls back to its built-in hero."""
+        live = self.scheduled_live(now).order_by("-starts_at", "-id").first()
+        return live or self.filter(is_default=True).first()
+
+
+class HeroTemplate(TimeStampModel):
+    """Backend-controlled content for the homepage hero.
+
+    The layout is fixed in the frontend; a template only fills it in. One
+    template is the default (always-on), and any template can additionally be
+    scheduled for a window during which it replaces the default.
+    """
+
+    STAT_STORIES = "stories"
+    STAT_CREATORS = "creators"
+    STAT_READERS = "readers"
+    STAT_CUSTOM = "custom"
+    STAT_SOURCE_CHOICES = [
+        (STAT_STORIES, "Live: published stories"),
+        (STAT_CREATORS, "Live: creators"),
+        (STAT_READERS, "Live: readers"),
+        (STAT_CUSTOM, "Custom value"),
+    ]
+
+    ANIMATION_CLASSIC = "classic"
+    ANIMATION_HALLOWEEN = "halloween"
+    ANIMATION_WINTER = "winter"
+    ANIMATION_NONE = "none"
+    ANIMATION_CHOICES = [
+        (ANIMATION_CLASSIC, "Classic — floating reading icons"),
+        (ANIMATION_HALLOWEEN, "Halloween — drifting ghosts and flickering flames"),
+        (ANIMATION_WINTER, "Winter — falling snow"),
+        (ANIMATION_NONE, "None — static background"),
+    ]
+
+    name = models.CharField(max_length=80)
+    is_default = models.BooleanField(default=False, db_index=True)
+    starts_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    ends_at = models.DateTimeField(null=True, blank=True)
+
+    title_prefix = models.CharField(max_length=60, blank=True, default="World")
+    title_highlight = models.CharField(max_length=60, blank=True, default="Stories")
+    title_highlight_from = hex_color_field("#ed405a")
+    title_highlight_to = hex_color_field("#fbbf24")
+    description = models.TextField(max_length=400, blank=True)
+
+    # Whole-row switches, so a template can drop a row without losing its
+    # content. Within a shown row, a blank text/label hides just that item.
+    show_info_lines = models.BooleanField(default=True)
+    show_stats = models.BooleanField(default=True)
+
+    # A blank text hides that line.
+    info_line_1_icon = models.CharField(max_length=30, choices=HERO_ICON_CHOICES, default="BookOpenText")
+    info_line_1_text = models.CharField(max_length=120, blank=True)
+    info_line_2_icon = models.CharField(max_length=30, choices=HERO_ICON_CHOICES, default="Headphones")
+    info_line_2_text = models.CharField(max_length=120, blank=True)
+
+    # A blank label hides that stat.
+    stat_1_source = models.CharField(max_length=10, choices=STAT_SOURCE_CHOICES, default=STAT_STORIES)
+    stat_1_label = models.CharField(max_length=40, blank=True, default="stories")
+    stat_1_value = models.CharField(max_length=20, blank=True)
+    stat_2_source = models.CharField(max_length=10, choices=STAT_SOURCE_CHOICES, default=STAT_CREATORS)
+    stat_2_label = models.CharField(max_length=40, blank=True, default="creators")
+    stat_2_value = models.CharField(max_length=20, blank=True)
+    stat_3_source = models.CharField(max_length=10, choices=STAT_SOURCE_CHOICES, default=STAT_READERS)
+    stat_3_label = models.CharField(max_length=40, blank=True, default="readers")
+    stat_3_value = models.CharField(max_length=20, blank=True)
+
+    cta_label = models.CharField(max_length=40, default="Start Reading")
+    # A site path ("/library") or a full http(s) URL; external links open in a new tab.
+    cta_url = models.CharField(max_length=300, default="/library")
+    cta_bg_from = hex_color_field("#ed405a")
+    cta_bg_to = hex_color_field("#f97316")
+    cta_text_color = hex_color_field("#ffffff")
+
+    background_color = hex_color_field("#1a212d")
+    # Optional; shown full-bleed under a dark overlay so the text stays legible.
+    background_image = models.URLField(blank=True)
+    accent_color = hex_color_field("#ed405a")
+    animation_preset = models.CharField(max_length=20, choices=ANIMATION_CHOICES, default=ANIMATION_CLASSIC)
+    # Empty means "use the preset's own icons".
+    animation_icons = models.JSONField(default=default_hero_icons, blank=True)
+
+    objects = HeroTemplateQuerySet.as_manager()
+
+    class Meta:
+        ordering = ["-is_default", "starts_at", "name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["is_default"],
+                condition=models.Q(is_default=True),
+                name="story_herotemplate_single_default",
+            ),
+        ]
+
+    def __str__(self):
+        return self.name
+
+    def clean(self):
+        errors = {}
+        if bool(self.starts_at) != bool(self.ends_at):
+            errors["ends_at"] = "Set both a start and an end, or neither."
+        elif self.starts_at and self.ends_at <= self.starts_at:
+            errors["ends_at"] = "The end must be after the start."
+        elif self.starts_at:
+            # Overlapping windows would make "which one shows?" depend on a
+            # tiebreak an editor can't see, so refuse them outright.
+            clash = (
+                HeroTemplate.objects.exclude(pk=self.pk)
+                .filter(starts_at__lt=self.ends_at, ends_at__gt=self.starts_at)
+                .first()
+            )
+            if clash:
+                errors["starts_at"] = f'This window overlaps "{clash.name}".'
+
+        is_site_path = self.cta_url.startswith("/") and not self.cta_url.startswith("//")
+        if not (is_site_path or self.cta_url.startswith(("https://", "http://"))):
+            errors["cta_url"] = "Use a site path like /library or a full http(s):// URL."
+
+        if not isinstance(self.animation_icons, list) or any(
+            name not in HERO_ICON_NAMES for name in self.animation_icons
+        ):
+            errors["animation_icons"] = "Pick icons from the available list."
+        elif len(self.animation_icons) > 10:
+            errors["animation_icons"] = "Use at most 10 icons."
+
+        if errors:
+            raise ValidationError(errors)
+
+    def stats(self):
+        return [
+            (self.stat_1_source, self.stat_1_label, self.stat_1_value),
+            (self.stat_2_source, self.stat_2_label, self.stat_2_value),
+            (self.stat_3_source, self.stat_3_label, self.stat_3_value),
+        ]
 
 
 def with_preferred_translation_only(queryset, preferred_language=None, candidate_filter=None):

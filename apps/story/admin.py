@@ -4,9 +4,19 @@ from django.utils.html import strip_tags
 from django.utils import timezone
 from django.utils.text import slugify
 from solo.admin import SingletonModelAdmin
-from .models import Audio, AudioTranscriptCue, Video, Blog, Story, DailyStory, Genre, Category, Mood, StoryJourney, StoryJourneyItem, StoryMood, StoryType, Tag, Theme, Author, Chapter, PromptSettings, Review, Submission, StoryView
+from .models import HeroTemplate, Audio, AudioTranscriptCue, Video, Blog, Story, DailyStory, Genre, Category, Mood, StoryJourney, StoryJourneyItem, StoryMood, StoryType, Tag, Theme, Author, Chapter, PromptSettings, Review, Submission, StoryView
 
 admin.site.register(PromptSettings, SingletonModelAdmin)
+
+
+@admin.register(HeroTemplate)
+class HeroTemplateAdmin(admin.ModelAdmin):
+    """Fallback only — templates are managed from the React admin panel
+    (/admin/hero), which has the live preview."""
+
+    list_display = ("name", "is_default", "starts_at", "ends_at", "animation_preset")
+    list_filter = ("is_default", "animation_preset")
+    search_fields = ("name",)
 
 
 @admin.register(DailyStory)

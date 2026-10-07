@@ -41,6 +41,7 @@ INSTALLED_APPS = [
     "apps.users",
     "apps.story",
     "apps.stats",
+    "apps.pages",
     # "apps.blog"
 ]
 

@@ -1,9 +1,11 @@
 import json
 
 from rest_framework import serializers
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.files.base import ContentFile
 from django.db.models import Case, Count, IntegerField, Q, Value, When
 from django.http import QueryDict
+from django.utils import timezone
 from django.utils.text import slugify
 from django.urls import reverse
 from datetime import date
@@ -32,6 +34,7 @@ from .models import (
     StoryQueue,
     StoryType,
     DailyStory,
+    HeroTemplate,
     published_story_q,
     with_preferred_translation_only,
 )
@@ -1511,6 +1514,101 @@ class PromptSettingsSerializer(serializers.ModelSerializer):
             "excerpt_instructions", "excerpt_model",
             "book_fetch_instructions", "book_fetch_model",
         ]
+
+
+class AdminHeroTemplateSerializer(serializers.ModelSerializer):
+    """Every editable field flat, as the admin form edits them. `is_default`
+    is read-only here — it moves between templates through the viewset's
+    set-default action, so the single-default constraint is never tripped by
+    a plain form save."""
+
+    status = serializers.SerializerMethodField()
+
+    def get_status(self, obj):
+        now = self.context.get("now") or timezone.now()
+        if obj.pk == self.context.get("current_id"):
+            return "live"
+        if obj.starts_at and obj.starts_at > now:
+            return "scheduled"
+        if obj.ends_at and obj.ends_at <= now:
+            return "ended"
+        return "idle"
+
+    def validate(self, attrs):
+        # DRF never calls full_clean(), so run the model's cross-field rules
+        # (schedule window, overlaps, CTA url, icon list) on the merged result.
+        instance = HeroTemplate(**{**self._current_values(), **attrs})
+        try:
+            instance.clean()
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(exc.message_dict)
+        return attrs
+
+    def _current_values(self):
+        if not self.instance:
+            return {}
+        return {
+            field.name: getattr(self.instance, field.name)
+            for field in HeroTemplate._meta.concrete_fields
+        }
+
+    class Meta:
+        model = HeroTemplate
+        exclude = ["created_at"]
+        read_only_fields = ["is_default", "updated_at"]
+
+
+def serialize_hero(template, live_stats):
+    """The public shape of a hero template, with each stat resolved to the
+    number or text the homepage should print. Numbers stay numbers so the
+    frontend can abbreviate them (12.3K) the same way it always has."""
+    if template is None:
+        return None
+
+    stats = []
+    for source, label, value in template.stats():
+        if not template.show_stats or not label:
+            continue
+        stats.append(
+            {
+                "label": label,
+                "value": value if source == HeroTemplate.STAT_CUSTOM else live_stats.get(source, 0),
+            }
+        )
+
+    return {
+        "id": template.id,
+        "title": {
+            "prefix": template.title_prefix,
+            "highlight": template.title_highlight,
+            "highlight_from": template.title_highlight_from,
+            "highlight_to": template.title_highlight_to,
+        },
+        "description": template.description,
+        "info_lines": [
+            {"icon": icon, "text": text}
+            for icon, text in (
+                (template.info_line_1_icon, template.info_line_1_text),
+                (template.info_line_2_icon, template.info_line_2_text),
+            )
+            if template.show_info_lines and text
+        ],
+        "stats": stats,
+        "cta": {
+            "label": template.cta_label,
+            "url": template.cta_url,
+            "bg_from": template.cta_bg_from,
+            "bg_to": template.cta_bg_to,
+            "text_color": template.cta_text_color,
+        },
+        "background": {
+            "color": template.background_color,
+            "image": template.background_image,
+            "accent": template.accent_color,
+            "animation": template.animation_preset,
+            "icons": template.animation_icons,
+        },
+    }
 
 
 class LinkedStorySummarySerializer(serializers.ModelSerializer):

@@ -25,7 +25,7 @@ from pydantic import ValidationError as PydanticValidationError
 
 from apps.stats.models import AnalyticsEvent, StoryCompletion
 from apps.story.api import StoryMapAPIView, StoryViewSet, open_s3_audio_stream
-from apps.story.models import Mood, StoryJourney, StoryMood, StoryReaction
+from apps.story.models import HeroTemplate, Mood, StoryJourney, StoryMood, StoryReaction
 from apps.story.ai_generation import GenerationError, _GenerationOutput, _to_plain_text, generate
 from apps.story.ai_generation_jobs import _concatenated_chapter_text, run_generate_blog_excerpt, run_generate_field
 from apps.story.book_fetch import (
@@ -1407,6 +1407,7 @@ class ScheduledPublishingTests(SimpleTestCase):
         self.assertEqual(story.site_published_date, date(2026, 9, 4))
         model_save.assert_called_once()
 
+    @patch("core.urls.Page.objects.published")
     @patch("core.urls.Category.objects.annotate")
     @patch("core.urls.Genre.objects.annotate")
     @patch("core.urls.Theme.objects.annotate")
@@ -1415,8 +1416,10 @@ class ScheduledPublishingTests(SimpleTestCase):
     @patch("core.urls.Blog.objects.published")
     @patch("core.urls.Story.objects.published")
     def test_sitemap_uses_scheduled_publication_gate(
-        self, published, blogs_published, authors_all, tags_annotate, themes_annotate, genres_annotate, categories_annotate
+        self, published, blogs_published, authors_all, tags_annotate, themes_annotate, genres_annotate,
+        categories_annotate, pages_published,
     ):
+        pages_published.return_value.filter.return_value.only.return_value = []
         chapter = SimpleNamespace(slug="chapter-one")
         original = SimpleNamespace(
             slug="visible-story",
@@ -5940,3 +5943,153 @@ class StoryReactionApiTests(APITestCase):
         self.assertEqual(
             Review.objects.get(user=self.user, story=self.story).rating, 5
         )
+
+
+class HeroTemplateTests(APITestCase):
+    """Backend-controlled homepage hero: which template shows, and how the
+    admin panel manages them."""
+
+    def setUp(self):
+        cache.clear()
+        # The migration seeds a "Regular" default; start from a known state.
+        HeroTemplate.objects.all().delete()
+        self.admin = User.objects.create_user(
+            email="heroadmin@example.com", username="heroadmin",
+            password="test-password", is_superuser=True, is_staff=True, is_active=True,
+        )
+        self.reader = User.objects.create_user(
+            email="heroreader@example.com", username="heroreader", password="test-password"
+        )
+        self.regular = HeroTemplate.objects.create(name="Regular", is_default=True)
+        self.now = timezone.now()
+
+    def _scheduled(self, name, start_days, end_days):
+        return HeroTemplate.objects.create(
+            name=name,
+            starts_at=self.now + timedelta(days=start_days),
+            ends_at=self.now + timedelta(days=end_days),
+        )
+
+    def test_default_shows_outside_any_schedule(self):
+        self._scheduled("Later", 5, 10)
+        self._scheduled("Earlier", -10, -5)
+        self.assertEqual(HeroTemplate.objects.current(self.now), self.regular)
+
+    def test_scheduled_template_overrides_default_inside_its_window(self):
+        halloween = self._scheduled("Halloween", -1, 1)
+        self.assertEqual(HeroTemplate.objects.current(self.now), halloween)
+
+    def test_current_is_none_without_default_or_live_schedule(self):
+        self.regular.delete()
+        self.assertIsNone(HeroTemplate.objects.current(self.now))
+
+    def test_only_one_default_is_allowed(self):
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            HeroTemplate.objects.create(name="Second", is_default=True)
+
+    def test_home_payload_resolves_live_and_custom_stats(self):
+        self.regular.stat_2_source = HeroTemplate.STAT_CUSTOM
+        self.regular.stat_2_value = "13"
+        self.regular.stat_2_label = "spooky tales"
+        self.regular.stat_3_label = ""
+        self.regular.info_line_2_text = ""
+        self.regular.save()
+        Story.objects.create(title="Live", slug="hero-live", is_published=True)
+
+        hero = self.client.get(reverse("home-data")).json()["hero"]
+
+        self.assertEqual(
+            hero["stats"],
+            [{"label": "stories", "value": 1}, {"label": "spooky tales", "value": "13"}],
+        )
+        self.assertEqual(hero["info_lines"], [])
+        self.assertEqual(hero["cta"]["url"], "/library")
+        self.assertEqual(hero["background"]["animation"], "classic")
+
+    def test_row_switches_hide_whole_rows_but_keep_their_content(self):
+        self.regular.info_line_1_text = "Full novels"
+        self.regular.show_info_lines = False
+        self.regular.show_stats = False
+        self.regular.save()
+
+        hero = self.client.get(reverse("home-data")).json()["hero"]
+
+        self.assertEqual(hero["info_lines"], [])
+        self.assertEqual(hero["stats"], [])
+        self.regular.refresh_from_db()
+        self.assertEqual(self.regular.info_line_1_text, "Full novels")
+
+    def test_home_payload_hero_is_null_when_nothing_applies(self):
+        self.regular.delete()
+        self.assertIsNone(self.client.get(reverse("home-data")).json()["hero"])
+
+    def test_admin_api_requires_superuser(self):
+        self.client.force_authenticate(self.reader)
+        self.assertEqual(self.client.get(reverse("admin-hero-template-list")).status_code, 403)
+
+    def test_admin_lists_with_status(self):
+        self.client.force_authenticate(self.admin)
+        self._scheduled("Later", 5, 10)
+        rows = {row["name"]: row["status"] for row in self.client.get(reverse("admin-hero-template-list")).json()}
+        self.assertEqual(rows, {"Regular": "live", "Later": "scheduled"})
+
+    def test_admin_rejects_overlapping_schedule(self):
+        self.client.force_authenticate(self.admin)
+        self._scheduled("Halloween", 1, 5)
+        response = self.client.post(
+            reverse("admin-hero-template-list"),
+            {
+                "name": "Clash",
+                "starts_at": (self.now + timedelta(days=3)).isoformat(),
+                "ends_at": (self.now + timedelta(days=8)).isoformat(),
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("starts_at", response.json())
+
+    def test_admin_rejects_half_a_schedule_and_unsafe_urls(self):
+        self.client.force_authenticate(self.admin)
+        url = reverse("admin-hero-template-detail", kwargs={"pk": self.regular.pk})
+        half = self.client.patch(url, {"starts_at": self.now.isoformat()}, format="json")
+        self.assertIn("ends_at", half.json())
+        for bad in ["javascript:alert(1)", "//evil.example", "library"]:
+            response = self.client.patch(url, {"cta_url": bad}, format="json")
+            self.assertEqual(response.status_code, 400, bad)
+        bad_icon = self.client.patch(url, {"animation_icons": ["NotAnIcon"]}, format="json")
+        self.assertEqual(bad_icon.status_code, 400)
+
+    def test_admin_cannot_set_default_through_a_plain_save(self):
+        self.client.force_authenticate(self.admin)
+        other = HeroTemplate.objects.create(name="Other")
+        self.client.patch(
+            reverse("admin-hero-template-detail", kwargs={"pk": other.pk}),
+            {"is_default": True},
+            format="json",
+        )
+        other.refresh_from_db()
+        self.assertFalse(other.is_default)
+
+    def test_set_default_moves_the_flag(self):
+        self.client.force_authenticate(self.admin)
+        other = HeroTemplate.objects.create(name="Other")
+        response = self.client.post(reverse("admin-hero-template-set-default", kwargs={"pk": other.pk}))
+        self.assertEqual(response.status_code, 200)
+        self.regular.refresh_from_db()
+        other.refresh_from_db()
+        self.assertFalse(self.regular.is_default)
+        self.assertTrue(other.is_default)
+
+    def test_duplicate_is_neither_default_nor_scheduled(self):
+        self.client.force_authenticate(self.admin)
+        self.regular.starts_at = self.now - timedelta(days=1)
+        self.regular.ends_at = self.now + timedelta(days=1)
+        self.regular.cta_label = "Read now"
+        self.regular.save()
+        response = self.client.post(reverse("admin-hero-template-duplicate", kwargs={"pk": self.regular.pk}))
+        self.assertEqual(response.status_code, 201)
+        copy = HeroTemplate.objects.get(pk=response.json()["id"])
+        self.assertEqual(copy.name, "Regular (copy)")
+        self.assertEqual(copy.cta_label, "Read now")
+        self.assertFalse(copy.is_default)
+        self.assertIsNone(copy.starts_at)
