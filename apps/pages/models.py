@@ -6,7 +6,25 @@ from django.db import models
 from django.db.models import Q
 from django.utils import timezone
 
+from solo.models import SingletonModel
+
 from core.libs.models import TimeStampModel
+
+
+class SiteSettings(SingletonModel):
+    """Site-wide switches edited from the admin panel's Customize → Site
+    Settings page. One row (django-solo)."""
+
+    # On: About, Contact and the footer name the publisher (person, city,
+    # personal email). Off: only "WorldStories" and the site's own address.
+    # The details themselves live in the frontend (src/lib/siteIdentity.ts).
+    show_publisher_info = models.BooleanField(default=False)
+
+    class Meta:
+        verbose_name = "Site settings"
+
+    def __str__(self):
+        return "Site settings"
 
 
 class PageQuerySet(models.QuerySet):

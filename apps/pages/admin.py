@@ -1,6 +1,8 @@
 from django.contrib import admin
 
-from .models import Page, PageBlock, PageRedirect, PageTheme, SiteTheme
+from solo.admin import SingletonModelAdmin
+
+from .models import Page, PageBlock, PageRedirect, PageTheme, SiteSettings, SiteTheme
 
 
 class PageBlockInline(admin.TabularInline):
@@ -38,3 +40,6 @@ class SiteThemeAdmin(admin.ModelAdmin):
     list_display = ("name", "mode", "apply_to", "starts_at", "ends_at")
     list_filter = ("mode", "apply_to")
     search_fields = ("name",)
+
+
+admin.site.register(SiteSettings, SingletonModelAdmin)

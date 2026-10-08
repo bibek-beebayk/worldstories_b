@@ -436,3 +436,24 @@ class StorySiteThemeTests(PageTestBase):
         self.theme.delete()
         self.story.refresh_from_db()
         self.assertIsNone(self.story.site_theme)
+
+
+class SiteSettingsTests(PageTestBase):
+    def test_publisher_info_is_hidden_by_default(self):
+        self.assertEqual(self.client.get(reverse("site-settings")).json(), {"show_publisher_info": False})
+
+    def test_admin_toggles_it_and_the_public_endpoint_follows(self):
+        self.client.force_authenticate(self.admin)
+        response = self.client.patch(reverse("admin-site-settings"), {"show_publisher_info": True}, format="json")
+        self.assertEqual(response.json(), {"show_publisher_info": True})
+        cache.clear()
+        self.client.force_authenticate(None)
+        self.assertTrue(self.client.get(reverse("site-settings")).json()["show_publisher_info"])
+
+    def test_admin_endpoint_requires_superuser(self):
+        self.client.force_authenticate(self.reader)
+        self.assertEqual(self.client.get(reverse("admin-site-settings")).status_code, 403)
+        self.assertEqual(
+            self.client.patch(reverse("admin-site-settings"), {"show_publisher_info": True}, format="json").status_code,
+            403,
+        )

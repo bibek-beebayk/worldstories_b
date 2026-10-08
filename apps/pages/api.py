@@ -2,7 +2,7 @@ from django.db import transaction
 from django.utils import timezone
 from django.utils.decorators import method_decorator
 from django.views.decorators.cache import cache_page
-from rest_framework import status
+from rest_framework import serializers, status
 from rest_framework.decorators import action
 from rest_framework.filters import SearchFilter
 from rest_framework.permissions import AllowAny
@@ -14,7 +14,7 @@ from apps.story.api import IsSuperUser
 from core.libs.site_sources import is_nepalikatha_request
 
 from .blocks import resolve_block
-from .models import Page, PageBlock, PageRedirect, PageTheme, SiteTheme
+from .models import Page, PageBlock, PageRedirect, PageTheme, SiteSettings, SiteTheme
 from .serializers import (
     AdminPageListSerializer,
     AdminPageThemeSerializer,
@@ -203,3 +203,34 @@ class PublicPageAPIView(APIView):
             return Response({"redirect": redirect.page.path})
 
         return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
+
+
+class SiteSettingsSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SiteSettings
+        fields = ["show_publisher_info"]
+
+
+@method_decorator(cache_page(60), name="get")
+class PublicSiteSettingsAPIView(APIView):
+    """The switches the public site renders from — read once per full page
+    load by the frontend's root loader. Cached briefly, so a change shows up
+    within a minute."""
+
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        return Response(SiteSettingsSerializer(SiteSettings.get_solo()).data)
+
+
+class AdminSiteSettingsAPIView(APIView):
+    permission_classes = [IsSuperUser]
+
+    def get(self, request):
+        return Response(SiteSettingsSerializer(SiteSettings.get_solo()).data)
+
+    def patch(self, request):
+        serializer = SiteSettingsSerializer(SiteSettings.get_solo(), data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data)
