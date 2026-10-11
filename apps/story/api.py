@@ -1857,18 +1857,36 @@ class AudioAdminViewSet(ModelViewSet):
 
 
 class VideoAdminViewSet(ModelViewSet):
-    queryset = Video.objects.select_related("story").all().order_by("story_id", "order")
+    """Serves two callers: the story editor's per-story video list
+    (`?story=<id>`, unpaginated, in playback order) and the standalone
+    Videos admin page (paged, newest first, optionally `?has_story=`)."""
+
+    queryset = Video.objects.select_related("story").all().order_by("-created_at", "-id")
     serializer_class = VideoAdminSerializer
-    pagination_class = AdminStoryItemPagination
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
     permission_classes = [IsSuperUser]
     filter_backends = [SearchFilter]
-    search_fields = ["title", "slug", "story__title"]
+    search_fields = ["title", "slug", "youtube_id", "story__title"]
+
+    @property
+    def paginator(self):
+        if not hasattr(self, "_paginator"):
+            if self.request.query_params.get("story"):
+                self._paginator = AdminStoryItemPagination()
+            else:
+                self._paginator = PageNumberPagination()
+        return self._paginator
 
     def get_queryset(self):
         queryset = super().get_queryset()
         story_id = self.request.query_params.get("story")
         if story_id:
             queryset = queryset.filter(story_id=story_id).order_by("order", "id")
+        has_story = (self.request.query_params.get("has_story") or "").lower()
+        if has_story == "true":
+            queryset = queryset.filter(story__isnull=False)
+        elif has_story == "false":
+            queryset = queryset.filter(story__isnull=True)
         return queryset
 
     def perform_destroy(self, instance):
@@ -1877,6 +1895,9 @@ class VideoAdminViewSet(ModelViewSet):
         instance.delete()
 
         # Keep order contiguous from 1 — see ChapterAdminViewSet.perform_destroy.
+        # Standalone videos have no sibling ordering to maintain.
+        if story is None:
+            return
         later_videos = Video.objects.filter(story=story, order__gt=deleted_order).order_by("order")
         for video in later_videos:
             video.order -= 1
@@ -2973,8 +2994,8 @@ class AdminOverviewAPIView(APIView):
                 "title": video.title,
                 "slug": video.slug,
                 "story_id": video.story_id,
-                "story_title": video.story.title,
-                "story_slug": video.story.slug,
+                "story_title": video.story.title if video.story else None,
+                "story_slug": video.story.slug if video.story else None,
                 "watchers_count": video.watchers_count,
                 "avg_progress": round(float(video.avg_progress or 0), 3),
             }

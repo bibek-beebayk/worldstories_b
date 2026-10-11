@@ -116,6 +116,7 @@ class VideoInline(admin.StackedInline):
         "youtube_id",
         "duration_seconds",
         "aspect_ratio",
+        "cover_image_file",
     )
     readonly_fields = ("youtube_id",)
 
@@ -492,6 +493,31 @@ class AudioAdmin(admin.ModelAdmin):
     @admin.display(boolean=True, description="Timed cues")
     def has_timed_cues(self, obj):
         return obj.transcript_cues.exists()
+
+
+@admin.register(Video)
+class VideoAdmin(admin.ModelAdmin):
+    """Top-level so videos with no story (standalone) can be managed too;
+    story-bound videos are still editable via VideoInline on StoryAdmin."""
+
+    list_display = ("title", "story", "order", "slug", "youtube_id", "aspect_ratio")
+    search_fields = ("title", "slug", "youtube_id", "story__title")
+    list_filter = (("story", admin.EmptyFieldListFilter), "aspect_ratio")
+    list_select_related = ("story",)
+    autocomplete_fields = ("story",)
+    ordering = ("story__title", "order")
+    fields = (
+        "story",
+        "title",
+        "slug",
+        "order",
+        "youtube_url",
+        "youtube_id",
+        "duration_seconds",
+        "aspect_ratio",
+        "cover_image_file",
+    )
+    readonly_fields = ("youtube_id",)
 
 
 @admin.register(AudioTranscriptCue)

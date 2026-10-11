@@ -3,7 +3,7 @@ import json
 from rest_framework import serializers
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.files.base import ContentFile
-from django.db.models import Case, Count, IntegerField, Q, Value, When
+from django.db.models import Case, Count, IntegerField, Max, Q, Value, When
 from django.http import QueryDict
 from django.utils import timezone
 from django.utils.text import slugify
@@ -48,6 +48,7 @@ from .rich_text import rich_text_has_content, sanitize_reader_html
 CARD_COVER_SIZE = "480x640"
 LARGE_COVER_SIZE = "900x1200"
 BLOG_COVER_SIZE = "1200x630"
+VIDEO_COVER_SIZE = "1280x1280"
 
 
 class GenreSerializer(serializers.ModelSerializer):
@@ -792,6 +793,12 @@ class ReadAlongSerializer(serializers.BaseSerializer):
 
 
 class VideoSerializer(serializers.ModelSerializer):
+    cover_image = serializers.SerializerMethodField()
+
+    def get_cover_image(self, obj):
+        request = self.context.get("request")
+        return get_cover_image_url(obj.cover_image_file, None, request, size=VIDEO_COVER_SIZE)
+
     class Meta:
         model = Video
         fields = [
@@ -802,6 +809,7 @@ class VideoSerializer(serializers.ModelSerializer):
             "order",
             "duration_seconds",
             "aspect_ratio",
+            "cover_image",
         ]
 
 
@@ -1496,7 +1504,7 @@ class ChapterAdminSerializer(serializers.ModelSerializer):
         title = attrs.get("title") or getattr(self.instance, "title", "")
         slug = attrs.get("slug")
 
-        if story and title and (slug is None or str(slug).strip() == ""):
+        if title and (slug is None or str(slug).strip() == ""):
             attrs["slug"] = self._build_unique_slug(story, title, self.instance)
         return attrs
 
@@ -1896,7 +1904,7 @@ class AudioAdminSerializer(serializers.ModelSerializer):
         title = attrs.get("title") or getattr(self.instance, "title", "")
         slug = attrs.get("slug")
 
-        if story and title and (slug is None or str(slug).strip() == ""):
+        if title and (slug is None or str(slug).strip() == ""):
             attrs["slug"] = self._build_unique_slug(story, title, self.instance)
         return attrs
 
@@ -1982,6 +1990,30 @@ class VideoAdminSerializer(serializers.ModelSerializer):
     # Accepts a URL or bare id on write; the parsed 11-char id is returned.
     youtube_url = serializers.CharField()
     duration_seconds = FlexibleDurationField(required=False, allow_null=True)
+    remove_cover_image_file = serializers.BooleanField(required=False, write_only=True)
+    cover_image_url = serializers.SerializerMethodField(read_only=True)
+    story_detail = serializers.SerializerMethodField(read_only=True)
+
+    def get_cover_image_url(self, obj):
+        if obj.cover_image_file:
+            request = self.context.get("request")
+            return request.build_absolute_uri(obj.cover_image_file.url) if request else obj.cover_image_file.url
+        return ""
+
+    def get_story_detail(self, obj):
+        if obj.story is None:
+            return None
+        return {"id": obj.story.id, "title": obj.story.title, "slug": obj.story.slug}
+
+    def update(self, instance, validated_data):
+        if validated_data.pop("remove_cover_image_file", False) and instance.cover_image_file:
+            instance.cover_image_file.delete(save=False)
+            instance.cover_image_file = None
+        return super().update(instance, validated_data)
+
+    def create(self, validated_data):
+        validated_data.pop("remove_cover_image_file", None)
+        return super().create(validated_data)
 
     def _build_unique_slug(self, story, title: str, instance=None) -> str:
         base_slug = slugify(title) or "video"
@@ -1994,6 +2026,24 @@ class VideoAdminSerializer(serializers.ModelSerializer):
             slug = f"{base_slug}-{suffix}"
             suffix += 1
         return slug
+
+    def to_internal_value(self, data):
+        attrs = super().to_internal_value(data)
+        # The Videos admin page doesn't ask for an order — append to the end
+        # of the story's list when a video is created for (or moved to) a
+        # story. Done here rather than in validate() so it happens before the
+        # (story, order) UniqueTogetherValidator would reject the default of 1.
+        story = attrs.get("story") or getattr(self.instance, "story", None)
+        story_changed = self.instance is None or (
+            "story" in attrs and attrs["story"] != self.instance.story
+        )
+        # Checks `data`, not `attrs`: DRF fills in the model default (1) for
+        # unique_together fields, so "order" is always in attrs.
+        order_sent = hasattr(data, "get") and data.get("order") not in (None, "")
+        if story and not order_sent and story_changed:
+            last_order = Video.objects.filter(story=story).aggregate(m=Max("order"))["m"] or 0
+            attrs["order"] = last_order + 1
+        return attrs
 
     def validate_youtube_url(self, value):
         video_id = parse_youtube_id(value)
@@ -2009,7 +2059,7 @@ class VideoAdminSerializer(serializers.ModelSerializer):
         title = attrs.get("title") or getattr(self.instance, "title", "")
         slug = attrs.get("slug")
 
-        if story and title and (slug is None or str(slug).strip() == ""):
+        if title and (slug is None or str(slug).strip() == ""):
             attrs["slug"] = self._build_unique_slug(story, title, self.instance)
 
         parsed_id = getattr(self, "_parsed_youtube_id", None)
@@ -2029,8 +2079,13 @@ class VideoAdminSerializer(serializers.ModelSerializer):
             "order",
             "duration_seconds",
             "aspect_ratio",
+            "cover_image_file",
+            "remove_cover_image_file",
+            "cover_image_url",
+            "story_detail",
+            "created_at",
         ]
-        read_only_fields = ["youtube_id"]
+        read_only_fields = ["youtube_id", "created_at"]
 
 
 class SubmissionAdminSerializer(serializers.ModelSerializer):

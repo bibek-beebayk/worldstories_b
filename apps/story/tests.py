@@ -2206,6 +2206,39 @@ class PublicAuthorApiTests(APITestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual([story["slug"] for story in response.data["results"]], ["story-with-video"])
 
+    def test_story_list_video_recent_sort_orders_by_newest_video(self):
+        # Published later, but its video is older — must sort after.
+        newer_story = Story.objects.create(
+            title="Newer Story",
+            slug="newer-story",
+            is_published=True,
+            site_published_date=timezone.now(),
+        )
+        older_story = Story.objects.create(
+            title="Older Story",
+            slug="older-story",
+            is_published=True,
+            site_published_date=timezone.now() - timedelta(days=30),
+        )
+        for story, days_ago in ((newer_story, 10), (older_story, 1)):
+            video = Video.objects.create(
+                story=story,
+                title=f"{story.title} video",
+                slug=f"{story.slug}-video",
+                order=1,
+                youtube_url="https://youtu.be/dQw4w9WgXcQ",
+                youtube_id="dQw4w9WgXcQ",
+            )
+            Video.objects.filter(pk=video.pk).update(created_at=timezone.now() - timedelta(days=days_ago))
+
+        response = self.client.get(reverse("story-list"), {"has_video": "true", "sort": "video_recent"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            [story["slug"] for story in response.data["results"]],
+            ["older-story", "newer-story"],
+        )
+
     def test_story_list_can_filter_by_has_summary(self):
         Story.objects.create(
             title="Story With Summary",
@@ -3422,6 +3455,76 @@ class DeleteChapterReordersRemainingChaptersTests(APITestCase):
         remaining = list(Chapter.objects.filter(story=story).order_by("order"))
         self.assertEqual([c.order for c in remaining], [1, 2])
         self.assertEqual([c.title for c in remaining], ["Chapter 1", "Chapter 2"])
+
+
+class VideoAdminApiTests(APITestCase):
+    URL = "/api/admin/videos/"
+    YOUTUBE_URL = "https://youtu.be/dQw4w9WgXcQ"
+
+    def setUp(self):
+        self.client.force_authenticate(
+            user=User.objects.create(
+                email="videoadmin@example.com", username="videoadmin", is_superuser=True, is_staff=True, is_active=True
+            )
+        )
+
+    def _video(self, story=None, **kwargs):
+        defaults = {"title": "Clip", "slug": "clip", "order": 1, "youtube_url": self.YOUTUBE_URL, "youtube_id": "dQw4w9WgXcQ"}
+        defaults.update(kwargs)
+        return Video.objects.create(story=story, **defaults)
+
+    def test_create_standalone_video(self):
+        response = self.client.post(self.URL, {"title": "Standalone Clip", "youtube_url": self.YOUTUBE_URL}, format="json")
+
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertIsNone(response.data["story"])
+        self.assertIsNone(response.data["story_detail"])
+        self.assertEqual(response.data["slug"], "standalone-clip")
+        self.assertEqual(response.data["youtube_id"], "dQw4w9WgXcQ")
+
+    def test_create_for_story_without_order_appends_to_end(self):
+        story = Story.objects.create(title="Story", slug="story")
+        self._video(story=story, order=1)
+        self._video(story=story, slug="clip-2", order=2)
+
+        response = self.client.post(
+            self.URL, {"story": story.id, "title": "Third", "youtube_url": self.YOUTUBE_URL}, format="json"
+        )
+
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(response.data["order"], 3)
+        self.assertEqual(response.data["story_detail"]["slug"], "story")
+
+    def test_detaching_video_from_story(self):
+        story = Story.objects.create(title="Story", slug="story")
+        video = self._video(story=story)
+
+        response = self.client.patch(f"{self.URL}{video.id}/", {"story": None}, format="json")
+
+        self.assertEqual(response.status_code, 200, response.data)
+        video.refresh_from_db()
+        self.assertIsNone(video.story)
+
+    def test_list_is_paged_newest_first_and_filters_by_has_story(self):
+        story = Story.objects.create(title="Story", slug="story")
+        older = self._video(story=story, slug="older")
+        newer = self._video(slug="newer")
+        Video.objects.filter(pk=older.pk).update(created_at=timezone.now() - timedelta(days=1))
+
+        response = self.client.get(self.URL)
+        self.assertEqual([v["id"] for v in response.data["results"]], [newer.id, older.id])
+        self.assertIn("pages", response.data["pagination"])
+
+        response = self.client.get(self.URL, {"has_story": "false"})
+        self.assertEqual([v["id"] for v in response.data["results"]], [newer.id])
+
+    def test_deleting_standalone_video(self):
+        video = self._video()
+
+        response = self.client.delete(f"{self.URL}{video.id}/")
+
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(Video.objects.filter(pk=video.pk).exists())
 
 
 def _mock_response(text="Generated text.", confident=True, note=""):

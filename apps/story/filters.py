@@ -1,6 +1,6 @@
 from django_filters import rest_framework as filters
-from django.db.models import Q
-from .models import Story, StoryMood
+from django.db.models import F, OuterRef, Q, Subquery
+from .models import Story, StoryMood, Video
 
 def public_story_mood_q():
     """Mood assignments a reader may see: an administrator's choice, or a
@@ -148,6 +148,18 @@ class StoryFilter(filters.FilterSet):
     def filter_sort(self, queryset, name, value):
         if value.lower() == "recent":
             return queryset.order_by("-site_published_date")
+        # Watch page: newest video first, regardless of when the story itself
+        # was published. A subquery rather than Max("videos__created_at") so it
+        # doesn't interact with joins added by other filters (has_video, genres…).
+        elif value.lower() == "video_recent":
+            latest_video_at = (
+                Video.objects.filter(story=OuterRef("pk"))
+                .order_by("-created_at")
+                .values("created_at")[:1]
+            )
+            return queryset.annotate(latest_video_at=Subquery(latest_video_at)).order_by(
+                F("latest_video_at").desc(nulls_last=True), "-id"
+            )
         # TODO: Fix sorting logic
         elif value.lower() == "popular":
             return queryset.order_by("site_published_date")

@@ -1,13 +1,13 @@
 from django.core.management.base import BaseCommand
 
-from apps.story.models import Blog, Story
+from apps.story.models import Blog, Story, Video
 from core.libs.images import warm_bulk
 
 
 class Command(BaseCommand):
     help = (
         "Generates and uploads the resized cover-image renditions (Story.SIZES/"
-        "Blog.SIZES) for existing rows, so GENERATE_IMAGE_RENDITIONS_ON_REQUEST="
+        "Blog.SIZES/Video.SIZES) for existing rows, so GENERATE_IMAGE_RENDITIONS_ON_REQUEST="
         "False (prod) serves an already-made small file instead of falling back "
         "to the full original upload. New saves are warmed automatically by the "
         "post_save signal in apps/story/models.py — this command is only for "
@@ -19,7 +19,7 @@ class Command(BaseCommand):
     def add_arguments(self, parser):
         parser.add_argument(
             "--model",
-            choices=["story", "blog", "all"],
+            choices=["story", "blog", "video", "all"],
             default="all",
             help="Which model's covers to warm (default: all).",
         )
@@ -30,6 +30,8 @@ class Command(BaseCommand):
             targets.append(("Story", Story.objects.exclude(cover_image_file="")))
         if options["model"] in ("blog", "all"):
             targets.append(("Blog", Blog.objects.exclude(cover_image_file="")))
+        if options["model"] in ("video", "all"):
+            targets.append(("Video", Video.objects.exclude(cover_image_file="")))
 
         for label, queryset in targets:
             total = queryset.count()

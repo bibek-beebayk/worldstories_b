@@ -1254,11 +1254,18 @@ class AudioTranscriptCue(models.Model):
 
 
 class Video(models.Model):
-    """A YouTube-hosted video narration of a story. One story can have many
-    videos (ordered), mirroring Audio — but the media lives on YouTube, so we
-    store only the video id / URL, not a file."""
+    """A YouTube-hosted video. Usually a narration of a story — one story can
+    have many videos (ordered), mirroring Audio — but `story` is optional so a
+    video can also stand on its own. The media lives on YouTube, so we store
+    only the video id / URL, not a file."""
 
-    story = models.ForeignKey(Story, on_delete=models.CASCADE, related_name="videos")
+    story = models.ForeignKey(
+        Story,
+        on_delete=models.CASCADE,
+        related_name="videos",
+        null=True,
+        blank=True,
+    )
     title = models.CharField(max_length=256)
     slug = models.SlugField(max_length=256, null=True)
     # Canonical 11-char YouTube id, stored bare (derived from youtube_url).
@@ -1274,9 +1281,21 @@ class Video(models.Model):
         choices=(("16:9", "Landscape (16:9)"), ("9:16", "Portrait (9:16)")),
         default="16:9",
     )
+    cover_image_file = VersatileImageField(upload_to="video_covers/", blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
+    # Keep in sync with VIDEO_COVER_SIZE in apps/story/serializers.py — see the
+    # matching comment on Story.SIZES for why this exists. A square bounding
+    # box so both 16:9 and 9:16 covers keep their aspect ratio.
+    SIZES = {
+        "cover_image_file": {
+            "card": "thumbnail__1280x1280",
+        }
+    }
+
     def __str__(self):
+        if self.story_id is None:
+            return f"Video: {self.title}"
         return f"Video for {self.story.title}: {self.title}"
 
     def save(self, *args, **kwargs):
@@ -1550,4 +1569,9 @@ def warm_story_cover(sender, instance, **kwargs):
 
 @receiver(models.signals.post_save, sender=Blog)
 def warm_blog_cover(sender, instance, **kwargs):
+    _warm_cover_image(instance)
+
+
+@receiver(models.signals.post_save, sender=Video)
+def warm_video_cover(sender, instance, **kwargs):
     _warm_cover_image(instance)
