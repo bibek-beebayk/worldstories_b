@@ -3457,6 +3457,44 @@ class DeleteChapterReordersRemainingChaptersTests(APITestCase):
         self.assertEqual([c.title for c in remaining], ["Chapter 1", "Chapter 2"])
 
 
+class StoryExternalLinkTests(APITestCase):
+    def test_admin_saves_external_link_fields_and_story_detail_returns_them(self):
+        self.client.force_authenticate(
+            user=User.objects.create(
+                email="linkadmin@example.com", username="linkadmin", is_superuser=True, is_staff=True, is_active=True
+            )
+        )
+        story = Story.objects.create(title="Linked Story", slug="linked-story", is_published=True)
+
+        response = self.client.patch(
+            f"/api/admin/stories/{story.id}/",
+            {
+                "external_link": "https://www.amazon.com/dp/B000000000",
+                "link_note": "Available on Amazon",
+                "link_label": "Buy on Amazon",
+            },
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+
+        self.client.force_authenticate(user=None)
+        response = self.client.get(reverse("story-detail", args=[story.slug]))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["external_link"], "https://www.amazon.com/dp/B000000000")
+        self.assertEqual(response.data["link_note"], "Available on Amazon")
+        self.assertEqual(response.data["link_label"], "Buy on Amazon")
+
+    def test_external_link_fields_default_to_empty(self):
+        story = Story.objects.create(title="Plain Story", slug="plain-story", is_published=True)
+
+        response = self.client.get(reverse("story-detail", args=[story.slug]))
+
+        self.assertEqual(response.data["external_link"], "")
+        self.assertEqual(response.data["link_note"], "")
+        self.assertEqual(response.data["link_label"], "")
+
+
 class VideoAdminApiTests(APITestCase):
     URL = "/api/admin/videos/"
     YOUTUBE_URL = "https://youtu.be/dQw4w9WgXcQ"

@@ -269,6 +269,12 @@ class StoryAdmin(admin.ModelAdmin):
             },
         ),
         (
+            "External Link",
+            {
+                "fields": ("external_link", "link_note", "link_label"),
+            },
+        ),
+        (
             "Publishing",
             {
                 "fields": (

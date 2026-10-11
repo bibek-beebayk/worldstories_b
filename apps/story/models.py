@@ -553,6 +553,23 @@ class Story(models.Model):
     )
     cover_image = models.URLField(blank=True, null=True)
     cover_image_file = VersatileImageField(upload_to="story_covers/", blank=True, null=True)
+    external_link = models.URLField(
+        max_length=1024,
+        blank=True,
+        default="",
+        help_text="An outside page for this story (e.g. where to buy it). Shown on the story page with link_note.",
+    )
+    link_note = models.TextField(
+        blank=True,
+        default="",
+        help_text="Text shown on the story page's link card, e.g. \"Available on Amazon\".",
+    )
+    link_label = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text="Button text for external_link, e.g. \"Buy on Amazon\". Defaults to \"Visit link\".",
+    )
 
     # Rendition keys here must match the `thumbnail__{size}` strings that
     # `get_cover_image_url()` (core/libs/images.py) requests via
