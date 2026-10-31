@@ -1,8 +1,9 @@
 import json
 
+from django.db.models import Q
 from rest_framework import serializers
 
-from apps.story.models import Chapter, Audio, Video, Story, Blog
+from apps.story.models import Chapter, Audio, Video, Story, Blog, published_story_q
 from apps.stats.request_meta import request_provenance
 from apps.stats.models import (
     AnalyticsEvent,
@@ -228,6 +229,12 @@ class VideoWatchProgressWriteSerializer(serializers.Serializer):
         return attrs
 
 
+class VideoProgressWriteSerializer(serializers.Serializer):
+    progress = serializers.FloatField(min_value=0.0, max_value=1.0)
+    position_seconds = serializers.FloatField(required=False, min_value=0.0, default=0.0)
+    duration_seconds = serializers.FloatField(required=False, min_value=0.0, default=0.0)
+
+
 class AnalyticsEventWriteSerializer(serializers.Serializer):
     event_id = serializers.UUIDField()
     event_type = serializers.ChoiceField(choices=AnalyticsEvent.EVENT_CHOICES)
@@ -235,6 +242,7 @@ class AnalyticsEventWriteSerializer(serializers.Serializer):
     session_id = serializers.CharField(max_length=64, required=False, allow_blank=True)
     story_slug = serializers.SlugField(required=False, allow_blank=True)
     blog_slug = serializers.SlugField(required=False, allow_blank=True)
+    video_id = serializers.IntegerField(required=False, min_value=1)
     duration_seconds = serializers.FloatField(required=False, min_value=0, max_value=86400)
     value = serializers.FloatField(required=False)
     metadata = serializers.JSONField(required=False)
@@ -252,6 +260,16 @@ class AnalyticsEventWriteSerializer(serializers.Serializer):
         story = None
         if story_slug:
             story = Story.objects.published().filter(slug=story_slug).first()
+        video = None
+        video_id = validated_data.pop("video_id", None)
+        if video_id:
+            video = (
+                Video.objects.select_related("story")
+                .filter(Q(story__isnull=True) | published_story_q("story"), pk=video_id)
+                .first()
+            )
+            if video is not None and story is None:
+                story = video.story
         blog_slug = validated_data.pop("blog_slug", "")
         blog = None
         if blog_slug:
@@ -265,6 +283,7 @@ class AnalyticsEventWriteSerializer(serializers.Serializer):
                 **request_provenance(request),
                 "story": story,
                 "blog": blog,
+                "video": video,
                 "user": request.user if request.user.is_authenticated else None,
             },
         )

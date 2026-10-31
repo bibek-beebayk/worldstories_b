@@ -117,7 +117,7 @@ def _engagement_pairs(user_ids=None, story_ids=None):
             progress__gte=ENGAGEMENT_PROGRESS_THRESHOLD
         ).values_list("user_id", "story_id"),
         VideoWatchProgress.objects.filter(
-            progress__gte=ENGAGEMENT_PROGRESS_THRESHOLD
+            progress__gte=ENGAGEMENT_PROGRESS_THRESHOLD, story__isnull=False
         ).values_list("user_id", "story_id"),
     ]
     if user_ids is not None:

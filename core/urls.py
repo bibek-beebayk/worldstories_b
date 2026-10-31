@@ -22,6 +22,7 @@ from apps.story.models import Author, Story, Blog, Tag, Theme, Genre, Category, 
 router = DefaultRouter()
 
 router.register("stories", story_api.StoryViewSet, basename="story")
+router.register("videos", story_api.VideoViewSet, basename="video")
 router.register("authors", story_api.AuthorViewSet, basename="author")
 router.register("tags", story_api.TagViewSet, basename="tag")
 router.register("themes", story_api.ThemeViewSet, basename="theme")
@@ -363,6 +364,11 @@ urlpatterns = [
         "api/audio-progress/<slug:story_slug>/",
         stats_views.AudioReadingProgressAPIView.as_view(),
         name="audio-reading-progress",
+    ),
+    path(
+        "api/watch-progress/<int:video_id>/",
+        stats_views.VideoProgressByIdAPIView.as_view(),
+        name="video-progress-by-id",
     ),
     path(
         "api/video-progress/<slug:story_slug>/",

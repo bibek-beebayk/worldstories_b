@@ -224,10 +224,14 @@ class VideoWatchProgress(models.Model):
         on_delete=models.CASCADE,
         related_name="video_watch_progress",
     )
+    # Denormalised from video.story; null for standalone videos. Progress is
+    # keyed on (user, video) — the story is only kept for story-level rollups.
     story = models.ForeignKey(
         Story,
         on_delete=models.CASCADE,
         related_name="video_watch_progress",
+        null=True,
+        blank=True,
     )
     video = models.ForeignKey(
         Video,
@@ -367,6 +371,16 @@ class AnalyticsEvent(models.Model):
         blank=True,
         related_name="analytics_events",
     )
+    # The video a watching_session belongs to — the source of truth for watch
+    # time. `story` on those events is derived server-side from video.story
+    # (never sent by the client) so story-level rollups keep working.
+    video = models.ForeignKey(
+        Video,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="analytics_events",
+    )
     duration_seconds = models.FloatField(default=0)
     value = models.FloatField(default=0)
     metadata = models.JSONField(default=dict, blank=True)
@@ -391,6 +405,7 @@ class AnalyticsEvent(models.Model):
             models.Index(fields=["user", "created_at"], name="stats_user_created_idx"),
             models.Index(fields=["story", "event_type"], name="stats_story_event_idx"),
             models.Index(fields=["blog", "event_type"], name="stats_blog_event_idx"),
+            models.Index(fields=["video", "event_type"], name="stats_video_event_idx"),
         ]
         ordering = ["-created_at"]
 

@@ -1473,7 +1473,7 @@ class StoryCompletionTests(APITestCase):
         self.assertTrue(response.data["story_completed"])
         self.assertEqual(StoryCompletion.objects.get().source, StoryCompletion.SOURCE_AUDIO)
 
-    def test_a_video_story_completes_by_watching(self):
+    def test_watching_a_video_never_completes_a_story(self):
         story = self._story("video-only", videos=1)
         video = story.videos.get()
 
@@ -1483,8 +1483,17 @@ class StoryCompletionTests(APITestCase):
             format="json",
         )
 
-        self.assertTrue(response.data["story_completed"])
-        self.assertEqual(StoryCompletion.objects.get().source, StoryCompletion.SOURCE_VIDEO)
+        self.assertNotIn("story_completed", response.data)
+        self.assertFalse(StoryCompletion.objects.exists())
+
+        response = self.client.put(
+            reverse("video-progress-by-id", args=[video.id]),
+            {"progress": 1.0, "position_seconds": 10, "duration_seconds": 10},
+            format="json",
+        )
+
+        self.assertEqual(response.data["progress"], 1.0)
+        self.assertFalse(StoryCompletion.objects.exists())
 
     def test_a_file_story_completes_only_when_the_story_has_that_file(self):
         story = self._story("file-only")

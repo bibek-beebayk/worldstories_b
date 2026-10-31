@@ -108,6 +108,16 @@ DATABASES = {
     }
 }
 
+# Local development without Postgres: set DB_ENGINE=sqlite in .env.
+if os.environ.get("DB_ENGINE", "").lower() == "sqlite":
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.sqlite3",
+            "NAME": BASE_DIR.parent / "db.sqlite3",
+            "ATOMIC_REQUESTS": True,
+        }
+    }
+
 
 # Password validation
 # https://docs.djangoproject.com/en/4.2/ref/settings/#auth-password-validators

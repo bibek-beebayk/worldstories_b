@@ -10,21 +10,21 @@ The rule per surface is "every item of that surface is finished":
 
     chapters   every Chapter has ChapterReadingProgress >= THRESHOLD
     audio      every Audio has AudioReadingProgress >= THRESHOLD
-    video      every Video has VideoWatchProgress >= THRESHOLD
     epub/pdf   that format's FileReadingProgress >= THRESHOLD
 
 A story completes when *any* one of its surfaces does. Finishing the audiobook
 is finishing the story; a reader who listens rather than reads has not read
 half a story. This is the fix for the old derived query, which only ever
-looked at chapters and so could never complete an audio-, video- or file-only
+looked at chapters and so could never complete an audio- or file-only
 story at all.
 
-Quick Read is deliberately not a surface here. Per the requirements document
+Videos are deliberately not a surface here: watch progress is tracked per
+video and never completes a story. Quick Read is not one either. Per the requirements document
 (§5.2), reading a summary does not complete the story and must not unlock a
 country in the Story Passport.
 """
 
-from apps.story.models import Audio, Chapter, Video
+from apps.story.models import Audio, Chapter
 
 # Matches the client-side threshold in progressSync.ts. A reader who reaches
 # the last line rarely scrolls to a mathematically exact 1.0 — the final
@@ -56,7 +56,6 @@ def completed_source(user, story):
         ChapterReadingProgress,
         FileReadingProgress,
         StoryCompletion,
-        VideoWatchProgress,
     )
 
     def finished(model, field, item_model):
@@ -72,8 +71,6 @@ def completed_source(user, story):
         return StoryCompletion.SOURCE_CHAPTERS
     if finished(AudioReadingProgress, "audio_id", Audio):
         return StoryCompletion.SOURCE_AUDIO
-    if finished(VideoWatchProgress, "video_id", Video):
-        return StoryCompletion.SOURCE_VIDEO
 
     file_formats = set(
         FileReadingProgress.objects.filter(

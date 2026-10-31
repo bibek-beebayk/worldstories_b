@@ -813,6 +813,42 @@ class VideoSerializer(serializers.ModelSerializer):
         ]
 
 
+class PublicVideoSerializer(serializers.ModelSerializer):
+    """Watch-page card/detail shape. `thumbnail` is the video's own cover image
+    when set, otherwise YouTube's default thumbnail."""
+
+    thumbnail = serializers.SerializerMethodField()
+    cover_image = serializers.SerializerMethodField()
+    story = serializers.SerializerMethodField()
+
+    def get_cover_image(self, obj):
+        request = self.context.get("request")
+        return get_cover_image_url(obj.cover_image_file, None, request, size=VIDEO_COVER_SIZE)
+
+    def get_thumbnail(self, obj):
+        return self.get_cover_image(obj) or f"https://i.ytimg.com/vi/{obj.youtube_id}/hqdefault.jpg"
+
+    def get_story(self, obj):
+        if obj.story_id is None:
+            return None
+        return {"id": obj.story.id, "title": obj.story.title, "slug": obj.story.slug}
+
+    class Meta:
+        model = Video
+        fields = [
+            "id",
+            "title",
+            "slug",
+            "youtube_id",
+            "duration_seconds",
+            "aspect_ratio",
+            "cover_image",
+            "thumbnail",
+            "story",
+            "created_at",
+        ]
+
+
 def similar_stories_candidates(story):
     """Shared 'similar to `story`' candidate query — genre/author/
     story_type/language overlap, excluding its own translation group. Used

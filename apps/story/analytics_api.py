@@ -1419,8 +1419,8 @@ def build_audience_data(days):
         .order_by("-duration_seconds")[:10]
     )
     top_watched = list(
-        events.filter(event_type=AnalyticsEvent.EVENT_WATCHING_SESSION, story_id__isnull=False)
-        .values("story_id", "story__title", "story__slug")
+        events.filter(event_type=AnalyticsEvent.EVENT_WATCHING_SESSION, video_id__isnull=False)
+        .values("video_id", "video__title", "video__story__title")
         .annotate(duration_seconds=Sum("duration_seconds"), sessions=Count("id"))
         .order_by("-duration_seconds")[:10]
     )
@@ -1551,9 +1551,9 @@ def build_audience_data(days):
         ],
         "top_watched": [
             {
-                "story_id": row["story_id"],
-                "title": row["story__title"],
-                "slug": row["story__slug"],
+                "video_id": row["video_id"],
+                "title": row["video__title"],
+                "story_title": row["video__story__title"],
                 "sessions": row["sessions"],
                 "minutes": round((row["duration_seconds"] or 0) / 60, 1),
             }

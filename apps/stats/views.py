@@ -1,3 +1,4 @@
+from django.db.models import Q
 from django.shortcuts import get_object_or_404
 from rest_framework.views import APIView
 from rest_framework.permissions import AllowAny, IsAuthenticated
@@ -8,7 +9,7 @@ from rest_framework.throttling import SimpleRateThrottle
 from apps.stats.achievements import evaluate as evaluate_achievements, serialize_earned
 from apps.stats.completion import record_completion_if_finished
 from apps.story.api import is_untracked_request
-from apps.story.models import Blog, Story
+from apps.story.models import Blog, Story, Video, published_story_q
 from apps.stats.models import (
     AnalyticsEvent,
     ReadingProgress,
@@ -27,6 +28,7 @@ from apps.stats.serializers import (
     AudioReadingProgressSerializer,
     AudioReadingProgressWriteSerializer,
     VideoWatchProgressSerializer,
+    VideoProgressWriteSerializer,
     VideoWatchProgressWriteSerializer,
     BlogReadingProgressSerializer,
     BlogReadingProgressWriteSerializer,
@@ -314,9 +316,51 @@ class VideoWatchProgressAPIView(APIView):
         progress_obj.duration_seconds = serializer.validated_data.get("duration_seconds", 0.0)
         progress_obj.save()
 
-        payload = self._build_progress_payload(request, story, progress_obj)
-        annotate_completion(payload, record_completion_if_finished(request.user, story))
-        return Response(payload)
+        return Response(self._build_progress_payload(request, story, progress_obj))
+
+
+class VideoProgressByIdAPIView(APIView):
+    """Watch progress keyed on the video itself — works for standalone videos
+    and story-linked ones alike, no story slug needed."""
+
+    permission_classes = [IsAuthenticated]
+
+    def _get_video(self, video_id):
+        return get_object_or_404(
+            Video.objects.select_related("story").filter(
+                Q(story__isnull=True) | published_story_q("story")
+            ),
+            pk=video_id,
+        )
+
+    @staticmethod
+    def _payload(video, progress):
+        return {
+            "video_id": video.id,
+            "progress": max(0.0, min(1.0, progress.progress)) if progress else 0.0,
+            "position_seconds": max(0.0, progress.position_seconds) if progress else 0.0,
+            "duration_seconds": max(0.0, progress.duration_seconds) if progress else 0.0,
+            "updated_at": progress.updated_at if progress else None,
+        }
+
+    def get(self, request, video_id):
+        video = self._get_video(video_id)
+        progress = VideoWatchProgress.objects.filter(user=request.user, video=video).first()
+        return Response(self._payload(video, progress))
+
+    def put(self, request, video_id):
+        video = self._get_video(video_id)
+        serializer = VideoProgressWriteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        progress_obj, _ = VideoWatchProgress.objects.get_or_create(
+            user=request.user, video=video, defaults={"story": video.story}
+        )
+        progress_obj.progress = max(progress_obj.progress, serializer.validated_data["progress"])
+        progress_obj.position_seconds = serializer.validated_data["position_seconds"]
+        progress_obj.duration_seconds = serializer.validated_data["duration_seconds"]
+        progress_obj.save()
+
+        return Response(self._payload(video, progress_obj))
 
 
 class BlogReadingProgressAPIView(APIView):

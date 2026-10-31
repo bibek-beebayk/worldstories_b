@@ -405,7 +405,9 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
             )
         )
         video_rows = list(
-            VideoWatchProgress.objects.filter(user=request.user).values_list(
+            VideoWatchProgress.objects.filter(
+                user=request.user, story__isnull=False
+            ).values_list(
                 "story_id", "progress", "updated_at"
             )
         )
@@ -759,7 +761,7 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
     @action(detail=False, methods=["get"], url_path="library/continue-watching")
     def library_continue_watching(self, request):
         all_video_progress = (
-            VideoWatchProgress.objects.filter(user=request.user)
+            VideoWatchProgress.objects.filter(user=request.user, story__isnull=False)
             .select_related("story", "video")
             .order_by("story_id", "-updated_at")
         )

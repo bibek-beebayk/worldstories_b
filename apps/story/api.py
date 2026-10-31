@@ -129,6 +129,7 @@ from .serializers import (
     AudioTranscriptCueSerializer,
     ReadAlongSerializer,
     VideoSerializer,
+    PublicVideoSerializer,
     ReviewSerializer,
     ReviewWriteSerializer,
     SubmissionSerializer,
@@ -341,6 +342,40 @@ class AuthorViewSet(ReadOnlyModelViewSet):
         if self.action == "retrieve":
             return AuthorDetailSerializer
         return AuthorSerializer
+
+
+class VideoViewSet(ReadOnlyModelViewSet):
+    """Public Watch catalogue: standalone videos plus videos of published
+    stories, newest first. Detail adds a `suggested` list for the player page."""
+
+    serializer_class = PublicVideoSerializer
+    filter_backends = [SearchFilter]
+    search_fields = ["title", "story__title"]
+    http_method_names = ["get", "head", "options"]
+
+    def get_queryset(self):
+        return (
+            Video.objects.select_related("story")
+            .filter(Q(story__isnull=True) | published_story_q("story"))
+            .order_by("-created_at", "-id")
+        )
+
+    def retrieve(self, request, *args, **kwargs):
+        video = self.get_object()
+        context = self.get_serializer_context()
+        # Same-story siblings first (playback order), then the newest others.
+        siblings = list(
+            self.get_queryset().filter(story=video.story).exclude(pk=video.pk).order_by("order", "id")[:12]
+        ) if video.story_id else []
+        others = list(
+            self.get_queryset().exclude(pk=video.pk).exclude(pk__in=[v.pk for v in siblings])[: 12 - len(siblings)]
+        )
+        return Response(
+            {
+                **PublicVideoSerializer(video, context=context).data,
+                "suggested": PublicVideoSerializer(siblings + others, many=True, context=context).data,
+            }
+        )
 
 
 class TagViewSet(ReadOnlyModelViewSet):
