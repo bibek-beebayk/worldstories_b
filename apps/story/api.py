@@ -114,6 +114,7 @@ from .serializers import (
     StoryTypeSerializer,
     AdminStoryTypeSerializer,
     AdminVideoTypeSerializer,
+    PublicVideoTypeSerializer,
     AuthorSerializer,
     AuthorDetailSerializer,
     AdminGenreSerializer,
@@ -356,11 +357,16 @@ class VideoViewSet(ReadOnlyModelViewSet):
     http_method_names = ["get", "head", "options"]
 
     def get_queryset(self):
-        return (
-            Video.objects.select_related("story")
+        queryset = (
+            Video.objects.select_related("story", "video_type")
             .filter(Q(story__isnull=True) | published_story_q("story"))
             .order_by("-created_at", "-id")
         )
+        # Only narrows the list; detail/suggestions must still resolve any video.
+        video_type = self.request.query_params.get("video_type")
+        if self.action == "list" and video_type and video_type.isdigit():
+            queryset = queryset.filter(video_type_id=int(video_type))
+        return queryset
 
     def retrieve(self, request, *args, **kwargs):
         video = self.get_object()
@@ -377,6 +383,26 @@ class VideoViewSet(ReadOnlyModelViewSet):
                 **PublicVideoSerializer(video, context=context).data,
                 "suggested": PublicVideoSerializer(siblings + others, many=True, context=context).data,
             }
+        )
+
+
+class VideoTypeViewSet(ReadOnlyModelViewSet):
+    """Public video categories for the Watch page filter — only types that
+    have at least one watchable video."""
+
+    serializer_class = PublicVideoTypeSerializer
+    pagination_class = None
+
+    def get_queryset(self):
+        return (
+            VideoType.objects.annotate(
+                videos_count=Count(
+                    "videos",
+                    filter=Q(videos__story__isnull=True) | published_story_q("videos__story"),
+                )
+            )
+            .filter(videos_count__gt=0)
+            .order_by("name")
         )
 
 

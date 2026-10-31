@@ -23,6 +23,7 @@ router = DefaultRouter()
 
 router.register("stories", story_api.StoryViewSet, basename="story")
 router.register("videos", story_api.VideoViewSet, basename="video")
+router.register("video-types", story_api.VideoTypeViewSet, basename="video-type")
 router.register("authors", story_api.AuthorViewSet, basename="author")
 router.register("tags", story_api.TagViewSet, basename="tag")
 router.register("themes", story_api.ThemeViewSet, basename="theme")

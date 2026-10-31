@@ -385,6 +385,14 @@ class AdminCategorySerializer(serializers.ModelSerializer):
         read_only_fields = ["slug"]
 
 
+class PublicVideoTypeSerializer(serializers.ModelSerializer):
+    videos_count = serializers.IntegerField(read_only=True)
+
+    class Meta:
+        model = VideoType
+        fields = ["id", "name", "videos_count"]
+
+
 class AdminVideoTypeSerializer(serializers.ModelSerializer):
     videos_count = serializers.SerializerMethodField(read_only=True)
 
@@ -832,6 +840,12 @@ class PublicVideoSerializer(serializers.ModelSerializer):
     thumbnail = serializers.SerializerMethodField()
     cover_image = serializers.SerializerMethodField()
     story = serializers.SerializerMethodField()
+    video_type = serializers.SerializerMethodField()
+
+    def get_video_type(self, obj):
+        if obj.video_type is None:
+            return None
+        return {"id": obj.video_type.id, "name": obj.video_type.name}
 
     def get_cover_image(self, obj):
         request = self.context.get("request")
@@ -857,6 +871,7 @@ class PublicVideoSerializer(serializers.ModelSerializer):
             "cover_image",
             "thumbnail",
             "story",
+            "video_type",
             "created_at",
         ]
 
