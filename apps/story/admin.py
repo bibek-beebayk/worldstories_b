@@ -4,7 +4,7 @@ from django.utils.html import strip_tags
 from django.utils import timezone
 from django.utils.text import slugify
 from solo.admin import SingletonModelAdmin
-from .models import HeroTemplate, Audio, AudioTranscriptCue, Video, Blog, Story, DailyStory, Genre, Category, Mood, StoryJourney, StoryJourneyItem, StoryMood, StoryType, Tag, Theme, Author, Chapter, PromptSettings, Review, Submission, StoryView
+from .models import HeroTemplate, Audio, AudioTranscriptCue, Video, Blog, Story, DailyStory, Genre, Category, Mood, StoryJourney, StoryJourneyItem, StoryMood, StoryType, VideoType, Tag, Theme, Author, Chapter, PromptSettings, Review, Submission, StoryView
 
 admin.site.register(PromptSettings, SingletonModelAdmin)
 
@@ -112,6 +112,7 @@ class VideoInline(admin.StackedInline):
         "title",
         "slug",
         "order",
+        "video_type",
         "youtube_url",
         "youtube_id",
         "duration_seconds",
@@ -418,6 +419,11 @@ class StoryTypeAdmin(admin.ModelAdmin):
     search_fields = ("name",)
 
 
+@admin.register(VideoType)
+class VideoTypeAdmin(admin.ModelAdmin):
+    search_fields = ("name",)
+
+
 @admin.register(Tag)
 class TagAdmin(admin.ModelAdmin):
     prepopulated_fields = {"slug": ("name",)}
@@ -508,7 +514,7 @@ class VideoAdmin(admin.ModelAdmin):
 
     list_display = ("title", "story", "order", "slug", "youtube_id", "aspect_ratio")
     search_fields = ("title", "slug", "youtube_id", "story__title")
-    list_filter = (("story", admin.EmptyFieldListFilter), "aspect_ratio")
+    list_filter = (("story", admin.EmptyFieldListFilter), "video_type", "aspect_ratio")
     list_select_related = ("story",)
     autocomplete_fields = ("story",)
     ordering = ("story__title", "order")

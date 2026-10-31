@@ -44,6 +44,7 @@ router.register("admin/themes", story_api.ThemeAdminViewSet, basename="admin-the
 router.register("admin/moods", story_api.MoodAdminViewSet, basename="admin-mood")
 router.register("admin/journeys", story_api.StoryJourneyAdminViewSet, basename="admin-journey")
 router.register("admin/hero-templates", story_api.HeroTemplateAdminViewSet, basename="admin-hero-template")
+router.register("admin/video-types", story_api.VideoTypeAdminViewSet, basename="admin-video-type")
 router.register("admin/story-types", story_api.StoryTypeAdminViewSet, basename="admin-story-type")
 router.register("admin/users", users_api.UserAdminViewSet, basename="admin-user")
 router.register("admin/blog", story_api.BlogAdminViewSet, basename="admin-blog")

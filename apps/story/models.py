@@ -1270,6 +1270,20 @@ class AudioTranscriptCue(models.Model):
         ]
 
 
+class VideoType(models.Model):
+    """Admin-managed category of video (Narration, Trailer, Interview, ...) —
+    same shape as StoryType. Optional on a Video; meant for filtering the Watch
+    catalogue as it grows."""
+
+    name = models.CharField(max_length=100, unique=True)
+
+    class Meta:
+        ordering = ["name"]
+
+    def __str__(self):
+        return self.name
+
+
 class Video(models.Model):
     """A YouTube-hosted video. Usually a narration of a story — one story can
     have many videos (ordered), mirroring Audio — but `story` is optional so a
@@ -1282,6 +1296,13 @@ class Video(models.Model):
         related_name="videos",
         null=True,
         blank=True,
+    )
+    video_type = models.ForeignKey(
+        VideoType,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="videos",
     )
     title = models.CharField(max_length=256)
     slug = models.SlugField(max_length=256, null=True)

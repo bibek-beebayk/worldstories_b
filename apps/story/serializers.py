@@ -34,6 +34,7 @@ from .models import (
     Blog,
     StoryQueue,
     StoryType,
+    VideoType,
     DailyStory,
     HeroTemplate,
     published_story_q,
@@ -382,6 +383,17 @@ class AdminCategorySerializer(serializers.ModelSerializer):
         model = Category
         fields = ["id", "name", "slug", "stories_count"]
         read_only_fields = ["slug"]
+
+
+class AdminVideoTypeSerializer(serializers.ModelSerializer):
+    videos_count = serializers.SerializerMethodField(read_only=True)
+
+    def get_videos_count(self, obj):
+        return obj.videos.count()
+
+    class Meta:
+        model = VideoType
+        fields = ["id", "name", "videos_count"]
 
 
 class AdminStoryTypeSerializer(serializers.ModelSerializer):
@@ -2035,6 +2047,12 @@ class VideoAdminSerializer(serializers.ModelSerializer):
     remove_cover_image_file = serializers.BooleanField(required=False, write_only=True)
     cover_image_url = serializers.SerializerMethodField(read_only=True)
     story_detail = serializers.SerializerMethodField(read_only=True)
+    video_type_detail = serializers.SerializerMethodField(read_only=True)
+
+    def get_video_type_detail(self, obj):
+        if obj.video_type is None:
+            return None
+        return {"id": obj.video_type.id, "name": obj.video_type.name}
 
     def get_cover_image_url(self, obj):
         if obj.cover_image_file:
@@ -2114,6 +2132,8 @@ class VideoAdminSerializer(serializers.ModelSerializer):
         fields = [
             "id",
             "story",
+            "video_type",
+            "video_type_detail",
             "title",
             "slug",
             "youtube_url",

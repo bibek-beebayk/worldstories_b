@@ -59,6 +59,7 @@ from .models import (
     Blog,
     StoryQueue,
     StoryType,
+    VideoType,
     DailyStory,
     Tag,
     Theme,
@@ -112,6 +113,7 @@ from .serializers import (
     AdminThemeSerializer,
     StoryTypeSerializer,
     AdminStoryTypeSerializer,
+    AdminVideoTypeSerializer,
     AuthorSerializer,
     AuthorDetailSerializer,
     AdminGenreSerializer,
@@ -1896,7 +1898,7 @@ class VideoAdminViewSet(ModelViewSet):
     (`?story=<id>`, unpaginated, in playback order) and the standalone
     Videos admin page (paged, newest first, optionally `?has_story=`)."""
 
-    queryset = Video.objects.select_related("story").all().order_by("-created_at", "-id")
+    queryset = Video.objects.select_related("story", "video_type").all().order_by("-created_at", "-id")
     serializer_class = VideoAdminSerializer
     parser_classes = [MultiPartParser, FormParser, JSONParser]
     permission_classes = [IsSuperUser]
@@ -2227,6 +2229,18 @@ class StoryTypeAdminViewSet(ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
         return super().destroy(request, *args, **kwargs)
+
+
+class VideoTypeAdminViewSet(ModelViewSet):
+    """Video-type management for the admin panel. Videos keep existing when a
+    type is deleted (their video_type is just cleared)."""
+
+    queryset = VideoType.objects.all().order_by("name")
+    serializer_class = AdminVideoTypeSerializer
+    permission_classes = [IsSuperUser]
+    pagination_class = None
+    filter_backends = [SearchFilter]
+    search_fields = ["name"]
 
 
 def _unique_genre_slug(name: str) -> str:
