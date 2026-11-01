@@ -12,6 +12,8 @@ from datetime import date
 from core.libs.images import get_cover_image_url
 from apps.pages.models import SiteTheme
 from .models import (
+    HOME_SECTION_ICON_NAMES,
+    HomeSection,
     Audio,
     AudioTranscriptCue,
     Video,
@@ -2305,3 +2307,72 @@ class StoryQueueSerializer(serializers.ModelSerializer):
             except ValueError:
                 raise serializers.ValidationError({"original_published_day": "Not a valid date."})
         return attrs
+
+
+class BlogCardSerializer(serializers.ModelSerializer):
+    """Just what a blog card shows — no body text, so homepage sections stay
+    light."""
+
+    cover_image = serializers.SerializerMethodField()
+    published_at = serializers.DateTimeField(source="created_at", read_only=True)
+
+    def get_cover_image(self, obj):
+        return get_cover_image_url(obj.cover_image_file, None, self.context.get("request"), size=BLOG_COVER_SIZE)
+
+    class Meta:
+        model = Blog
+        fields = ["id", "title", "slug", "excerpt", "cover_image", "author_name", "published_at", "updated_at"]
+
+
+class HomeSectionAdminSerializer(serializers.ModelSerializer):
+    stories_detail = serializers.SerializerMethodField()
+
+    def get_stories_detail(self, obj):
+        ids = (obj.config or {}).get("story_ids") or []
+        if obj.section_type != HomeSection.TYPE_STORIES_MANUAL or not ids:
+            return []
+        titles = dict(Story.objects.filter(pk__in=ids).values_list("pk", "title"))
+        return [{"id": i, "title": titles[i]} for i in ids if i in titles]
+
+    def validate_icon(self, value):
+        if value and value not in HOME_SECTION_ICON_NAMES:
+            raise serializers.ValidationError("Unknown icon.")
+        return value
+
+    def validate_see_all_url(self, value):
+        value = value.strip()
+        if value and not (value.startswith("/") or value.startswith("https://") or value.startswith("http://")):
+            raise serializers.ValidationError("Use a site path like /library or a full https:// URL.")
+        return value
+
+    def validate(self, attrs):
+        from .home_sections import clean_config
+
+        section_type = attrs.get("section_type") or (self.instance.section_type if self.instance else None)
+        if "config" in attrs or "section_type" in attrs:
+            raw = attrs.get("config", self.instance.config if self.instance else {})
+            try:
+                attrs["config"] = clean_config(section_type, raw)
+            except ValueError as exc:
+                raise serializers.ValidationError({"config": str(exc)})
+        if section_type == HomeSection.TYPE_STORIES_MANUAL and "config" in attrs:
+            ids = attrs["config"].get("story_ids", [])
+            found = set(Story.objects.filter(pk__in=ids).values_list("pk", flat=True))
+            if found != set(ids):
+                raise serializers.ValidationError({"config": "Some picked stories no longer exist."})
+        title = attrs.get("title", self.instance.title if self.instance else "")
+        if section_type in (
+            HomeSection.CONTENT_TYPES | {HomeSection.TYPE_BANNER, HomeSection.TYPE_NEW_ENTRIES}
+        ) and not (title or "").strip():
+            raise serializers.ValidationError({"title": "A title is required for this section type."})
+        return attrs
+
+    class Meta:
+        model = HomeSection
+        fields = [
+            "id", "title", "subtitle", "section_type", "variant", "position", "is_enabled", "icon",
+            "layout", "columns_mobile", "columns_desktop", "card_style", "item_limit", "allow_repeats",
+            "show_see_all", "see_all_label", "see_all_url", "config", "stories_detail", "updated_at",
+        ]
+        read_only_fields = ["updated_at"]
+        extra_kwargs = {"position": {"required": False}}

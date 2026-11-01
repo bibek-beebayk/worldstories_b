@@ -6293,3 +6293,81 @@ class HeroTypographyTests(APITestCase):
         url = reverse("admin-hero-template-detail", kwargs={"pk": self.template.pk})
         for payload in ({"title_font": "Comic Sans"}, {"title_weight": 1000}, {"title_size": "huge"}, {"description_size": "tiny"}):
             self.assertEqual(self.client.patch(url, payload, format="json").status_code, 400, payload)
+
+
+class HomeSectionTests(APITestCase):
+    UA = {"HTTP_USER_AGENT": "Mozilla/5.0 Chrome"}
+
+    def setUp(self):
+        from apps.story.models import HomeSection
+
+        self.HomeSection = HomeSection
+        HomeSection.objects.all().delete()  # drop the migration's seed rows
+        self.admin = User.objects.create(
+            email="homeadmin@example.com", username="homeadmin", is_superuser=True, is_staff=True, is_active=True
+        )
+        for n in range(3):
+            Story.objects.create(title=f"Home Story {n}", slug=f"home-story-{n}", is_published=True, views=n)
+
+    def _public(self):
+        cache.clear()
+        return self.client.get("/api/home/", **self.UA).json()["sections"]
+
+    def test_admin_endpoints_require_superuser(self):
+        self.assertEqual(self.client.get("/api/admin/home-sections/").status_code, 401)
+
+    def test_disabled_and_empty_sections_are_not_served(self):
+        self.HomeSection.objects.create(
+            section_type="stories_query", title="Shown", position=0, config={"sort": "popular"}
+        )
+        self.HomeSection.objects.create(
+            section_type="stories_query", title="Hidden", position=1, is_enabled=False
+        )
+        self.HomeSection.objects.create(section_type="videos", title="No videos", position=2)
+        self.HomeSection.objects.create(section_type="blogs", title="No blogs", position=3)
+        sections = self._public()
+        self.assertEqual([s["title"] for s in sections], ["Shown"])
+        # popular = most views first
+        self.assertEqual(sections[0]["items"][0]["title"], "Home Story 2")
+
+    def test_order_follows_position_and_manual_picks_keep_their_order(self):
+        ids = list(Story.objects.order_by("id").values_list("id", flat=True))
+        self.HomeSection.objects.create(
+            section_type="stories_manual", title="Picks", position=5, config={"story_ids": [ids[2], ids[0]]}
+        )
+        self.HomeSection.objects.create(section_type="banner", title="Banner", position=1)
+        sections = self._public()
+        self.assertEqual([s["title"] for s in sections], ["Banner", "Picks"])
+        self.assertEqual([i["id"] for i in sections[1]["items"]], [ids[2], ids[0]])
+
+    def test_admin_create_validates_config_and_reorder(self):
+        self.client.force_authenticate(self.admin)
+        bad = self.client.post(
+            "/api/admin/home-sections/",
+            {"title": "x", "section_type": "stories_query", "config": {"sort": "nope"}},
+            format="json",
+        )
+        self.assertEqual(bad.status_code, 400)
+        first = self.client.post(
+            "/api/admin/home-sections/",
+            {"title": "A", "section_type": "stories_query", "config": {"sort": "popular", "junk": 1}},
+            format="json",
+        )
+        self.assertEqual(first.status_code, 201)
+        self.assertNotIn("junk", first.json()["config"])
+        second = self.client.post(
+            "/api/admin/home-sections/", {"title": "B", "section_type": "videos"}, format="json"
+        )
+        a, b = first.json()["id"], second.json()["id"]
+        self.assertLess(first.json()["position"], second.json()["position"])
+        self.assertEqual(self.client.post("/api/admin/home-sections/reorder/", {"ids": [a]}, format="json").status_code, 400)
+        reordered = self.client.post("/api/admin/home-sections/reorder/", {"ids": [b, a]}, format="json")
+        self.assertEqual([s["id"] for s in reordered.json()], [b, a])
+
+    def test_toggle_and_duplicate(self):
+        self.client.force_authenticate(self.admin)
+        section = self.HomeSection.objects.create(section_type="stories_query", title="T", position=0)
+        self.assertFalse(self.client.post(f"/api/admin/home-sections/{section.pk}/toggle/").json()["is_enabled"])
+        copy = self.client.post(f"/api/admin/home-sections/{section.pk}/duplicate/").json()
+        self.assertFalse(copy["is_enabled"])
+        self.assertEqual(copy["position"], 1)

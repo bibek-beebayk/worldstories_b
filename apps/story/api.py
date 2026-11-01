@@ -8,7 +8,7 @@ from rest_framework.viewsets import ReadOnlyModelViewSet, ModelViewSet
 from rest_framework.views import APIView
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db.models import Sum, Avg, Count, Exists, F, IntegerField, OuterRef, Prefetch, Subquery
-from django.db.models import Q
+from django.db.models import Max, Q
 from django.db.models.functions import Coalesce
 from django.http import FileResponse, Http404, HttpResponse, StreamingHttpResponse
 from django.db import transaction
@@ -39,7 +39,9 @@ from apps.users.recommendations import (
     recommend_because_finished,
     recommend_stories_for,
 )
+from .home_sections import resolve_home_sections
 from .models import (
+    HomeSection,
     default_story_type_id,
     Genre,
     Category,
@@ -108,6 +110,7 @@ from .serializers import (
     AdminStoryJourneySerializer,
     AdminHeroTemplateSerializer,
     serialize_hero,
+    HomeSectionAdminSerializer,
     AdminStoryMoodSerializer,
     get_cover_image_url,
     AdminThemeSerializer,
@@ -2228,6 +2231,83 @@ class HeroTemplateAdminViewSet(ModelViewSet):
         return Response(self.get_serializer(copy).data, status=status.HTTP_201_CREATED)
 
 
+class HomeSectionAdminViewSet(ModelViewSet):
+    """Admin management of the homepage body sections: CRUD, enable/disable,
+    drag-to-reorder and duplication. The public homepage response is cached for
+    DISCOVERY_CACHE_SECONDS, so changes show up within that long."""
+
+    queryset = HomeSection.objects.all().order_by("position", "id")
+    serializer_class = HomeSectionAdminSerializer
+    permission_classes = [IsSuperUser]
+    pagination_class = None
+
+    def perform_create(self, serializer):
+        if "position" not in serializer.validated_data:
+            last = HomeSection.objects.aggregate(m=Max("position"))["m"]
+            serializer.save(position=0 if last is None else last + 1)
+        else:
+            serializer.save()
+
+    @action(detail=False, methods=["post"])
+    def reorder(self, request):
+        ids = request.data.get("ids")
+        existing = set(HomeSection.objects.values_list("pk", flat=True))
+        if not isinstance(ids, list) or set(ids) != existing or len(ids) != len(existing):
+            return Response(
+                {"detail": "Send every section id exactly once, in the new order."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        with transaction.atomic():
+            for position, pk in enumerate(ids):
+                HomeSection.objects.filter(pk=pk).update(position=position)
+        return Response(self.get_serializer(self.get_queryset(), many=True).data)
+
+    @action(detail=True, methods=["post"])
+    def toggle(self, request, pk=None):
+        section = self.get_object()
+        section.is_enabled = not section.is_enabled
+        section.save(update_fields=["is_enabled", "updated_at"])
+        return Response(self.get_serializer(section).data)
+
+    @action(detail=True, methods=["post"])
+    def duplicate(self, request, pk=None):
+        """A disabled copy right below the original, so it can't change the
+        live page until an editor turns it on."""
+        source = self.get_object()
+        with transaction.atomic():
+            HomeSection.objects.filter(position__gt=source.position).update(position=F("position") + 1)
+            copy = HomeSection.objects.get(pk=source.pk)
+            copy.pk = None
+            copy.title = f"{source.title} (copy)"[:120] if source.title else ""
+            copy.is_enabled = False
+            copy.position = source.position + 1
+            copy.save()
+        return Response(self.get_serializer(copy).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=False, methods=["get"])
+    def types(self, request):
+        """Static description of the section types and choice lists the admin
+        form is built from."""
+        from .home_sections import AD_SIZES, BANNER_THEMES, STORY_SORTS, TYPE_META
+        from .models import HOME_SECTION_ICON_NAMES
+
+        return Response(
+            {
+                "types": [
+                    {"value": value, "label": label, **TYPE_META[value]}
+                    for value, label in HomeSection.TYPE_CHOICES
+                ],
+                "variants": [{"value": v, "label": l} for v, l in HomeSection.VARIANT_CHOICES],
+                "layouts": [{"value": v, "label": l} for v, l in HomeSection.LAYOUT_CHOICES],
+                "card_styles": [{"value": v, "label": l} for v, l in HomeSection.CARD_STYLE_CHOICES],
+                "sorts": list(STORY_SORTS),
+                "banner_themes": BANNER_THEMES,
+                "ad_sizes": AD_SIZES,
+                "icons": HOME_SECTION_ICON_NAMES,
+            }
+        )
+
+
 class StoryTypeAdminViewSet(ModelViewSet):
     """Full story-type management (list/create/update/delete) for the admin
     panel. Deletion is blocked while the type is still referenced by any
@@ -2680,6 +2760,7 @@ class HomeDataAPIView(APIView):
                     "stats": stats,
                 },
                 "hero": serialize_hero(HeroTemplate.objects.current(), stats),
+                "sections": resolve_home_sections(request),
             }
         )
 

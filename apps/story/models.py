@@ -1600,6 +1600,109 @@ def _warm_cover_image(instance):
         )
 
 
+# Icon names a homepage section may use — keys into the frontend's own
+# registry (src/components/home/sectionIcons.ts), same safety rule as the hero:
+# the backend stores a name, never markup. Unknown names fall back to no icon.
+HOME_SECTION_ICON_NAMES = [
+    "BookOpen", "Zap", "Youtube", "Newspaper", "Sparkles", "Star", "Flame",
+    "Headphones", "Globe2", "Heart", "Clock3", "Rss", "Captions", "Trophy",
+    "Crown", "Music", "Mic2", "Feather", "Leaf", "Gem", "Rocket", "Sun",
+    "Compass", "Library",
+]
+
+
+class HomeSection(TimeStampModel):
+    """One block of the homepage body, shown in `position` order below the
+    hero and Featured Stories.
+
+    A section is a *type* (which renderer / content source) plus configuration
+    (how many items, layout, filters). Content types are resolved server-side
+    (apps/story/home_sections.py); "widget" types (personal shelves, New
+    Entries…) are rendered by the frontend from their own data and only use
+    the title / icon / position / enabled flag here.
+    """
+
+    TYPE_STORIES_QUERY = "stories_query"
+    TYPE_STORIES_MANUAL = "stories_manual"
+    TYPE_VIDEOS = "videos"
+    TYPE_BLOGS = "blogs"
+    TYPE_BANNER = "banner"
+    TYPE_AD_SLOT = "ad_slot"
+    TYPE_NEW_ENTRIES = "new_entries"
+    TYPE_CONTINUE_SHELF = "continue_shelf"
+    TYPE_READING_JOURNEY = "reading_journey"
+    TYPE_RECOMMENDED = "recommended"
+    TYPE_JOURNEYS_BANNER = "journeys_banner"
+    TYPE_CHOICES = [
+        (TYPE_STORIES_QUERY, "Stories — by rules (sort + filters)"),
+        (TYPE_STORIES_MANUAL, "Stories — hand-picked"),
+        (TYPE_VIDEOS, "Videos"),
+        (TYPE_BLOGS, "Blog posts"),
+        (TYPE_BANNER, "Banner / call to action"),
+        (TYPE_AD_SLOT, "Ad slot"),
+        (TYPE_NEW_ENTRIES, "New entries (one per format)"),
+        (TYPE_CONTINUE_SHELF, "Continue reading & listening (signed-in)"),
+        (TYPE_READING_JOURNEY, "Reading journey card (signed-in)"),
+        (TYPE_RECOMMENDED, "Recommended for you (signed-in)"),
+        (TYPE_JOURNEYS_BANNER, "Story journeys banner"),
+    ]
+    CONTENT_TYPES = {TYPE_STORIES_QUERY, TYPE_STORIES_MANUAL, TYPE_VIDEOS, TYPE_BLOGS}
+
+    VARIANT_STANDARD = "standard"
+    VARIANT_QUICK_READ = "quick_read"
+    VARIANT_ORIGINALS = "originals"
+    VARIANT_CHOICES = [
+        (VARIANT_STANDARD, "Standard"),
+        (VARIANT_QUICK_READ, "Quick reads (time filter, opens quick-read mode)"),
+        (VARIANT_ORIGINALS, "WorldStories Originals band"),
+    ]
+
+    LAYOUT_GRID = "grid"
+    LAYOUT_RAIL = "rail"
+    LAYOUT_CHOICES = [(LAYOUT_GRID, "Grid"), (LAYOUT_RAIL, "Scrolling rail")]
+
+    CARD_DEFAULT = "default"
+    CARD_COMPACT = "compact"
+    CARD_STYLE_CHOICES = [(CARD_DEFAULT, "Default"), (CARD_COMPACT, "Compact")]
+
+    title = models.CharField(max_length=120, blank=True)
+    subtitle = models.CharField(max_length=300, blank=True)
+    section_type = models.CharField(max_length=24, choices=TYPE_CHOICES)
+    variant = models.CharField(max_length=16, choices=VARIANT_CHOICES, default=VARIANT_STANDARD)
+    position = models.PositiveIntegerField(default=0, db_index=True)
+    is_enabled = models.BooleanField(default=True, db_index=True)
+    icon = models.CharField(max_length=24, blank=True)
+
+    layout = models.CharField(max_length=8, choices=LAYOUT_CHOICES, default=LAYOUT_GRID)
+    columns_mobile = models.PositiveSmallIntegerField(
+        default=2, validators=[MinValueValidator(1), MaxValueValidator(3)]
+    )
+    columns_desktop = models.PositiveSmallIntegerField(
+        default=4, validators=[MinValueValidator(2), MaxValueValidator(6)]
+    )
+    card_style = models.CharField(max_length=8, choices=CARD_STYLE_CHOICES, default=CARD_DEFAULT)
+    item_limit = models.PositiveSmallIntegerField(
+        default=6, validators=[MinValueValidator(1), MaxValueValidator(24)]
+    )
+    # When off, a story already shown by a section higher up the page is
+    # skipped here (the page fills the gap from the rest of the pool).
+    allow_repeats = models.BooleanField(default=False)
+
+    show_see_all = models.BooleanField(default=True)
+    see_all_label = models.CharField(max_length=40, blank=True)
+    # Blank = an automatic link derived from the type / filters.
+    see_all_url = models.CharField(max_length=300, blank=True)
+
+    # Type-specific settings, validated per type by HomeSectionAdminSerializer.
+    config = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        ordering = ["position", "id"]
+
+    def __str__(self):
+        return self.title or self.get_section_type_display()
+
+
 @receiver(models.signals.post_save, sender=Story)
 def warm_story_cover(sender, instance, **kwargs):
     _warm_cover_image(instance)
