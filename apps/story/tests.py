@@ -6371,3 +6371,85 @@ class HomeSectionTests(APITestCase):
         copy = self.client.post(f"/api/admin/home-sections/{section.pk}/duplicate/").json()
         self.assertFalse(copy["is_enabled"])
         self.assertEqual(copy["position"], 1)
+
+
+class FeaturedVideoTests(APITestCase):
+    UA = {"HTTP_USER_AGENT": "Mozilla/5.0 Chrome"}
+
+    def setUp(self):
+        self.admin = User.objects.create(
+            email="featadmin@example.com", username="featadmin", is_superuser=True, is_staff=True, is_active=True
+        )
+        self.story = Story.objects.create(title="Feat Story", slug="feat-story", is_published=True)
+        self.video = Video.objects.create(title="Feat Video", slug="feat-video", youtube_id="abcdefghijk", youtube_url="https://youtu.be/abcdefghijk")
+        self.draft_story = Story.objects.create(title="Draft", slug="draft-feat", is_published=False)
+        self.hidden_video = Video.objects.create(
+            story=self.draft_story, title="Hidden", slug="hidden-video", youtube_id="zzzzzzzzzzz", youtube_url="https://youtu.be/zzzzzzzzzzz"
+        )
+
+    def _home(self):
+        cache.clear()
+        return self.client.get("/api/home/", **self.UA).json()
+
+    def test_lineup_mixes_stories_and_videos_in_order(self):
+        self.client.force_authenticate(self.admin)
+        put = self.client.put(
+            "/api/admin/stories/featured/",
+            {"items": [{"kind": "video", "id": self.video.id}, {"kind": "story", "id": self.story.id}]},
+            format="json",
+        )
+        self.assertEqual(put.status_code, 200)
+        self.assertEqual([(r["kind"], r["featured_rank"]) for r in put.json()], [("video", 1), ("story", 2)])
+        self.client.force_authenticate(None)
+        data = self._home()
+        self.assertEqual([i["kind"] for i in data["featured_items"]], ["video", "story"])
+        self.assertEqual(data["featured_items"][0]["video"]["id"], self.video.id)
+        # Backfill must not kick in once any manual pick exists.
+        self.assertEqual([s["id"] for s in data["featured_stories"]], [self.story.id])
+
+    def test_video_only_lineup_does_not_backfill_stories(self):
+        self.client.force_authenticate(self.admin)
+        self.client.put("/api/admin/stories/featured/", {"items": [{"kind": "video", "id": self.video.id}]}, format="json")
+        self.client.force_authenticate(None)
+        data = self._home()
+        self.assertEqual([i["kind"] for i in data["featured_items"]], ["video"])
+        self.assertEqual(data["featured_stories"], [])
+
+    def test_unwatchable_video_is_not_shown_and_bad_payload_changes_nothing(self):
+        self.client.force_authenticate(self.admin)
+        self.client.put("/api/admin/stories/featured/", {"items": [{"kind": "story", "id": self.story.id}]}, format="json")
+        bad = self.client.put("/api/admin/stories/featured/", {"items": [{"kind": "video", "id": 99999}]}, format="json")
+        self.assertEqual(bad.status_code, 400)
+        self.assertEqual(len(self.client.get("/api/admin/stories/featured/").json()), 1)
+        self.client.put(
+            "/api/admin/stories/featured/",
+            {"items": [{"kind": "video", "id": self.hidden_video.id}, {"kind": "story", "id": self.story.id}]},
+            format="json",
+        )
+        self.client.force_authenticate(None)
+        self.assertEqual([i["kind"] for i in self._home()["featured_items"]], ["story"])
+
+    def test_legacy_story_ids_payload_still_works(self):
+        self.client.force_authenticate(self.admin)
+        put = self.client.put("/api/admin/stories/featured/", {"story_ids": [self.story.id]}, format="json")
+        self.assertEqual([r["kind"] for r in put.json()], ["story"])
+
+    def test_daily_can_be_a_video_and_switches_targets(self):
+        self.client.force_authenticate(self.admin)
+        today = timezone.localdate().isoformat()
+        r = self.client.put("/api/admin/stories/daily/", {"date": today, "video": self.video.id, "featured_reason": "Watch this"}, format="json")
+        self.assertEqual(r.status_code, 201, r.content)
+        self.assertEqual(r.json()["video_detail"]["id"], self.video.id)
+        self.assertIsNone(r.json()["story"])
+        self.client.force_authenticate(None)
+        daily = self._home()["daily_story"]
+        self.assertTrue(daily["configured"])
+        self.assertEqual(daily["video"]["id"], self.video.id)
+        self.assertIsNone(daily["story"])
+        self.client.force_authenticate(self.admin)
+        r = self.client.put("/api/admin/stories/daily/", {"date": today, "story": self.story.id}, format="json")
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertIsNone(r.json()["video"])
+        both = self.client.put("/api/admin/stories/daily/", {"date": today}, format="json")
+        # no target in the payload keeps the existing one, so still valid
+        self.assertEqual(both.status_code, 200)

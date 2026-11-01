@@ -128,6 +128,7 @@ from .serializers import (
     FeaturedStoryAdminSerializer,
     DailyStorySerializer,
     DailyStoryAdminSerializer,
+    FeaturedVideoAdminSerializer,
     ChapterSearchResultSerializer,
     StoryDetailSerializer,
     ChapterSerializer,
@@ -1344,60 +1345,75 @@ class StoryAdminViewSet(ModelViewSet):
         response["Content-Disposition"] = 'attachment; filename="stories-export.csv"'
         return response
 
+    def _featured_rows(self, request):
+        """The admin lineup: featured stories and videos together, by rank."""
+        context = {"request": request}
+        stories = Story.objects.filter(featured_rank__isnull=False).select_related("author")
+        videos = Video.objects.filter(featured_rank__isnull=False).select_related("story", "video_type")
+        rows = [{**FeaturedStoryAdminSerializer(s, context=context).data, "kind": "story"} for s in stories]
+        rows += [dict(FeaturedVideoAdminSerializer(v, context=context).data) for v in videos]
+        return sorted(rows, key=lambda row: row["featured_rank"])
+
     @action(detail=False, methods=["get", "put"], url_path="featured")
     def featured(self, request):
-        """The homepage hero's manually-curated lead stories — an ordered,
-        at-most-5 list. PUT replaces the whole set atomically (same
-        validate-then-replace shape as AudioAdminViewSet.transcript_cues):
-        a bad payload leaves the existing set untouched. HomeDataAPIView
-        reads featured_rank directly and backfills any empty slots."""
+        """The homepage's manually-curated Featured lineup — an ordered,
+        at-most-5 list of stories and/or videos. PUT replaces the whole set
+        atomically (same validate-then-replace shape as
+        AudioAdminViewSet.transcript_cues): a bad payload leaves the existing
+        set untouched. Send `items: [{kind: "story"|"video", id}]`; the older
+        `story_ids: [...]` form still works for stories only. HomeDataAPIView
+        reads the ranks directly and backfills when the lineup is empty."""
         if request.method == "GET":
-            stories = (
-                Story.objects.filter(featured_rank__isnull=False)
-                .select_related("author")
-                .order_by("featured_rank")
-            )
-            return Response(
-                FeaturedStoryAdminSerializer(stories, many=True, context={"request": request}).data
-            )
+            return Response(self._featured_rows(request))
 
-        story_ids = request.data.get("story_ids", [])
-        if not isinstance(story_ids, list) or not all(isinstance(i, int) for i in story_ids):
+        if "items" in request.data:
+            raw_items = request.data.get("items")
+            valid_shape = isinstance(raw_items, list) and all(
+                isinstance(i, dict) and i.get("kind") in ("story", "video") and isinstance(i.get("id"), int)
+                for i in raw_items
+            )
+            if not valid_shape:
+                return Response(
+                    {"detail": 'items must be a list of {"kind": "story"|"video", "id": number}.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            items = [(i["kind"], i["id"]) for i in raw_items]
+        else:
+            story_ids = request.data.get("story_ids", [])
+            if not isinstance(story_ids, list) or not all(isinstance(i, int) for i in story_ids):
+                return Response(
+                    {"detail": "story_ids must be a list of story IDs."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            items = [("story", i) for i in story_ids]
+
+        if len(items) > 5:
             return Response(
-                {"detail": "story_ids must be a list of story IDs."},
+                {"detail": "You can feature at most 5 items."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        if len(story_ids) > 5:
+        if len(items) != len(set(items)):
             return Response(
-                {"detail": "You can feature at most 5 stories."},
+                {"detail": "The same item can't be featured twice."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        if len(story_ids) != len(set(story_ids)):
-            return Response(
-                {"detail": "The same story can't be featured twice."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        found = set(Story.objects.filter(id__in=story_ids).values_list("id", flat=True))
-        missing = [i for i in story_ids if i not in found]
-        if missing:
-            return Response(
-                {"detail": f"Story id(s) not found: {missing}"},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+        for kind, model in (("story", Story), ("video", Video)):
+            wanted = [i for k, i in items if k == kind]
+            found = set(model.objects.filter(id__in=wanted).values_list("id", flat=True))
+            missing = [i for i in wanted if i not in found]
+            if missing:
+                return Response(
+                    {"detail": f"{kind.capitalize()} id(s) not found: {missing}"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
         with transaction.atomic():
             Story.objects.filter(featured_rank__isnull=False).update(featured_rank=None)
-            for index, story_id in enumerate(story_ids, start=1):
-                Story.objects.filter(pk=story_id).update(featured_rank=index)
+            Video.objects.filter(featured_rank__isnull=False).update(featured_rank=None)
+            for index, (kind, pk) in enumerate(items, start=1):
+                (Story if kind == "story" else Video).objects.filter(pk=pk).update(featured_rank=index)
 
-        stories = (
-            Story.objects.filter(featured_rank__isnull=False)
-            .select_related("author")
-            .order_by("featured_rank")
-        )
-        return Response(
-            FeaturedStoryAdminSerializer(stories, many=True, context={"request": request}).data
-        )
+        return Response(self._featured_rows(request))
 
     @action(detail=False, methods=["get", "put", "delete"], url_path="daily")
     def daily(self, request):
@@ -1408,7 +1424,11 @@ class StoryAdminViewSet(ModelViewSet):
         except (TypeError, ValueError):
             return Response({"detail": "date must use YYYY-MM-DD."}, status=status.HTTP_400_BAD_REQUEST)
 
-        current = DailyStory.objects.select_related("story", "story__author").filter(date=selected_date).first()
+        current = (
+            DailyStory.objects.select_related("story", "story__author", "video", "video__story", "video__video_type")
+            .filter(date=selected_date)
+            .first()
+        )
         if request.method == "GET":
             if not current:
                 return Response(None)
@@ -2664,30 +2684,49 @@ class HomeDataAPIView(APIView):
         manual_featured = list(
             base_qs.filter(featured_rank__isnull=False).order_by("featured_rank")[:5]
         )
-        if manual_featured:
+        # Videos share the lineup: same rank space, so the two lists merge into
+        # one ordered set. A video only counts while it is watchable.
+        watchable_videos = Video.objects.select_related("story", "video_type").filter(
+            Q(story__isnull=True) | published_story_q("story")
+        )
+        manual_videos = list(watchable_videos.filter(featured_rank__isnull=False).order_by("featured_rank")[:5])
+        if manual_featured or manual_videos:
             used_ids.update(story.id for story in manual_featured)
             featured_stories = manual_featured
+            lineup = sorted(
+                [("story", s.featured_rank, s) for s in manual_featured]
+                + [("video", v.featured_rank, v) for v in manual_videos],
+                key=lambda entry: entry[1],
+            )[:5]
         else:
             featured_stories = take(base_qs.order_by("-views", "-rating", "-id"), 5)
+            lineup = [("story", None, s) for s in featured_stories]
+        featured_items = [
+            {"kind": "story", "story": FeaturedStorySerializer(item, context={"request": request}).data}
+            if kind == "story"
+            else {"kind": "video", "video": PublicVideoSerializer(item, context={"request": request}).data}
+            for kind, _rank, item in lineup
+        ]
         # Dates are deliberately interpreted in Django's configured timezone,
         # which is UTC. Every visitor therefore receives the same story for a
         # given date, regardless of their device timezone. With no active
         # record, the hero's existing lead story is the graceful fallback.
         configured_daily = (
-            DailyStory.objects.select_related("story", "story__author")
-            .filter(date=timezone.localdate(), active=True, story__in=base_qs)
+            DailyStory.objects.select_related("story", "story__author", "video", "video__story", "video__video_type")
+            .filter(date=timezone.localdate(), active=True)
+            .filter(Q(story__in=base_qs) | Q(video__in=watchable_videos))
             .first()
         )
         if configured_daily:
             daily_story = DailyStorySerializer(configured_daily, context={"request": request}).data
             daily_story["configured"] = True
-        elif featured_stories:
+        elif featured_items:
+            lead = featured_items[0]
             daily_story = {
                 "date": timezone.localdate().isoformat(),
-                "story": FeaturedStorySerializer(
-                    featured_stories[0], context={"request": request}
-                ).data,
-                "featured_reason": "Today's featured story",
+                "story": lead.get("story"),
+                "video": lead.get("video"),
+                "featured_reason": "Today's featured pick" if lead["kind"] == "video" else "Today's featured story",
                 "configured": False,
             }
         else:
@@ -2726,6 +2765,7 @@ class HomeDataAPIView(APIView):
                 "featured_stories": FeaturedStorySerializer(
                     featured_stories, many=True, context={"request": request}
                 ).data,
+                "featured_items": featured_items,
                 "daily_story": daily_story,
                 "weekly_spotlight": StoryListSerializer(
                     weekly_spotlight, many=True, context={"request": request}

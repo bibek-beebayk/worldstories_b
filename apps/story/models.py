@@ -712,15 +712,31 @@ class DailyStory(models.Model):
     """The one editorial story shown to every reader on a UTC calendar date."""
 
     date = models.DateField(unique=True, db_index=True)
-    story = models.ForeignKey(Story, on_delete=models.CASCADE, related_name="daily_features")
+    # Exactly one of story / video (enforced by the constraint below).
+    story = models.ForeignKey(
+        Story, on_delete=models.CASCADE, related_name="daily_features", null=True, blank=True
+    )
+    video = models.ForeignKey(
+        "Video", on_delete=models.CASCADE, related_name="daily_features", null=True, blank=True
+    )
     featured_reason = models.CharField(max_length=280, blank=True)
     active = models.BooleanField(default=True, db_index=True)
 
     class Meta:
         ordering = ["-date"]
+        constraints = [
+            models.CheckConstraint(
+                check=(
+                    models.Q(story__isnull=False, video__isnull=True)
+                    | models.Q(story__isnull=True, video__isnull=False)
+                ),
+                name="story_dailystory_exactly_one_target",
+            ),
+        ]
 
     def __str__(self):
-        return f"{self.date}: {self.story.title}"
+        target = self.story.title if self.story_id else self.video.title
+        return f"{self.date}: {target}"
 
 
 hex_color_validator = RegexValidator(
@@ -1321,6 +1337,11 @@ class Video(models.Model):
     )
     cover_image_file = VersatileImageField(upload_to="video_covers/", blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
+    # Position in the homepage's Featured lineup. Shares the 1-5 rank space
+    # with Story.featured_rank (a lineup mixes stories and videos), so it is
+    # only ever written by the admin Featured endpoint, which keeps the ranks
+    # unique across both tables.
+    featured_rank = models.PositiveSmallIntegerField(null=True, blank=True)
 
     # Keep in sync with VIDEO_COVER_SIZE in apps/story/serializers.py — see the
     # matching comment on Story.SIZES for why this exists. A square bounding

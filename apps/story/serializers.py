@@ -551,11 +551,19 @@ class FeaturedStorySerializer(StoryListSerializer):
 
 
 class DailyStorySerializer(serializers.ModelSerializer):
-    story = FeaturedStorySerializer(read_only=True)
+    """Today's pick: either a story or a video, the other is null."""
+
+    story = FeaturedStorySerializer(read_only=True, allow_null=True)
+    video = serializers.SerializerMethodField()
+
+    def get_video(self, obj):
+        if obj.video_id is None:
+            return None
+        return PublicVideoSerializer(obj.video, context=self.context).data
 
     class Meta:
         model = DailyStory
-        fields = ["date", "story", "featured_reason"]
+        fields = ["date", "story", "video", "featured_reason"]
 
 
 class ChapterSearchResultSerializer(serializers.Serializer):
@@ -1761,17 +1769,69 @@ class FeaturedStoryAdminSerializer(serializers.ModelSerializer):
         fields = ["id", "title", "slug", "cover_image", "author", "is_published", "featured_rank"]
 
 
+class FeaturedVideoAdminSerializer(serializers.ModelSerializer):
+    """Admin Featured lineup row for a video — same keys as
+    FeaturedStoryAdminSerializer so the screen can treat both alike."""
+
+    kind = serializers.SerializerMethodField()
+    cover_image = serializers.SerializerMethodField()
+    author = serializers.SerializerMethodField()
+    is_published = serializers.SerializerMethodField()
+
+    def get_kind(self, obj):
+        return "video"
+
+    def get_cover_image(self, obj):
+        request = self.context.get("request")
+        return get_cover_image_url(obj.cover_image_file, None, request, size=VIDEO_COVER_SIZE) or (
+            f"https://i.ytimg.com/vi/{obj.youtube_id}/hqdefault.jpg"
+        )
+
+    def get_author(self, obj):
+        # Shown under the title: the story it belongs to, else its type.
+        if obj.story_id:
+            return obj.story.title
+        return obj.video_type.name if obj.video_type_id else None
+
+    def get_is_published(self, obj):
+        # "Watchable": standalone, or its story is live.
+        return obj.story_id is None or Story.objects.published().filter(pk=obj.story_id).exists()
+
+    class Meta:
+        model = Video
+        fields = ["id", "kind", "title", "slug", "cover_image", "author", "is_published", "featured_rank"]
+
+
 class DailyStoryAdminSerializer(serializers.ModelSerializer):
     story_detail = FeaturedStoryAdminSerializer(source="story", read_only=True)
+    video_detail = FeaturedVideoAdminSerializer(source="video", read_only=True)
 
     class Meta:
         model = DailyStory
-        fields = ["date", "story", "story_detail", "featured_reason", "active"]
+        fields = ["date", "story", "story_detail", "video", "video_detail", "featured_reason", "active"]
+        extra_kwargs = {"story": {"required": False, "allow_null": True}, "video": {"required": False, "allow_null": True}}
+
+    def validate(self, attrs):
+        story = attrs.get("story", self.instance.story if self.instance else None)
+        video = attrs.get("video", self.instance.video if self.instance else None)
+        # Choosing one target replaces the other.
+        if attrs.get("story") is not None:
+            video = attrs["video"] = None
+        elif attrs.get("video") is not None:
+            story = attrs["story"] = None
+        if (story is None) == (video is None):
+            raise serializers.ValidationError("Choose either a story or a video.")
+        return attrs
 
     def validate_story(self, story):
-        if not story.is_published:
+        if story is not None and not story.is_published:
             raise serializers.ValidationError("Only a published story can be the Daily Story.")
         return story
+
+    def validate_video(self, video):
+        if video is not None and video.story_id and not Story.objects.published().filter(pk=video.story_id).exists():
+            raise serializers.ValidationError("That video's story isn't published.")
+        return video
 
 
 class LinkedBlogSummarySerializer(serializers.ModelSerializer):
