@@ -16,6 +16,7 @@ from apps.stats import views as stats_views
 from apps.stats import nepalikatha as nepalikatha_api
 from apps.users import api as users_api
 from apps.pages import api as pages_api
+from apps.feedback import api as feedback_api
 from apps.pages.models import Page
 from apps.story.models import Author, Story, Blog, Tag, Theme, Genre, Category, published_story_q
 
@@ -54,6 +55,7 @@ router.register("admin/story-queue", story_api.StoryQueueViewSet, basename="admi
 router.register("admin/pages", pages_api.PageAdminViewSet, basename="admin-page")
 router.register("admin/page-themes", pages_api.PageThemeAdminViewSet, basename="admin-page-theme")
 router.register("admin/site-themes", pages_api.SiteThemeAdminViewSet, basename="admin-site-theme")
+router.register("admin/feedback", feedback_api.FeedbackAdminViewSet, basename="admin-feedback")
 router.register("auth", users_api.AuthenticationViewSet, basename="auth")
 
 
@@ -278,6 +280,7 @@ urlpatterns = [
     path("api/home/", story_api.HomeDataAPIView.as_view(), name="home-data"),
     path("api/pages/<slug:slug>/", pages_api.PublicPageAPIView.as_view(), name="public-page"),
     path("api/site-themes/live/", pages_api.LiveSiteThemesAPIView.as_view(), name="live-site-themes"),
+    path("api/feedback/", feedback_api.FeedbackCreateAPIView.as_view(), name="feedback-create"),
     path("api/site-settings/", pages_api.PublicSiteSettingsAPIView.as_view(), name="site-settings"),
     path("api/admin/site-settings/", pages_api.AdminSiteSettingsAPIView.as_view(), name="admin-site-settings"),
     path("api/trending/", story_api.TrendingDataAPIView.as_view(), name="trending-data"),
