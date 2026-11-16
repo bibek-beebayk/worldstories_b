@@ -13,6 +13,7 @@ from rest_framework_simplejwt.views import TokenRefreshView
 from apps.story import api as story_api
 from apps.story import analytics_api as story_analytics_api
 from apps.story import overview_api
+from apps.story import engagement_api
 from apps.stats import views as stats_views
 from apps.stats import nepalikatha as nepalikatha_api
 from apps.users import api as users_api
@@ -314,7 +315,7 @@ urlpatterns = [
     ),
     path(
         "api/admin/analytics/engagement/",
-        story_analytics_api.AdminAnalyticsEngagementAPIView.as_view(),
+        engagement_api.AdminAnalyticsEngagementAPIView.as_view(),
         name="admin-analytics-engagement",
     ),
     path(

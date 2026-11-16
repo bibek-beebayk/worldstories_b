@@ -1022,137 +1022,6 @@ def build_detail_time_series(days, *, story=None, blog=None):
 # itself shows.
 
 
-def build_engagement_data(days):
-    cutoff = get_cutoff(days)
-
-    progress_qs = audience_only(filter_since(ReadingProgress.objects.all(), cutoff, "updated_at"))
-    bucket_defs = [
-        ("0-25%", 0.0, 0.25),
-        ("25-50%", 0.25, 0.5),
-        ("50-75%", 0.5, 0.75),
-        ("75-100%", 0.75, 1.01),
-    ]
-    reading_progress_buckets = [
-        {"bucket": label, "count": progress_qs.filter(progress__gte=lo, progress__lt=hi).count()}
-        for label, lo, hi in bucket_defs
-    ]
-
-    chapter_progress = audience_only(
-        filter_since(ChapterReadingProgress.objects.all(), cutoff, "updated_at")
-    )
-    chapter_rows = list(
-        chapter_progress.values("user_id", "story_id", "chapter__order", "progress")
-    )
-    story_ids = {row["story_id"] for row in chapter_rows}
-    chapter_counts = dict(
-        Story.objects.filter(id__in=story_ids)
-        .annotate(chapter_count=Count("chapters"))
-        .values_list("id", "chapter_count")
-    )
-    dropoff_buckets = {
-        label: {"progress": [], "readers": set()} for label, _, _ in bucket_defs
-    }
-    for row in chapter_rows:
-        chapter_count = chapter_counts.get(row["story_id"], 0)
-        if not chapter_count:
-            continue
-        position = row["chapter__order"] / chapter_count
-        for label, lo, hi in bucket_defs:
-            if lo <= position < hi:
-                dropoff_buckets[label]["progress"].append(row["progress"])
-                dropoff_buckets[label]["readers"].add(row["user_id"])
-                break
-
-    audio_listen_through = audience_only(filter_since(AudioReadingProgress.objects.all(), cutoff, "updated_at")).aggregate(
-        avg_progress=Avg("progress"), listeners=Count("user", distinct=True)
-    )
-
-    video_watch_through = audience_only(filter_since(VideoWatchProgress.objects.all(), cutoff, "updated_at")).aggregate(
-        avg_progress=Avg("progress"), watchers=Count("user", distinct=True)
-    )
-
-    favorites_over_time = (
-        audience_only(filter_since(Favorite.objects.all(), cutoff))
-        .annotate(day=time_trunc("created_at", days))
-        .values("day")
-        .annotate(count=Count("id"))
-        .order_by("day")
-    )
-
-    rating_distribution = (
-        audience_only(filter_since(Review.objects.all(), cutoff))
-        .values("rating")
-        .annotate(count=Count("id"))
-        .order_by("rating")
-    )
-
-    rating_trend = (
-        audience_only(filter_since(Review.objects.all(), cutoff))
-        .annotate(day=time_trunc("created_at", days))
-        .values("day")
-        .annotate(avg_rating=Avg("rating"), count=Count("id"))
-        .order_by("day")
-    )
-
-    views_count = audience_only(filter_since(StoryView.objects.all(), cutoff)).count()
-    readers_count = (
-        audience_only(filter_since(ReadingProgress.objects.all(), cutoff, "updated_at"))
-        .values("user_id", "story_id")
-        .distinct()
-        .count()
-    )
-
-    return {
-        "range_days": days,
-        "time_interval": get_time_interval(days),
-        "reading_progress_buckets": reading_progress_buckets,
-        "chapter_dropoff": [
-            {
-                "position_bucket": label,
-                "avg_progress": round(
-                    sum(values["progress"]) / len(values["progress"]), 3
-                ) if values["progress"] else 0,
-                "readers": len(values["readers"]),
-            }
-            for label, values in dropoff_buckets.items()
-        ],
-        "audio_listen_through": {
-            "avg_progress": round(audio_listen_through["avg_progress"] or 0, 3),
-            "listeners": audio_listen_through["listeners"] or 0,
-        },
-        "video_watch_through": {
-            "avg_progress": round(video_watch_through["avg_progress"] or 0, 3),
-            "watchers": video_watch_through["watchers"] or 0,
-        },
-        "favorites_over_time": fill_time_buckets(
-            [{"day": row["day"], "count": row["count"]} for row in favorites_over_time],
-            days,
-            defaults={"count": 0},
-        ),
-        "rating_distribution": list(rating_distribution),
-        # avg_rating fills with None, not 0: a day with no reviews has no
-        # average, and a 0 would drag the line down to the floor as if every
-        # reviewer that day gave zero stars. None draws a break instead.
-        "rating_trend": fill_time_buckets(
-            [
-                {
-                    "day": row["day"],
-                    "avg_rating": round(row["avg_rating"] or 0, 2),
-                    "count": row["count"],
-                }
-                for row in rating_trend
-            ],
-            days,
-            defaults={"avg_rating": None, "count": 0},
-        ),
-        "view_to_read_conversion": {
-            "views": views_count,
-            "readers": readers_count,
-            "conversion_rate": round(readers_count / views_count, 3) if views_count else 0,
-        },
-    }
-
-
 def build_users_data(days):
     cutoff = get_cutoff(days)
 
@@ -2006,14 +1875,6 @@ class AdminAnalyticsContentRankingsAPIView(APIView):
         )
 
 
-class AdminAnalyticsEngagementAPIView(APIView):
-    permission_classes = [IsSuperUser]
-
-    @method_decorator(cache_page(CACHE_SECONDS))
-    def get(self, request):
-        return Response(build_with_previous_period(build_engagement_data, get_range_days(request)))
-
-
 class AdminAnalyticsUsersAPIView(APIView):
     permission_classes = [IsSuperUser]
 
@@ -2060,9 +1921,16 @@ class AdminAnalyticsAudienceAPIView(APIView):
         return Response(build_with_previous_period(build_audience_data, get_range_days(request)))
 
 
+def _engagement_export(days):
+    # engagement_api imports this module, so it can only be imported lazily.
+    from .engagement_api import build_engagement_export_data
+
+    return build_engagement_export_data(days)
+
+
 EXPORT_SECTION_BUILDERS = {
     "content": build_content_export_data,
-    "engagement": build_engagement_data,
+    "engagement": lambda days: _engagement_export(days),
     "audience": build_audience_data,
     "users": build_users_data,
     "geography": build_geography_data,
@@ -2100,13 +1968,7 @@ SECTION_TABLE_KEYS = {
         "top_content",
         "catalogue_gaps",
     },
-    "engagement": {
-        "reading_progress_buckets",
-        "chapter_dropoff",
-        "favorites_over_time",
-        "rating_distribution",
-        "rating_trend",
-    },
+    "engagement": {"funnel_steps", "depth_curve", "drop_off_stories", "retention"},
     "users": {"signups_over_time", "login_frequency_buckets"},
     "geography": {"by_country", "by_city", "logins_over_time"},
     "submissions": {"submissions_over_time", "funnel", "by_story_type", "by_genre"},
