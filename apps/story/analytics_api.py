@@ -1,12 +1,13 @@
 import csv
 import io
 import json
+import contextvars
 import statistics
 import zipfile
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 from unittest.mock import patch
 
-from django.db.models import Avg, Count, Min, Q, Sum
+from django.db.models import Avg, Count, Exists, Min, OuterRef, Q, Sum
 from django.db.models.functions import TruncDate, TruncHour, TruncMonth, TruncWeek
 from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
@@ -30,7 +31,21 @@ from apps.stats.models import (
 from apps.users.models import User, UserLoginLocation
 
 from .api import IsSuperUser
-from .models import Blog, Favorite, Genre, Review, Story, StoryView, Submission, published_blog_q, published_story_q
+from .content_scoring import SCORE_FORMULA, SessionCaps, score_rows
+from .models import (
+    Audio,
+    Blog,
+    Favorite,
+    Genre,
+    Review,
+    Story,
+    StoryReaction,
+    StoryView,
+    Submission,
+    Video,
+    published_blog_q,
+    published_story_q,
+)
 
 # Superuser/staff activity is now rejected at ingest (see is_untracked_request
 # in .api), but two things still need filtering on the read side: rows written
@@ -94,11 +109,23 @@ def get_time_interval(days):
     return "day"
 
 
+# The end of the window currently being built, set only while
+# build_with_previous_period() runs the builder for the preceding period.
+# filter_since() reads it as its default upper bound: the builders only ever
+# passed a lower bound, so the "previous" window silently also contained the
+# whole current one and every comparison was cumulative rather than a
+# like-for-like period.
+_PERIOD_END = contextvars.ContextVar("analytics_period_end", default=None)
+
+
 def filter_since(queryset, cutoff, field="created_at", until=None):
     """Apply a range lower bound, leaving an all-time queryset unbounded.
 
     `until` is an optional exclusive upper bound, for windows that end before
-    now (the previous period of a comparison)."""
+    now. Inside build_with_previous_period() it defaults to the end of the
+    previous period."""
+    if until is None:
+        until = _PERIOD_END.get()
     if cutoff is not None:
         queryset = queryset.filter(**{f"{field}__gte": cutoff})
     if until is not None:
@@ -113,8 +140,12 @@ def build_with_previous_period(builder, days, *args, **kwargs):
         current["comparison"] = None
         return current
     previous_end = timezone.now() - timedelta(days=days)
-    with patch("apps.story.analytics_api.timezone.now", return_value=previous_end):
-        current["comparison"] = builder(*args, days, **kwargs)
+    token = _PERIOD_END.set(previous_end)
+    try:
+        with patch("apps.story.analytics_api.timezone.now", return_value=previous_end):
+            current["comparison"] = builder(*args, days, **kwargs)
+    finally:
+        _PERIOD_END.reset(token)
     return current
 
 
@@ -240,108 +271,166 @@ def build_referral_sources(events):
     ]
 
 
-def build_content_rankings(days, kind, *, until=None):
-    """Return comparable, interval-scoped metrics for every published title.
+RANKING_KINDS = ("story", "audiobook", "quick_read", "blog")
+BLOG_FINISHED_PROGRESS = 0.9  # scroll depth that counts as "read to the end"
+CONTENT_TOP_ROWS = 10
 
-    The window is the `days` before now, or the `days` before `until` when
-    that is given (the period preceding a comparison).
 
-    The score intentionally uses understandable raw weights rather than a
-    hidden statistical model: a view is 1 point, a read is 2, an interaction
-    is 3, and each engaged minute is 1. Raw values are returned alongside it
-    so admins can judge performance without relying on the score alone.
+def _blank_title_metrics():
+    return {
+        "sv_by_bucket": {},
+        "reach_by_bucket": {},
+        "readers": set(),
+        "listeners": set(),
+        "watchers": set(),
+        "quick_opened": set(),
+        "quick_completed": set(),
+        "started_users": set(),
+        "completed_users": set(),
+        "session_users": set(),
+        "listener_users": set(),
+        "audio_completed_users": set(),
+        "reads": 0,
+        "listens": 0,
+        "reading_seconds": 0.0,
+        "listening_seconds": 0.0,
+        "watching_seconds": 0.0,
+        "downloads": 0,
+        "event_interactions": 0,
+        "blog_tracked": 0,
+        "blog_finished": 0,
+    }
+
+
+def collect_content_metrics(days, kind, *, until=None, caps=None):
+    """Score every published title of one content type over one window.
+
+    Returns (rows, internals): `rows` are the public ranking rows, `internals`
+    maps title id -> the identity sets and per-bucket view counts the Content
+    tab aggregates further (genres, types, KPIs, the views chart).
+
+    Where the numbers come from, and why they agree with each other:
+    - Every audience figure goes through audience_only()/audience_events().
+    - People are identities (the signed-in user, else the browser's
+      visitor_id), counted once however many sessions they had.
+    - Views and reads used to come from different places. A StoryView row is
+      written only by the beacon on the story *detail* page, once per IP per
+      24h; a reading/listening/watching session comes from the *reader* pages
+      and is keyed by browser or user. Anyone entering a reader directly
+      (Continue Reading, a shared chapter link, the installed app) read
+      without ever producing a view, and readers behind one IP collapsed into
+      one view. A bucket's views are therefore the larger of the detail-page
+      views and the people who actually read, listened or watched in that
+      bucket, so a title can never be read by more people than viewed it.
+      Blogs and Quick Reads have no separate detail-view table: their views
+      are the distinct people (events only) who opened or engaged with them.
+    - Minutes count each session only up to SessionCaps.
     """
     cutoff = get_cutoff(days) if until is None else until - timedelta(days=days)
+    caps = caps or SessionCaps()
     is_story = kind in {"story", "audiobook", "quick_read"}
     is_quick_read = kind == "quick_read"
+    is_audiobook = kind == "audiobook"
     title_queryset = Story.objects.published() if is_story else Blog.objects.published()
-    if kind == "audiobook":
+    if is_audiobook:
         title_queryset = title_queryset.filter(audios__isnull=False).distinct()
     elif is_quick_read:
         title_queryset = title_queryset.exclude(Q(summary__isnull=True) | Q(summary__exact=""))
     titles = list(title_queryset.values("id", "title", "slug").order_by("title"))
     title_ids = [row["id"] for row in titles]
-    metrics = {
-        title_id: {
-            "views": 0,
-            "reads": 0,
-            "reader_ids": set(),
-            "listens": 0,
-            "listener_ids": set(),
-            "reading_seconds": 0,
-            "listening_seconds": 0,
-            "watching_seconds": 0,
-            "completions": 0,
-            "downloads": 0,
-            "event_interactions": 0,
-        }
-        for title_id in title_ids
-    }
+    metrics = {title_id: _blank_title_metrics() for title_id in title_ids}
+
+    def bucket_of(moment):
+        return python_time_bucket(moment, days)
 
     if is_story and not is_quick_read:
-        for row in (
-            audience_only(filter_since(StoryView.objects.filter(story_id__in=title_ids), cutoff, until=until))
-            .values("story_id")
-            .annotate(count=Count("id"))
-        ):
-            metrics[row["story_id"]]["views"] = row["count"]
+        for story_id, created_at in audience_only(
+            filter_since(StoryView.objects.filter(story_id__in=title_ids), cutoff, until=until)
+        ).values_list("story_id", "created_at"):
+            bucket = bucket_of(created_at)
+            sv = metrics[story_id]["sv_by_bucket"]
+            sv[bucket] = sv.get(bucket, 0) + 1
 
     events = audience_events(filter_since(AnalyticsEvent.objects.all(), cutoff, until=until))
     events = events.filter(story_id__in=title_ids) if is_story else events.filter(blog_id__in=title_ids)
     id_field = "story_id" if is_story else "blog_id"
-    event_interaction_types = {
+    interaction_types = {
         AnalyticsEvent.EVENT_COMPLETION,
         AnalyticsEvent.EVENT_DOWNLOAD,
         AnalyticsEvent.EVENT_READ_ALONG_CUE_SEEK,
         AnalyticsEvent.EVENT_READ_ALONG_FOLLOW_TOGGLE,
     }
-    for title_id, event_type, user_id, visitor_id, duration, metadata in events.values_list(
-        id_field, "event_type", "user_id", "visitor_id", "duration_seconds", "metadata"
+    for title_id, event_type, user_id, visitor_id, duration, metadata, created_at, video_id in events.values_list(
+        id_field, "event_type", "user_id", "visitor_id", "duration_seconds", "metadata", "created_at", "video_id"
     ):
-        row = metrics[title_id]
-        duration = duration or 0
+        m = metrics[title_id]
+        identity = _content_identity(user_id, visitor_id)
         metadata = metadata or {}
+        quick_session = event_type == AnalyticsEvent.EVENT_READING_SESSION and metadata.get("format") == "quick_read"
+
+        def reach():
+            m["reach_by_bucket"].setdefault(bucket_of(created_at), set()).add(identity)
+
+        def counted(seconds_key):
+            m[seconds_key] += caps.capped(
+                duration,
+                event_type,
+                story_id=title_id if is_story else None,
+                blog_id=None if is_story else title_id,
+                video_id=video_id,
+                is_quick_read=quick_session,
+            )
+
         if is_quick_read:
             if event_type == AnalyticsEvent.EVENT_QUICK_READ_OPENED:
-                row["views"] += 1
-            elif (
-                event_type == AnalyticsEvent.EVENT_READING_SESSION
-                and metadata.get("format") == "quick_read"
-            ):
-                row["reads"] += 1
-                row["reader_ids"].add(_content_identity(user_id, visitor_id))
-                row["reading_seconds"] += duration
+                m["quick_opened"].add(identity)
+                reach()
+            elif quick_session:
+                m["reads"] += 1
+                m["readers"].add(identity)
+                counted("reading_seconds")
+                reach()
             elif event_type == AnalyticsEvent.EVENT_QUICK_READ_COMPLETED:
-                row["completions"] += 1
-                row["event_interactions"] += 1
+                m["quick_completed"].add(identity)
+                m["event_interactions"] += 1
             elif event_type == AnalyticsEvent.EVENT_QUICK_READ_FULL_STORY_CLICKED:
-                row["event_interactions"] += 1
+                m["event_interactions"] += 1
             continue
 
         if not is_story and event_type == AnalyticsEvent.EVENT_VISIT:
-            row["views"] += 1
-        elif (
-            event_type == AnalyticsEvent.EVENT_READING_SESSION
-            and metadata.get("format") != "quick_read"
-        ):
-            row["reads"] += 1
-            row["reader_ids"].add(_content_identity(user_id, visitor_id))
-            row["reading_seconds"] += duration
+            reach()
+        elif event_type == AnalyticsEvent.EVENT_READING_SESSION and not quick_session:
+            m["reads"] += 1
+            m["readers"].add(identity)
+            counted("reading_seconds")
+            reach()
+            if user_id:
+                m["session_users"].add(user_id)
         elif event_type == AnalyticsEvent.EVENT_LISTENING_SESSION:
-            row["listens"] += 1
-            row["listener_ids"].add(_content_identity(user_id, visitor_id))
-            row["listening_seconds"] += duration
+            m["listens"] += 1
+            m["listeners"].add(identity)
+            counted("listening_seconds")
+            reach()
+            if user_id:
+                m["session_users"].add(user_id)
+                m["listener_users"].add(user_id)
         elif event_type == AnalyticsEvent.EVENT_WATCHING_SESSION:
-            row["watching_seconds"] += duration
-        if event_type == AnalyticsEvent.EVENT_COMPLETION:
-            row["completions"] += 1
+            m["watchers"].add(identity)
+            counted("watching_seconds")
+            reach()
+            if user_id:
+                m["session_users"].add(user_id)
+        elif event_type == AnalyticsEvent.EVENT_STORY_STARTED and user_id:
+            m["started_users"].add(user_id)
+            reach()
+        elif event_type == AnalyticsEvent.EVENT_STORY_COMPLETED and user_id:
+            m["completed_users"].add(user_id)
         if event_type == AnalyticsEvent.EVENT_DOWNLOAD:
-            row["downloads"] += 1
-        if event_type in event_interaction_types:
-            row["event_interactions"] += 1
+            m["downloads"] += 1
+        if event_type in interaction_types:
+            m["event_interactions"] += 1
 
-    favorites = {}
-    reviews = {}
+    favorites, reviews, reactions = {}, {}, {}
     if is_story and not is_quick_read:
         favorites = dict(
             audience_only(filter_since(Favorite.objects.filter(story_id__in=title_ids), cutoff, until=until))
@@ -353,51 +442,128 @@ def build_content_rankings(days, kind, *, until=None):
             .values_list("story_id")
             .annotate(count=Count("id"))
         )
+        reactions = dict(
+            audience_only(filter_since(StoryReaction.objects.filter(story_id__in=title_ids), cutoff, until=until))
+            .values_list("story_id")
+            .annotate(count=Count("id"))
+        )
+        if is_audiobook:
+            for story_id, user_id in audience_only(
+                filter_since(
+                    StoryCompletion.objects.filter(story_id__in=title_ids, source=StoryCompletion.SOURCE_AUDIO),
+                    cutoff,
+                    "completed_at",
+                    until,
+                )
+            ).values_list("story_id", "user_id"):
+                metrics[story_id]["audio_completed_users"].add(user_id)
+    if not is_story:
+        for blog_id, progress in audience_only(
+            filter_since(BlogReadingProgress.objects.filter(blog_id__in=title_ids), cutoff, "updated_at", until)
+        ).values_list("blog_id", "progress"):
+            metrics[blog_id]["blog_tracked"] += 1
+            if progress >= BLOG_FINISHED_PROGRESS:
+                metrics[blog_id]["blog_finished"] += 1
 
-    result = []
+    rows = []
+    internals = {}
     for title in titles:
-        row = metrics[title["id"]]
+        m = metrics[title["id"]]
         favorite_count = favorites.get(title["id"], 0)
         review_count = reviews.get(title["id"], 0)
-        interactions = row["event_interactions"] + favorite_count + review_count
-        engagement_seconds = (
-            row["reading_seconds"] + row["listening_seconds"] + row["watching_seconds"]
+        reaction_count = reactions.get(title["id"], 0)
+        actions = favorite_count + review_count + reaction_count
+
+        # Who counts as "people" for this type of content.
+        if is_audiobook:
+            people = m["listeners"]
+        elif is_quick_read or not is_story:
+            people = m["readers"]
+        else:
+            people = m["readers"] | m["listeners"] | m["watchers"]
+
+        # Completion is only observable for signed-in readers (progress and
+        # lifecycle events are tied to an account), so it is a share of those.
+        if is_audiobook:
+            finished = len(m["audio_completed_users"])
+            tracked = len(m["listener_users"] | m["audio_completed_users"])
+        elif is_quick_read:
+            finished = len(m["quick_completed"])
+            tracked = len(m["quick_opened"] | m["quick_completed"])
+        elif is_story:
+            finished = len(m["completed_users"])
+            tracked = len(m["started_users"] | m["session_users"] | m["completed_users"])
+        else:
+            finished, tracked = m["blog_finished"], m["blog_tracked"]
+        completion_rate = round(finished / tracked, 3) if tracked else None
+
+        # Views: see the docstring. Per bucket, never fewer than the people
+        # who engaged (reach); stories also have detail-page views to compare.
+        views_by_bucket = {}
+        for bucket in set(m["sv_by_bucket"]) | set(m["reach_by_bucket"]):
+            views_by_bucket[bucket] = max(
+                m["sv_by_bucket"].get(bucket, 0), len(m["reach_by_bucket"].get(bucket, ()))
+            )
+        views = sum(views_by_bucket.values())
+
+        reading_minutes = round(m["reading_seconds"] / 60, 1)
+        listening_minutes = round(m["listening_seconds"] / 60, 1)
+        watching_minutes = round(m["watching_seconds"] / 60, 1)
+        # Audiobooks are scored on listening only; everything else on all time.
+        engagement_minutes = (
+            listening_minutes
+            if is_audiobook
+            else round((m["reading_seconds"] + m["listening_seconds"] + m["watching_seconds"]) / 60, 1)
         )
-        engagement_minutes = round(engagement_seconds / 60, 1)
-        listening_minutes = round(row["listening_seconds"] / 60, 1)
-        performance_score = (
-            row["views"] + row["listens"] * 2 + interactions * 3 + listening_minutes
-            if kind == "audiobook"
-            else row["views"] + row["reads"] * 2 + interactions * 3 + engagement_minutes
-        )
-        result.append(
+        rows.append(
             {
                 **title,
                 "content_type": kind,
-                "views": row["views"],
-                "reads": row["reads"],
-                "unique_readers": len(row["reader_ids"]),
-                "listens": row["listens"],
-                "unique_listeners": len(row["listener_ids"]),
-                "reading_minutes": round(row["reading_seconds"] / 60, 1),
+                "views": views,
+                "reads": m["reads"],
+                "unique_people": len(people),
+                "unique_readers": len(m["readers"]),
+                "listens": m["listens"],
+                "unique_listeners": len(m["listeners"]),
+                "reading_minutes": reading_minutes,
                 "listening_minutes": listening_minutes,
-                "watching_minutes": round(row["watching_seconds"] / 60, 1),
+                "watching_minutes": watching_minutes,
                 "engagement_minutes": engagement_minutes,
-                "interactions": interactions,
-                "completions": row["completions"],
-                "downloads": row["downloads"],
+                "interactions": m["event_interactions"] + actions,
+                "actions": actions,
+                "completions": finished,
+                "completion_rate": completion_rate,
+                "tracked_people": tracked,
+                "downloads": m["downloads"],
                 "favorites": favorite_count,
                 "reviews": review_count,
-                "performance_score": round(performance_score, 1),
+                "reactions": reaction_count,
             }
         )
-    return result
+        internals[title["id"]] = {
+            "readers": m["readers"],
+            "people": people,
+            "views_by_bucket": views_by_bucket,
+            "finished": finished,
+            "tracked": tracked,
+        }
+    score_rows(rows)
+    return rows, internals
+
+
+def build_content_rankings(days, kind, *, until=None):
+    """Scored ranking rows for every published title of one type in a window.
+
+    See collect_content_metrics() for how each figure is sourced and
+    content_scoring.SCORE_FORMULA for the 0-100 score."""
+    return collect_content_metrics(days, kind, until=until)[0]
 
 
 CONTENT_RANKING_SORTS = {
     "performance_score",
     "views",
     "reads",
+    "unique_people",
     "unique_readers",
     "listens",
     "unique_listeners",
@@ -406,12 +572,354 @@ CONTENT_RANKING_SORTS = {
     "engagement_minutes",
     "interactions",
     "completions",
+    "completion_rate",
 }
 
 
 def sort_content_rankings(rows, sort):
+    """Highest first, with rows backed by too few people (`low_sample`) after
+    every other row so a single reader's session can't top the table."""
     sort = sort if sort in CONTENT_RANKING_SORTS else "performance_score"
-    return sorted(rows, key=lambda row: (-row[sort], row["title"].lower()))
+    return sorted(
+        rows,
+        key=lambda row: (
+            bool(row.get("low_sample")),
+            -(row[sort] if row[sort] is not None else -1),
+            row["title"].lower(),
+        ),
+    )
+
+
+def _ranking_period(kind, days):
+    return {"rows": build_content_rankings(days, kind)}
+
+
+def attach_previous_period(rows, previous_rows):
+    """Add previous_score and rank_change (places moved up if positive).
+
+    Ranks are positions in the default order among titles that had any
+    people; a title unranked last period (or a brand-new one) has a null
+    rank_change. With no previous period (all-time) both stay null."""
+    previous_score = {}
+    previous_rank = {}
+    if previous_rows is not None:
+        previous_score = {row["id"]: row["performance_score"] for row in previous_rows}
+        ranked = [r for r in sort_content_rankings(previous_rows, "performance_score") if r["unique_people"] > 0]
+        previous_rank = {row["id"]: position for position, row in enumerate(ranked, start=1)}
+    current_rank = {
+        row["id"]: position
+        for position, row in enumerate(
+            (r for r in sort_content_rankings(rows, "performance_score") if r["unique_people"] > 0), start=1
+        )
+    }
+    for row in rows:
+        row["previous_score"] = previous_score.get(row["id"]) if previous_rows is not None else None
+        row["rank_change"] = (
+            previous_rank[row["id"]] - current_rank[row["id"]]
+            if row["id"] in previous_rank and row["id"] in current_rank
+            else None
+        )
+    return rows
+
+
+def build_ranked_content(days, kind):
+    """One type's rows for the window with previous-period score and rank movement."""
+    result = build_with_previous_period(_ranking_period, days, kind)
+    previous = result["comparison"]["rows"] if result["comparison"] else None
+    return attach_previous_period(result["rows"], previous)
+
+
+def _kpi_pair(value, previous):
+    change_pct = None
+    if previous:
+        change_pct = round((value - previous) / previous * 100, 1)
+    return {"value": value, "previous_value": previous, "change_pct": change_pct}
+
+
+def build_publish_markers(days, cutoff, *, include_blogs=False):
+    """Stories (and optionally blog posts) published in the window, for
+    annotating a time series.
+
+    `bucket` is the series key a marker belongs to, or None when the series
+    can't place it: the 24h series is hourly and a publish date has no hour
+    to land on."""
+    stories = filter_since(
+        Story.objects.filter(published_story_q(), site_published_date__isnull=False),
+        cutoff.date() if cutoff else None,
+        "site_published_date",
+    )
+    markers = []
+    for published_on, title, slug in stories.order_by("site_published_date", "title").values_list(
+        "site_published_date", "title", "slug"
+    ):
+        bucket = None
+        if days != 1:
+            bucket = python_time_bucket(timezone.make_aware(datetime.combine(published_on, time.min)), days)
+        markers.append({"date": published_on, "bucket": bucket, "title": title, "slug": slug, "type": "story"})
+    if include_blogs:
+        blogs = filter_since(Blog.objects.filter(published_blog_q()), cutoff).order_by("created_at")
+        for created_at, title, slug in blogs.values_list("created_at", "title", "slug"):
+            markers.append(
+                {
+                    "date": timezone.localtime(created_at).date(),
+                    "bucket": None if days == 1 else python_time_bucket(created_at, days),
+                    "title": title,
+                    "slug": slug,
+                    "type": "blog",
+                }
+            )
+    markers.sort(key=lambda marker: (marker["date"], marker["title"]))
+    return markers
+
+
+def build_publishing_data(days, cutoff):
+    """Stories and blog posts published in the window, with one combined series."""
+    buckets = {}
+    stories = filter_since(
+        Story.objects.filter(published_story_q(), site_published_date__isnull=False),
+        cutoff.date() if cutoff else None,
+        "site_published_date",
+    ).values_list("site_published_date", flat=True)
+    story_count = 0
+    for published_on in stories:
+        story_count += 1
+        bucket = python_time_bucket(
+            timezone.make_aware(datetime.combine(published_on, time.min)), days, date_only=True
+        )
+        buckets.setdefault(bucket, {"stories": 0, "blogs": 0})["stories"] += 1
+    blog_count = 0
+    for created_at in filter_since(Blog.objects.filter(published_blog_q()), cutoff).values_list(
+        "created_at", flat=True
+    ):
+        blog_count += 1
+        bucket = python_time_bucket(created_at, days, date_only=True)
+        buckets.setdefault(bucket, {"stories": 0, "blogs": 0})["blogs"] += 1
+    series = fill_time_buckets(
+        [{"day": bucket, **counts} for bucket, counts in buckets.items()],
+        days,
+        defaults={"stories": 0, "blogs": 0},
+        date_only=True,
+    )
+    return {"stories": story_count, "blogs": blog_count, "series": series}
+
+
+def _group_performance(stories_by_group, rows_by_id, internals):
+    """In-range engagement for groups of stories (a genre, a story type)."""
+    performance = []
+    for name, story_ids in stories_by_group.items():
+        views = active = 0
+        seconds_minutes = 0.0
+        readers = set()
+        finished = tracked = 0
+        for story_id in story_ids:
+            row = rows_by_id.get(story_id)
+            if row is None:
+                continue
+            views += row["views"]
+            seconds_minutes += row["engagement_minutes"]
+            readers |= internals[story_id]["readers"]
+            finished += internals[story_id]["finished"]
+            tracked += internals[story_id]["tracked"]
+            if row["views"] or row["unique_people"]:
+                active += 1
+        catalogue = len(story_ids)
+        performance.append(
+            {
+                "name": name,
+                "stories_in_catalogue": catalogue,
+                "stories_with_activity": active,
+                "views": views,
+                "unique_readers": len(readers),
+                "engagement_minutes": round(seconds_minutes, 1),
+                "completion_rate": round(finished / tracked, 3) if tracked else None,
+                "views_per_story": round(views / catalogue, 1) if catalogue else 0,
+            }
+        )
+    return sorted(performance, key=lambda row: (-row["views"], -row["unique_readers"], row["name"].lower()))
+
+
+def build_catalogue_gaps(views_by_story):
+    """Published stories missing audio, a Quick Read, a cover or a video,
+    ranked by their views in the window so the gaps worth fixing come first."""
+    stories = Story.objects.published().annotate(
+        has_audio=Exists(Audio.objects.filter(story=OuterRef("pk"))),
+        has_video=Exists(Video.objects.filter(story=OuterRef("pk"))),
+    )
+    gaps = {"no_audio": [], "no_quick_read": [], "no_cover": [], "no_video": []}
+    for story in stories.values(
+        "id", "title", "slug", "summary", "cover_image", "cover_image_file", "has_audio", "has_video"
+    ):
+        missing = []
+        if not story["has_audio"]:
+            missing.append("audio")
+        if not (story["summary"] or "").strip():
+            missing.append("quick_read")
+        if not story["cover_image_file"] and not story["cover_image"]:
+            missing.append("cover")
+        if not story["has_video"]:
+            missing.append("video")
+        for piece in missing:
+            key = {"audio": "no_audio", "quick_read": "no_quick_read", "cover": "no_cover", "video": "no_video"}[piece]
+            gaps[key].append(
+                {
+                    "id": story["id"],
+                    "title": story["title"],
+                    "slug": story["slug"],
+                    "missing": missing,
+                    "views": views_by_story.get(story["id"], 0),
+                }
+            )
+    return {
+        key: {
+            "total": len(rows),
+            "rows": sorted(rows, key=lambda row: (-row["views"], row["title"].lower()))[:CONTENT_TOP_ROWS],
+        }
+        for key, rows in gaps.items()
+    }
+
+
+def build_content_data(days):
+    """One window of everything the Content tab shows. Wrapped by
+    build_content_response(), which adds the previous period."""
+    cutoff = get_cutoff(days)
+    caps = SessionCaps()
+    rankings, internals = {}, {}
+    for kind in RANKING_KINDS:
+        rankings[kind], internals[kind] = collect_content_metrics(days, kind, caps=caps)
+
+    story_rows = {row["id"]: row for row in rankings["story"]}
+    story_internals = internals["story"]
+
+    # Views over time: the per-bucket reconciled views of every story and blog.
+    views_by_bucket = {}
+    for kind in ("story", "blog"):
+        for title_internals in internals[kind].values():
+            for bucket, count in title_internals["views_by_bucket"].items():
+                views_by_bucket[bucket] = views_by_bucket.get(bucket, 0) + count
+    views_series = fill_time_buckets(
+        [{"day": bucket, "count": count} for bucket, count in views_by_bucket.items()],
+        days,
+        defaults={"count": 0},
+    )
+
+    genre_names = dict(Genre.objects.values_list("id", "name"))
+    story_genres = {}
+    for story_id, genre_id in Story.genres.through.objects.filter(story_id__in=story_rows).values_list(
+        "story_id", "genre_id"
+    ):
+        story_genres.setdefault(genre_names.get(genre_id, "Unknown"), []).append(story_id)
+    story_types = {}
+    for story_id, type_name in Story.objects.published().values_list("id", "story_type__name"):
+        story_types.setdefault(type_name or "Uncategorised", []).append(story_id)
+
+    publishing = build_publishing_data(days, cutoff)
+    all_readers = set()
+    for kind in ("story", "quick_read", "blog"):
+        for title_internals in internals[kind].values():
+            all_readers |= title_internals["readers"]
+    minutes = sum(
+        row["engagement_minutes"] for kind in ("story", "quick_read", "blog") for row in rankings[kind]
+    )
+
+    return {
+        "range_days": days,
+        "time_interval": get_time_interval(days),
+        "kpi_values": {
+            "views": sum(views_by_bucket.values()),
+            "unique_readers": len(all_readers),
+            "engagement_minutes": round(minutes, 1),
+            "completions": sum(row["completions"] for row in rankings["story"]),
+            "titles_published": publishing["stories"] + publishing["blogs"],
+        },
+        "views_series": views_series,
+        "publish_markers": build_publish_markers(days, cutoff, include_blogs=True),
+        "publishing": publishing,
+        "rankings": rankings,
+        "genre_performance": _group_performance(story_genres, story_rows, story_internals),
+        "story_type_performance": _group_performance(story_types, story_rows, story_internals),
+        "catalogue_gaps": build_catalogue_gaps({story_id: row["views"] for story_id, row in story_rows.items()}),
+    }
+
+
+def build_content_response(days):
+    """The Content tab payload: the selected window with its comparison to the
+    window before it. See build_content_data() for the shape of one window."""
+    data = build_with_previous_period(build_content_data, days)
+    previous = data.pop("comparison")
+
+    kpis = {
+        key: _kpi_pair(value, previous["kpi_values"][key] if previous else None)
+        for key, value in data.pop("kpi_values").items()
+    }
+    views_total = kpis["views"]["value"]
+    views_previous = kpis["views"]["previous_value"]
+    top_content = {}
+    for kind in RANKING_KINDS:
+        rows = attach_previous_period(data["rankings"][kind], previous["rankings"][kind] if previous else None)
+        top_content[kind] = {
+            "count": len(rows),
+            "rows": sort_content_rankings(rows, "performance_score")[:CONTENT_TOP_ROWS],
+        }
+    previous_publishing = previous["publishing"] if previous else None
+    return {
+        "range_days": days,
+        "time_interval": data["time_interval"],
+        "kpis": kpis,
+        "views_over_time": {
+            "series": data["views_series"],
+            "previous_series": previous["views_series"] if previous else None,
+            "total": views_total,
+            "previous_total": views_previous,
+            "change_pct": kpis["views"]["change_pct"],
+            "publish_markers": data["publish_markers"],
+        },
+        "top_content": top_content,
+        "score_formula": SCORE_FORMULA,
+        "genre_performance": data["genre_performance"],
+        "story_type_performance": data["story_type_performance"],
+        "catalogue_gaps": data["catalogue_gaps"],
+        "publishing": {
+            "stories": data["publishing"]["stories"],
+            "blogs": data["publishing"]["blogs"],
+            "previous_stories": previous_publishing["stories"] if previous_publishing else None,
+            "previous_blogs": previous_publishing["blogs"] if previous_publishing else None,
+            "series": data["publishing"]["series"],
+        },
+    }
+
+
+def build_content_export_data(days):
+    """build_content_response() reshaped into the flat tables the CSV/XLSX
+    export is made of (see SECTION_TABLE_KEYS["content"])."""
+    data = build_content_response(days)
+    previous = data["views_over_time"]["previous_series"] or []
+    previous_counts = [row["count"] for row in previous]
+    exported = {
+        "views_over_time": [
+            {
+                "day": row["day"],
+                "count": row["count"],
+                "previous_period_count": previous_counts[index] if index < len(previous_counts) else None,
+            }
+            for index, row in enumerate(data["views_over_time"]["series"])
+        ],
+        "genre_performance": data["genre_performance"],
+        "story_type_performance": data["story_type_performance"],
+        "publishing_over_time": data["publishing"]["series"],
+        "top_content": [
+            {"content_type": kind, **row}
+            for kind, block in data["top_content"].items()
+            for row in block["rows"]
+        ],
+        "catalogue_gaps": [
+            {"gap": gap, **{key: value for key, value in row.items() if key != "missing"},
+             "missing": ", ".join(row["missing"])}
+            for gap, block in data["catalogue_gaps"].items()
+            for row in block["rows"]
+        ],
+    }
+    exported.update({f"kpi_{key}": value for key, value in data["kpis"].items()})
+    return exported
 
 
 def build_detail_time_series(days, *, story=None, blog=None):
@@ -512,146 +1020,6 @@ def build_detail_time_series(days, *, story=None, blog=None):
 # calls the same functions directly. Keeping the queries in one place means
 # the CSV/Excel export can never drift out of sync with what the dashboard
 # itself shows.
-
-
-def build_content_data(days):
-    cutoff = get_cutoff(days)
-
-    views_over_time = (
-        audience_only(filter_since(StoryView.objects.all(), cutoff))
-        .annotate(day=time_trunc("created_at", days))
-        .values("day")
-        .annotate(count=Count("id"))
-        .order_by("day")
-    )
-
-    genre_qs = (
-        Genre.objects.annotate(
-            stories_count=Count("stories", filter=published_story_q("stories"), distinct=True),
-            avg_rating=Avg("stories__rating", filter=published_story_q("stories")),
-            total_views=Sum("stories__views", filter=published_story_q("stories")),
-            total_favorites=Count("stories__favorites", filter=published_story_q("stories"), distinct=True),
-        )
-        .filter(stories_count__gt=0)
-        .order_by("-total_views")
-    )
-    genre_performance = [
-        {
-            "id": genre.id,
-            "name": genre.name,
-            "stories_count": genre.stories_count,
-            "avg_rating": round(genre.avg_rating or 0, 2),
-            "total_views": genre.total_views or 0,
-            "total_favorites": genre.total_favorites,
-        }
-        for genre in genre_qs
-    ]
-
-    story_type_breakdown = (
-        Story.objects.published()
-        .values("story_type__name")
-        .annotate(count=Count("id"), avg_rating=Avg("rating"), avg_views=Avg("views"))
-        .order_by("-count")
-    )
-
-    completion_split = (
-        Story.objects.published()
-        .values("is_completed")
-        .annotate(count=Count("id"), avg_rating=Avg("rating"), avg_views=Avg("views"))
-    )
-
-    publishing_over_time = (
-        filter_since(
-            Story.objects.filter(published_story_q(), site_published_date__isnull=False),
-            cutoff.date() if cutoff else None,
-            "site_published_date",
-        )
-        .annotate(day=time_trunc("site_published_date", days, date_only=True))
-        .values("day")
-        .annotate(count=Count("id"))
-        .order_by("day")
-    )
-
-    # Blog has no site_published_date-style field — its own BlogSerializer
-    # already treats created_at as the effective "published at" moment
-    # (published_at = source="created_at"), so this mirrors that.
-    blog_publishing_over_time = (
-        filter_since(Blog.objects.filter(published_blog_q()), cutoff)
-        .annotate(day=time_trunc("created_at", days))
-        .values("day")
-        .annotate(count=Count("id"))
-        .order_by("day")
-    )
-    blog_posts_count = Blog.objects.published().count()
-    stories_count = Story.objects.published().count()
-    # Same "has_audio"/"has_summary" semantics as StoryFilter (filters.py)
-    # — a story counts as an audiobook/Quick Read if it has narration
-    # audio / a summary, matching how those are surfaced to readers.
-    audiobooks_count = Story.objects.published().filter(audios__isnull=False).distinct().count()
-    watchable_count = Story.objects.published().filter(videos__isnull=False).distinct().count()
-    quick_read_count = (
-        Story.objects.published().exclude(Q(summary__isnull=True) | Q(summary__exact="")).count()
-    )
-    top_stories = sort_content_rankings(build_content_rankings(days, "story"), "performance_score")[:5]
-    top_audiobooks = sort_content_rankings(
-        build_content_rankings(days, "audiobook"), "performance_score"
-    )[:5]
-    top_blogs = sort_content_rankings(build_content_rankings(days, "blog"), "performance_score")[:5]
-    top_quick_reads = sort_content_rankings(
-        build_content_rankings(days, "quick_read"), "performance_score"
-    )[:5]
-
-    return {
-        "range_days": days,
-        "time_interval": get_time_interval(days),
-        "publishing_interval": "day" if days == 1 else get_time_interval(days),
-        "views_over_time": fill_time_buckets(
-            [{"day": row["day"], "count": row["count"]} for row in views_over_time],
-            days,
-            defaults={"count": 0},
-        ),
-        "genre_performance": genre_performance,
-        "story_type_breakdown": [
-            {
-                "story_type": row["story_type__name"],
-                "count": row["count"],
-                "avg_rating": round(row["avg_rating"] or 0, 2),
-                "avg_views": round(row["avg_views"] or 0, 1),
-            }
-            for row in story_type_breakdown
-        ],
-        "completion_split": [
-            {
-                "is_completed": row["is_completed"],
-                "count": row["count"],
-                "avg_rating": round(row["avg_rating"] or 0, 2),
-                "avg_views": round(row["avg_views"] or 0, 1),
-            }
-            for row in completion_split
-        ],
-        # date_only mirrors the time_trunc() call that grouped these: the
-        # source is a DateField, so its buckets are dates at every interval.
-        "publishing_over_time": fill_time_buckets(
-            [{"day": row["day"], "count": row["count"]} for row in publishing_over_time],
-            days,
-            defaults={"count": 0},
-            date_only=True,
-        ),
-        "blog_publishing_over_time": fill_time_buckets(
-            [{"day": row["day"], "count": row["count"]} for row in blog_publishing_over_time],
-            days,
-            defaults={"count": 0},
-        ),
-        "blog_posts_count": blog_posts_count,
-        "stories_count": stories_count,
-        "audiobooks_count": audiobooks_count,
-        "watchable_count": watchable_count,
-        "quick_read_count": quick_read_count,
-        "top_stories": top_stories,
-        "top_audiobooks": top_audiobooks,
-        "top_blogs": top_blogs,
-        "top_quick_reads": top_quick_reads,
-    }
 
 
 def build_engagement_data(days):
@@ -1601,7 +1969,7 @@ class AdminAnalyticsContentAPIView(APIView):
 
     @method_decorator(cache_page(CACHE_SECONDS))
     def get(self, request):
-        return Response(build_with_previous_period(build_content_data, get_range_days(request)))
+        return Response(build_content_response(get_range_days(request)))
 
 
 class AdminAnalyticsContentRankingsAPIView(APIView):
@@ -1620,7 +1988,7 @@ class AdminAnalyticsContentRankingsAPIView(APIView):
             page = max(1, int(request.query_params.get("page", 1)))
         except (TypeError, ValueError):
             page = 1
-        rows = sort_content_rankings(build_content_rankings(days, kind), sort)
+        rows = sort_content_rankings(build_ranked_content(days, kind), sort)
         count = len(rows)
         start = (page - 1) * CONTENT_RANKING_PAGE_SIZE
         end = start + CONTENT_RANKING_PAGE_SIZE
@@ -1629,6 +1997,7 @@ class AdminAnalyticsContentRankingsAPIView(APIView):
                 "range_days": days,
                 "content_type": kind,
                 "sort": sort,
+                "score_formula": SCORE_FORMULA,
                 "count": count,
                 "page": page,
                 "page_size": CONTENT_RANKING_PAGE_SIZE,
@@ -1692,7 +2061,7 @@ class AdminAnalyticsAudienceAPIView(APIView):
 
 
 EXPORT_SECTION_BUILDERS = {
-    "content": build_content_data,
+    "content": build_content_export_data,
     "engagement": build_engagement_data,
     "audience": build_audience_data,
     "users": build_users_data,
@@ -1726,10 +2095,10 @@ SECTION_TABLE_KEYS = {
     "content": {
         "views_over_time",
         "genre_performance",
-        "story_type_breakdown",
-        "completion_split",
+        "story_type_performance",
         "publishing_over_time",
-        "blog_publishing_over_time",
+        "top_content",
+        "catalogue_gaps",
     },
     "engagement": {
         "reading_progress_buckets",

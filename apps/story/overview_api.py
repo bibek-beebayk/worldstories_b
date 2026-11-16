@@ -12,7 +12,7 @@ that helper patches timezone.now() but the builders it wraps only have a lower
 bound, so its "previous" figures would still include the current period.
 """
 import statistics
-from datetime import datetime, time, timedelta
+from datetime import timedelta
 
 from django.core.cache import cache
 from django.db.models import Avg, Case, CharField, Count, Max, Q, Sum, Value, When
@@ -36,6 +36,7 @@ from .analytics_api import (
     audience_events,
     audience_only,
     build_content_rankings,
+    build_publish_markers,
     build_referral_sources,
     build_story_lifecycle_counts,
     _rate,
@@ -49,6 +50,7 @@ from .analytics_api import (
     time_trunc,
 )
 from .api import IsSuperUser
+from .content_scoring import SessionCaps
 from .models import (
     Audio,
     BookFetchJob,
@@ -142,14 +144,27 @@ def _bucket_values(rows, days):
 
 
 def _event_totals(events, window):
-    totals = {event_type: {"count": 0, "seconds": 0.0} for event_type in KPI_EVENT_TYPES}
+    totals = {event_type: {"count": 0} for event_type in KPI_EVENT_TYPES}
     for row in (
         _in(events.filter(event_type__in=KPI_EVENT_TYPES), window)
         .values("event_type")
-        .annotate(count=Count("id"), seconds=Sum("duration_seconds"))
+        .annotate(count=Count("id"))
     ):
-        totals[row["event_type"]] = {"count": row["count"], "seconds": row["seconds"] or 0.0}
+        totals[row["event_type"]] = {"count": row["count"]}
     return totals
+
+
+def _capped_sessions(events, window, caps):
+    """Every reading/listening/watching session in the window as
+    (event_type, identity, created_at, capped_seconds). A session counts only
+    up to SessionCaps, so a tab left open can't add hours of "engagement"."""
+    rows = _in(events.filter(event_type__in=SESSION_EVENT_TYPES), window).values_list(
+        "event_type", "user_id", "visitor_id", "duration_seconds", "metadata", "created_at", "story_id", "video_id"
+    )
+    for event_type, user_id, visitor_id, duration, metadata, created_at, story_id, video_id in rows:
+        is_quick = event_type == AnalyticsEvent.EVENT_READING_SESSION and (metadata or {}).get("format") == "quick_read"
+        seconds = caps.capped(duration, event_type, story_id=story_id, video_id=video_id, is_quick_read=is_quick)
+        yield event_type, ("u:%s" % user_id if user_id else "v:%s" % visitor_id), created_at, seconds
 
 
 def _distinct_identities(events, window):
@@ -166,14 +181,11 @@ def _signups(window):
     )
 
 
-def _engagement_minutes(totals):
-    return round(sum(totals[event_type]["seconds"] for event_type in SESSION_EVENT_TYPES) / 60, 1)
-
-
 def build_kpis(days, events, current, previous):
     visits = events.filter(event_type=AnalyticsEvent.EVENT_VISIT)
     current_totals = _event_totals(events, current)
     previous_totals = _event_totals(events, previous) if previous else None
+    caps = SessionCaps()
 
     visitor_rows = {
         row["day"]: row["n"]
@@ -183,17 +195,24 @@ def build_kpis(days, events, current, previous):
         .annotate(n=Count("identity", distinct=True))
     }
 
-    # One grouped query for every event-backed sparkline.
-    counts, seconds = {}, {}
+    # One grouped query for every count-backed sparkline.
+    counts = {}
     for row in (
         _in(events.filter(event_type__in=KPI_EVENT_TYPES), current)
         .annotate(day=time_trunc("created_at", days))
         .values("day", "event_type")
-        .annotate(n=Count("id"), secs=Sum("duration_seconds"))
+        .annotate(n=Count("id"))
     ):
         counts.setdefault(row["event_type"], {})[row["day"]] = row["n"]
-        if row["event_type"] in SESSION_EVENT_TYPES:
-            seconds[row["day"]] = seconds.get(row["day"], 0) + (row["secs"] or 0)
+
+    # Time spent is summed in Python so each session can be capped.
+    seconds = {}
+    for _event_type, _identity, created_at, capped in _capped_sessions(events, current, caps):
+        bucket = python_time_bucket(created_at, days)
+        seconds[bucket] = seconds.get(bucket, 0) + capped
+    previous_seconds = (
+        sum(capped for *_rest, capped in _capped_sessions(events, previous, caps)) if previous else None
+    )
 
     signup_rows = {
         row["day"]: row["n"]
@@ -227,8 +246,8 @@ def build_kpis(days, events, current, previous):
             _bucket_values(counts.get(completed, {}), days),
         ),
         "engagement_minutes": _kpi(
-            _engagement_minutes(current_totals),
-            previous_of(_engagement_minutes),
+            round(sum(seconds.values()) / 60, 1),
+            round(previous_seconds / 60, 1) if previous_seconds is not None else None,
             [round(value / 60, 1) for value in _bucket_values(seconds, days)],
         ),
         "new_signups": _kpi(
@@ -242,29 +261,6 @@ def build_kpis(days, events, current, previous):
             _bucket_values(counts.get(impressions, {}), days),
         ),
     }, visitor_rows
-
-
-def build_publish_markers(days, cutoff):
-    """Stories that went live in the range, for annotating the traffic chart.
-
-    `bucket` is the traffic-series key the marker belongs to, or None when the
-    series can't place it: the 24h series is hourly and a publish date has no
-    hour to land on.
-    """
-    stories = Story.objects.filter(published_story_q(), site_published_date__isnull=False)
-    if cutoff is not None:
-        stories = stories.filter(site_published_date__gte=cutoff.date())
-    markers = []
-    for published_on, title, slug in stories.order_by("site_published_date", "title").values_list(
-        "site_published_date", "title", "slug"
-    ):
-        bucket = None
-        if days != 1:
-            bucket = python_time_bucket(
-                timezone.make_aware(datetime.combine(published_on, time.min)), days
-            )
-        markers.append({"date": published_on, "bucket": bucket, "title": title, "slug": slug})
-    return markers
 
 
 def build_funnel(events, cutoff):
@@ -315,19 +311,16 @@ def _story_completion_average(progress_qs, unit_counts, cutoff):
 
 
 def build_formats(events, cutoff):
-    sessions = {
-        row["event_type"]: row
-        for row in filter_since(events.filter(event_type__in=SESSION_EVENT_TYPES), cutoff)
-        .annotate(identity=IDENTITY)
-        .values("event_type")
-        .annotate(seconds=Sum("duration_seconds"), users=Count("identity", distinct=True))
-    }
+    caps = SessionCaps()
+    seconds, people = {}, {}
+    for event_type, identity, _created_at, capped in _capped_sessions(events, (cutoff, None), caps):
+        seconds[event_type] = seconds.get(event_type, 0) + capped
+        people.setdefault(event_type, set()).add(identity)
 
     def card(event_type, avg_completion):
-        row = sessions.get(event_type)
         return {
-            "minutes": round((row["seconds"] or 0) / 60, 1) if row else 0,
-            "unique_users": row["users"] if row else 0,
+            "minutes": round(seconds.get(event_type, 0) / 60, 1),
+            "unique_users": len(people.get(event_type, ())),
             "avg_completion": avg_completion,
         }
 

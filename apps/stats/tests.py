@@ -944,19 +944,19 @@ class AdminContentAnalyticsApiTests(APITestCase):
         response = self.client.get(reverse("admin-analytics-content"), {"days": 30})
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.data["blog_posts_count"], 2)
-        self.assertGreaterEqual(sum(row["count"] for row in response.data["blog_publishing_over_time"]), 2)
-        self.assertEqual(response.data["stories_count"], 4)
-        self.assertEqual(response.data["audiobooks_count"], 1)
-        self.assertEqual(response.data["watchable_count"], 1)
-        self.assertEqual(response.data["quick_read_count"], 1)
-        self.assertEqual(response.data["top_audiobooks"][0]["id"], self.audiobook_story.id)
+        # Two published blog posts and four published stories this period.
+        self.assertEqual(response.data["publishing"]["blogs"], 2)
+        self.assertEqual(response.data["publishing"]["stories"], 4)
+        self.assertEqual(response.data["kpis"]["titles_published"]["value"], 6)
+        self.assertEqual(response.data["top_content"]["audiobook"]["count"], 1)
+        self.assertEqual(response.data["top_content"]["audiobook"]["rows"][0]["id"], self.audiobook_story.id)
+        self.assertEqual(response.data["top_content"]["quick_read"]["count"], 1)
+        self.assertEqual(response.data["top_content"]["blog"]["count"], 2)
 
         last_day = self.client.get(reverse("admin-analytics-content"), {"days": 1})
         self.assertEqual(last_day.status_code, 200)
         self.assertEqual(last_day.data["range_days"], 1)
         self.assertEqual(last_day.data["time_interval"], "hour")
-        self.assertEqual(last_day.data["publishing_interval"], "day")
 
         last_90_days = self.client.get(reverse("admin-analytics-content"), {"days": 90})
         self.assertEqual(last_90_days.data["time_interval"], "week")
@@ -991,8 +991,8 @@ class AdminContentAnalyticsApiTests(APITestCase):
         response = self.client.get(reverse("admin-analytics-content"), {"days": 30})
 
         self.assertEqual(response.status_code, 200)
-        story = next(row for row in response.data["top_stories"] if row["id"] == self.plain_story.id)
-        blog = next(row for row in response.data["top_blogs"] if row["id"] == self.blog.id)
+        story = next(row for row in response.data["top_content"]["story"]["rows"] if row["id"] == self.plain_story.id)
+        blog = next(row for row in response.data["top_content"]["blog"]["rows"] if row["id"] == self.blog.id)
         self.assertEqual(story["views"], 1)
         self.assertEqual(story["reads"], 1)
         self.assertEqual(story["reading_minutes"], 2)
@@ -1077,7 +1077,7 @@ class AdminContentAnalyticsApiTests(APITestCase):
 
         response = self.client.get(reverse("admin-analytics-content"), {"days": 30})
 
-        story = next(row for row in response.data["top_stories"] if row["id"] == self.plain_story.id)
+        story = next(row for row in response.data["top_content"]["story"]["rows"] if row["id"] == self.plain_story.id)
         self.assertEqual(story["views"], 1)
         self.assertEqual(story["reads"], 1)
         self.assertEqual(story["reading_minutes"], 1)
@@ -1134,7 +1134,7 @@ class TimeSeriesBucketFillTests(APITestCase):
 
         response = self.client.get(reverse("admin-analytics-content"), {"days": 7})
 
-        series = response.data["views_over_time"]
+        series = response.data["views_over_time"]["series"]
         # Today plus each of the 7 preceding days.
         self.assertEqual(len(series), 8)
         days = [row["day"] for row in series]
@@ -1151,7 +1151,7 @@ class TimeSeriesBucketFillTests(APITestCase):
 
         response = self.client.get(reverse("admin-analytics-content"), {"days": 1})
 
-        series = response.data["views_over_time"]
+        series = response.data["views_over_time"]["series"]
         self.assertEqual(response.data["time_interval"], "hour")
         # This hour plus each of the 24 preceding ones.
         self.assertEqual(len(series), 25)
@@ -1161,7 +1161,7 @@ class TimeSeriesBucketFillTests(APITestCase):
     def test_series_is_full_length_even_with_no_data_at_all(self):
         response = self.client.get(reverse("admin-analytics-content"), {"days": 30})
 
-        series = response.data["views_over_time"]
+        series = response.data["views_over_time"]["series"]
         self.assertEqual(len(series), 31)
         self.assertTrue(all(row["count"] == 0 for row in series))
 
@@ -1169,7 +1169,7 @@ class TimeSeriesBucketFillTests(APITestCase):
         for days, expected_interval, expected_length in ((90, "week", 14), (365, "month", 13)):
             with self.subTest(days=days):
                 response = self.client.get(reverse("admin-analytics-content"), {"days": days})
-                series = response.data["views_over_time"]
+                series = response.data["views_over_time"]["series"]
                 self.assertEqual(response.data["time_interval"], expected_interval)
                 self.assertEqual(len(series), expected_length)
                 days_seen = [row["day"] for row in series]
@@ -1180,14 +1180,14 @@ class TimeSeriesBucketFillTests(APITestCase):
         content = self.client.get(reverse("admin-analytics-content"), {"days": 7}).data
         users = self.client.get(reverse("admin-analytics-users"), {"days": 7}).data
 
-        for key, payload in (
-            ("views_over_time", content),
-            ("publishing_over_time", content),
-            ("blog_publishing_over_time", content),
-            ("signups_over_time", users),
+        for key, series in (
+            ("views_over_time", content["views_over_time"]["series"]),
+            ("previous views_over_time", content["views_over_time"]["previous_series"]),
+            ("publishing", content["publishing"]["series"]),
+            ("signups_over_time", users["signups_over_time"]),
         ):
             with self.subTest(series=key):
-                self.assertEqual(len(payload[key]), 8)
+                self.assertEqual(len(series), 8)
 
     def test_rating_trend_fills_average_with_none_not_zero(self):
         """A day with no reviews has no average — a 0 would render as if every
@@ -2933,3 +2933,422 @@ class AdminOverviewNeedsAttentionTests(APITestCase):
         )
         self.assertNotIn("submissions", items)
         self.assertEqual(items["feedback"]["link"], "/admin/feedback")
+
+
+class SessionCapTests(APITestCase):
+    """The one helper that decides how much of a session counts as time spent."""
+
+    def setUp(self):
+        from apps.story.content_scoring import SessionCaps
+
+        self.SessionCaps = SessionCaps
+        self.story = Story.objects.create(title="Capped", slug="capped", is_published=True)
+
+    def _caps(self):
+        return self.SessionCaps()
+
+    def test_reading_is_capped_at_one_and_a_half_times_the_estimated_reading_time(self):
+        Story.objects.filter(pk=self.story.pk).update(cached_chapter_reading_minutes=10)
+        caps = self._caps()
+        reading = AnalyticsEvent.EVENT_READING_SESSION
+        self.assertEqual(caps.capped(10 * 3600, reading, story_id=self.story.id), 15 * 60)
+        self.assertEqual(caps.capped(120, reading, story_id=self.story.id), 120)
+
+    def test_listening_and_watching_use_media_length(self):
+        Audio.objects.create(
+            story=self.story, title="One", slug="one", order=1, audio_file="story_audios/a.mp3",
+            duration_seconds=1200,
+        )
+        Audio.objects.create(
+            story=self.story, title="Two", slug="two", order=2, audio_file="story_audios/b.mp3",
+            duration_seconds=600,
+        )
+        video = Video.objects.create(
+            story=self.story, title="V", slug="v", order=1, youtube_url="https://youtu.be/abcdefghijk",
+            youtube_id="abcdefghijk", duration_seconds=1200,
+        )
+        caps = self._caps()
+        # Both tracks together are 30 minutes of audio: 1.5x = 45 minutes.
+        self.assertEqual(caps.capped(10 * 3600, AnalyticsEvent.EVENT_LISTENING_SESSION, story_id=self.story.id), 45 * 60)
+        self.assertEqual(
+            caps.capped(10 * 3600, AnalyticsEvent.EVENT_WATCHING_SESSION, story_id=self.story.id, video_id=video.id),
+            30 * 60,
+        )
+
+    def test_fallbacks_floor_and_ceiling(self):
+        caps = self._caps()
+        reading = AnalyticsEvent.EVENT_READING_SESSION
+        # Length unknown -> 60 minutes; a blog post is never known.
+        self.assertEqual(caps.capped(5 * 3600, reading, story_id=self.story.id), 60 * 60)
+        self.assertEqual(caps.capped(5 * 3600, reading, blog_id=1), 60 * 60)
+        # A Quick Read is a couple of minutes long.
+        self.assertEqual(caps.capped(5 * 3600, reading, story_id=self.story.id, is_quick_read=True), 10 * 60)
+        # A very short story is still allowed 10 minutes; a 20h audiobook is not one sitting.
+        Story.objects.filter(pk=self.story.pk).update(cached_chapter_reading_minutes=2)
+        Audio.objects.create(
+            story=self.story, title="Long", slug="long", order=1, audio_file="story_audios/l.mp3",
+            duration_seconds=20 * 3600,
+        )
+        caps = self._caps()
+        self.assertEqual(caps.capped(5 * 3600, reading, story_id=self.story.id), 10 * 60)
+        self.assertEqual(
+            caps.capped(20 * 3600, AnalyticsEvent.EVENT_LISTENING_SESSION, story_id=self.story.id), 3 * 3600
+        )
+
+
+class AdminContentTabTests(APITestCase):
+    def setUp(self):
+        cache.clear()
+        self.admin = User.objects.create_user(
+            email="content-admin@example.com", username="contentadmin",
+            password="test-password", is_superuser=True, is_staff=True, is_active=True,
+        )
+        self.staff = User.objects.create_user(
+            email="content-staff@example.com", username="contentstaff",
+            password="test-password", is_staff=True, is_active=True,
+        )
+        self.reader = User.objects.create_user(
+            email="content-reader@example.com", username="contentreader", password="test-password"
+        )
+        self.url = reverse("admin-analytics-content")
+        self.client.force_authenticate(self.admin)
+
+    def _story(self, title, **kwargs):
+        return Story.objects.create(
+            title=title, slug=title.lower().replace(" ", "-"), is_published=True, **kwargs
+        )
+
+    def _event(self, event_type, *, days_ago=0, **kwargs):
+        kwargs.setdefault("visitor_id", f"visitor-{uuid4().hex[:8]}")
+        event = AnalyticsEvent.objects.create(event_type=event_type, **kwargs)
+        if days_ago:
+            AnalyticsEvent.objects.filter(pk=event.pk).update(
+                created_at=timezone.now() - timedelta(days=days_ago)
+            )
+        return event
+
+    def _read(self, story, *, seconds=300, days_ago=0, **kwargs):
+        return self._event(
+            AnalyticsEvent.EVENT_READING_SESSION, story=story, duration_seconds=seconds, days_ago=days_ago, **kwargs
+        )
+
+    def _get(self, **params):
+        response = self.client.get(self.url, params)
+        self.assertEqual(response.status_code, 200, response.data)
+        return response.data
+
+    def _rows(self, data, kind="story"):
+        return {row["title"]: row for row in data["top_content"][kind]["rows"]}
+
+    # --- minutes ------------------------------------------------------------
+
+    def test_idle_tab_sessions_are_capped_in_rows_and_kpis(self):
+        story = self._story("Idle Story")
+        blog = Blog.objects.create(title="Idle Blog", slug="idle-blog", content="<p>x</p>")
+        self._read(story, seconds=20 * 3600)
+        self._event(AnalyticsEvent.EVENT_READING_SESSION, blog=blog, duration_seconds=1083 * 60)
+
+        data = self._get(days=7)
+        # An unknown-length story and every blog post are capped at 60 minutes.
+        self.assertEqual(self._rows(data)["Idle Story"]["reading_minutes"], 60.0)
+        self.assertEqual(self._rows(data, "blog")["Idle Blog"]["engagement_minutes"], 60.0)
+        self.assertEqual(data["kpis"]["engagement_minutes"]["value"], 120.0)
+
+    # --- scoring ------------------------------------------------------------
+
+    def test_scores_are_normalised_within_each_content_type(self):
+        big, small = self._story("Big Story"), self._story("Small Story")
+        for _ in range(2):
+            self._read(big, seconds=600)
+        self._read(small, seconds=300)
+        blog_big = Blog.objects.create(title="Big Blog", slug="big-blog", content="<p>x</p>")
+        blog_small = Blog.objects.create(title="Small Blog", slug="small-blog", content="<p>x</p>")
+        for _ in range(2):
+            self._event(AnalyticsEvent.EVENT_READING_SESSION, blog=blog_big, duration_seconds=600)
+        self._event(AnalyticsEvent.EVENT_READING_SESSION, blog=blog_small, duration_seconds=300)
+
+        data = self._get(days=7)
+        stories, blogs = self._rows(data), self._rows(data, "blog")
+        # The best of each type scores the same: 35 (people) + 25 (time), nothing else.
+        self.assertAlmostEqual(stories["Big Story"]["performance_score"], 60.0, delta=0.1)
+        self.assertAlmostEqual(blogs["Big Blog"]["performance_score"], 60.0, delta=0.1)
+        # Half the people, a quarter of the time: 100 x (.35 x .5 + .25 x .25).
+        self.assertAlmostEqual(stories["Small Story"]["performance_score"], 23.8, delta=0.1)
+        for row in list(stories.values()) + list(blogs.values()):
+            self.assertTrue(0 <= row["performance_score"] <= 100)
+        self.assertIn("weights", data["score_formula"])
+
+    def test_one_long_session_does_not_outrank_a_story_many_people_read(self):
+        popular, lone = self._story("Popular"), self._story("Lone Reader")
+        for _ in range(4):
+            self._read(popular, seconds=240)
+        self._read(lone, seconds=3000)
+
+        rows = self._get(days=7)["top_content"]["story"]["rows"]
+        self.assertEqual([row["title"] for row in rows][:2], ["Popular", "Lone Reader"])
+        self.assertFalse(rows[0]["low_sample"])
+        self.assertTrue(rows[1]["low_sample"])
+
+    def test_low_sample_rows_sort_last_whatever_their_score(self):
+        two_people, one_person = self._story("Two People"), self._story("One Person")
+        self._read(two_people, seconds=60)
+        self._read(two_people, seconds=60)
+        self._read(one_person, seconds=3000)
+        for _ in range(3):
+            self._event(AnalyticsEvent.EVENT_STORY_STARTED, user=self.reader, story=one_person)
+        user = User.objects.create_user(email="done@example.com", username="done", password="x")
+        self._event(AnalyticsEvent.EVENT_STORY_COMPLETED, user=user, story=one_person)
+
+        by_score = self.client.get(
+            reverse("admin-analytics-content-rankings"), {"kind": "story", "days": 7}
+        ).data["results"]
+        self.assertEqual([row["title"] for row in by_score], ["Two People", "One Person"])
+        by_minutes = self.client.get(
+            reverse("admin-analytics-content-rankings"),
+            {"kind": "story", "days": 7, "sort": "engagement_minutes"},
+        ).data["results"]
+        self.assertEqual([row["title"] for row in by_minutes][:1], ["Two People"])
+
+    def test_audiobook_with_no_listens_scores_zero(self):
+        audiobook = self._story("Silent Audiobook")
+        Audio.objects.create(
+            story=audiobook, title="One", slug="one", order=1, audio_file="story_audios/s.mp3"
+        )
+        StoryView.objects.create(story=audiobook, ip_address="198.51.100.20")
+        Favorite.objects.create(story=audiobook, user=self.reader)
+        self._read(audiobook)  # reading the text is not listening
+
+        row = self._rows(self._get(days=7), "audiobook")["Silent Audiobook"]
+        self.assertEqual(row["unique_people"], 0)
+        self.assertEqual(row["performance_score"], 0)
+        self.assertTrue(row["low_sample"])
+
+    def test_audiobooks_are_scored_on_listening_only(self):
+        audiobook = self._story("Heard Audiobook")
+        Audio.objects.create(
+            story=audiobook, title="One", slug="one", order=1, audio_file="story_audios/h.mp3"
+        )
+        self._read(audiobook, seconds=900)
+        for _ in range(2):
+            self._event(AnalyticsEvent.EVENT_LISTENING_SESSION, story=audiobook, duration_seconds=300)
+
+        row = self._rows(self._get(days=7), "audiobook")["Heard Audiobook"]
+        self.assertEqual(row["unique_people"], 2)
+        self.assertEqual(row["engagement_minutes"], 10.0)  # listening only, not the 15 reading minutes
+
+    # --- views and reads ----------------------------------------------------
+
+    def test_views_are_never_fewer_than_the_people_who_read(self):
+        """Readers who arrive on a reader page directly never fire the detail-page
+        view beacon, so a story could show 0 views and 8 reads."""
+        story = self._story("Direct Readers")
+        visitors = ["a", "b", "c"]  # 6 sessions, 3 people
+        for visitor in visitors:
+            self._read(story, visitor_id=visitor)
+            self._read(story, visitor_id=visitor)
+
+        row = self._rows(self._get(days=7))["Direct Readers"]
+        self.assertEqual(row["reads"], 6)
+        self.assertEqual(row["unique_people"], 3)
+        self.assertEqual(row["views"], 3)
+
+    def test_detail_page_views_still_count_when_nobody_reads(self):
+        story = self._story("Browsed Only")
+        for index in range(4):
+            StoryView.objects.create(story=story, ip_address=f"198.51.100.{index + 30}")
+        data = self._get(days=7)
+        self.assertEqual(self._rows(data)["Browsed Only"]["views"], 4)
+        self.assertEqual(data["kpis"]["views"]["value"], 4)
+        self.assertEqual(data["views_over_time"]["total"], 4)
+        self.assertEqual(sum(row["count"] for row in data["views_over_time"]["series"]), 4)
+
+    # --- every section respects days ----------------------------------------
+
+    def test_every_section_respects_the_selected_range(self):
+        genre = Genre.objects.create(name="Folk Tales")
+        story = self._story("Old Hit")
+        story.genres.add(genre)
+        Story.objects.filter(pk=story.pk).update(site_published_date=timezone.localdate() - timedelta(days=40))
+        old_blog = Blog.objects.create(title="Old Blog", slug="old-blog", content="<p>x</p>")
+        Blog.objects.filter(pk=old_blog.pk).update(created_at=timezone.now() - timedelta(days=40))
+        for index in range(3):
+            self._read(story, days_ago=40, visitor_id=f"old-{index}")
+        view = StoryView.objects.create(story=story, ip_address="198.51.100.50")
+        StoryView.objects.filter(pk=view.pk).update(created_at=timezone.now() - timedelta(days=40))
+        Favorite.objects.create(story=story, user=self.reader)
+        Favorite.objects.filter(story=story).update(created_at=timezone.now() - timedelta(days=40))
+
+        recent = self._get(days=7)
+        genre_row = next(row for row in recent["genre_performance"] if row["name"] == "Folk Tales")
+        self.assertEqual(genre_row["stories_in_catalogue"], 1)
+        self.assertEqual(
+            (genre_row["stories_with_activity"], genre_row["views"], genre_row["unique_readers"], genre_row["engagement_minutes"]),
+            (0, 0, 0, 0),
+        )
+        story_row = self._rows(recent)["Old Hit"]
+        self.assertEqual((story_row["views"], story_row["unique_people"], story_row["favorites"]), (0, 0, 0))
+        type_row = recent["story_type_performance"][0]
+        self.assertEqual((type_row["views"], type_row["unique_readers"]), (0, 0))
+        self.assertEqual(recent["catalogue_gaps"]["no_audio"]["rows"][0]["views"], 0)
+        self.assertEqual(recent["publishing"]["stories"], 0)
+        self.assertEqual(recent["publishing"]["blogs"], 0)
+        self.assertEqual(recent["kpis"]["views"]["value"], 0)
+        self.assertEqual(recent["kpis"]["unique_readers"]["value"], 0)
+        self.assertEqual(recent["views_over_time"]["publish_markers"], [])
+
+        wide = self._get(days=90)
+        genre_row = next(row for row in wide["genre_performance"] if row["name"] == "Folk Tales")
+        self.assertEqual((genre_row["views"], genre_row["unique_readers"]), (3, 3))
+        self.assertEqual(wide["publishing"]["stories"], 1)
+        self.assertEqual(wide["publishing"]["blogs"], 1)
+        self.assertEqual(wide["kpis"]["titles_published"]["value"], 2)
+        self.assertEqual(self._rows(wide)["Old Hit"]["favorites"], 1)
+
+    # --- exclusions ---------------------------------------------------------
+
+    def test_staff_and_suspected_bot_activity_is_excluded(self):
+        story = self._story("Watched Story")
+        self._read(story, visitor_id="real")
+        self._read(story, user=self.admin, seconds=3000)
+        self._read(story, user=self.staff, seconds=3000)
+        self._read(story, visitor_id="bot", is_suspected_bot=True, seconds=3000)
+        StoryView.objects.create(story=story, user=self.admin, ip_address="198.51.100.60")
+        Favorite.objects.create(story=story, user=self.staff)
+
+        data = self._get(days=7)
+        row = self._rows(data)["Watched Story"]
+        self.assertEqual((row["unique_people"], row["views"], row["favorites"], row["reads"]), (1, 1, 0, 1))
+        self.assertEqual(row["reading_minutes"], 5.0)
+        self.assertEqual(data["kpis"]["unique_readers"]["value"], 1)
+        self.assertEqual(data["kpis"]["engagement_minutes"]["value"], 5.0)
+
+    # --- previous period ----------------------------------------------------
+
+    def test_kpis_compare_with_the_previous_period_only(self):
+        story = self._story("Trendy")
+        for index in range(3):
+            self._read(story, visitor_id=f"now-{index}")
+        self._read(story, visitor_id="before", days_ago=10)
+
+        kpis = self._get(days=7)["kpis"]
+        readers = kpis["unique_readers"]
+        # Previous is the week before, not "the last 14 days".
+        self.assertEqual((readers["value"], readers["previous_value"]), (3, 1))
+        self.assertEqual(readers["change_pct"], 200.0)
+
+    def test_change_is_null_when_nothing_happened_in_the_previous_period(self):
+        story = self._story("Brand New")
+        self._read(story)
+        kpis = self._get(days=7)["kpis"]
+        self.assertEqual(kpis["unique_readers"]["previous_value"], 0)
+        self.assertIsNone(kpis["unique_readers"]["change_pct"])
+        self.assertIsNone(self._get(days="all")["kpis"]["unique_readers"]["previous_value"])
+
+    def test_rows_carry_previous_score_and_rank_change(self):
+        alpha, bravo = self._story("Alpha"), self._story("Bravo")
+        for index in range(3):
+            self._read(alpha, visitor_id=f"a{index}")
+        self._read(bravo, visitor_id="b0")
+        self._read(bravo, visitor_id="b1")
+        # Last week the order was the other way round.
+        for index in range(3):
+            self._read(bravo, visitor_id=f"pb{index}", days_ago=10)
+        self._read(alpha, visitor_id="pa0", days_ago=10)
+        self._read(alpha, visitor_id="pa1", days_ago=10)
+
+        rows = self._rows(self._get(days=7))
+        self.assertEqual(rows["Alpha"]["rank_change"], 1)
+        self.assertEqual(rows["Bravo"]["rank_change"], -1)
+        self.assertGreater(rows["Bravo"]["previous_score"], rows["Alpha"]["previous_score"])
+        self.assertIsNone(self._rows(self._get(days="all"))["Alpha"]["rank_change"])
+
+    def test_views_over_time_keeps_a_previous_series(self):
+        story = self._story("Charted")
+        for index in range(2):
+            StoryView.objects.create(story=story, ip_address=f"198.51.100.{index + 70}")
+        old = StoryView.objects.create(story=story, ip_address="198.51.100.80")
+        StoryView.objects.filter(pk=old.pk).update(created_at=timezone.now() - timedelta(days=10))
+
+        chart = self._get(days=7)["views_over_time"]
+        self.assertEqual((chart["total"], chart["previous_total"]), (2, 1))
+        self.assertEqual(chart["change_pct"], 100.0)
+        self.assertEqual(len(chart["previous_series"]), 8)
+        self.assertEqual(sum(row["count"] for row in chart["previous_series"]), 1)
+        self.assertEqual(sum(row["count"] for row in chart["series"]), 2)
+
+    # --- genres, types, gaps, publishing ------------------------------------
+
+    def test_genre_and_story_type_performance_are_in_range_and_sorted_by_views(self):
+        quiet, busy = Genre.objects.create(name="Quiet"), Genre.objects.create(name="Busy")
+        Genre.objects.create(name="Empty Genre")
+        a, b = self._story("Quiet Story"), self._story("Busy Story")
+        a.genres.add(quiet)
+        b.genres.add(busy)
+        self._read(a)
+        for index in range(3):
+            self._read(b, visitor_id=f"busy-{index}", seconds=600)
+
+        data = self._get(days=7)
+        genres = data["genre_performance"]
+        self.assertEqual([row["name"] for row in genres], ["Busy", "Quiet"])  # no genre without stories
+        busy_row = genres[0]
+        self.assertEqual(busy_row["views"], 3)
+        self.assertEqual(busy_row["unique_readers"], 3)
+        self.assertEqual(busy_row["engagement_minutes"], 30.0)
+        self.assertEqual(busy_row["views_per_story"], 3.0)
+        self.assertIsNone(busy_row["completion_rate"])
+        self.assertEqual(sum(row["views"] for row in data["story_type_performance"]), 4)
+
+    def test_completion_rate_is_the_share_of_signed_in_readers_who_finished(self):
+        story = self._story("Finishable")
+        finisher = User.objects.create_user(email="fin@example.com", username="fin", password="x")
+        for user in (self.reader, finisher):
+            self._event(AnalyticsEvent.EVENT_STORY_STARTED, user=user, story=story)
+        self._event(AnalyticsEvent.EVENT_STORY_COMPLETED, user=finisher, story=story)
+
+        row = self._rows(self._get(days=7))["Finishable"]
+        self.assertEqual(row["completion_rate"], 0.5)
+        self.assertEqual(row["completions"], 1)
+
+    def test_catalogue_gaps_rank_by_views_in_range(self):
+        complete = self._story("Complete", cover_image="https://example.com/c.jpg", summary="<p>s</p>")
+        Audio.objects.create(story=complete, title="T", slug="t", order=1, audio_file="story_audios/c.mp3")
+        Video.objects.create(
+            story=complete, title="V", slug="v", order=1, youtube_url="https://youtu.be/abcdefghijk",
+            youtube_id="abcdefghijk",
+        )
+        popular, ignored = self._story("Popular Gap"), self._story("Ignored Gap")
+        for index in range(3):
+            StoryView.objects.create(story=popular, ip_address=f"198.51.100.{index + 90}")
+        old = StoryView.objects.create(story=ignored, ip_address="198.51.100.99")
+        StoryView.objects.filter(pk=old.pk).update(created_at=timezone.now() - timedelta(days=60))
+
+        gaps = self._get(days=7)["catalogue_gaps"]
+        self.assertEqual(gaps["no_audio"]["total"], 2)
+        self.assertEqual([row["title"] for row in gaps["no_audio"]["rows"]], ["Popular Gap", "Ignored Gap"])
+        self.assertEqual(gaps["no_audio"]["rows"][0]["views"], 3)
+        self.assertEqual(gaps["no_audio"]["rows"][1]["views"], 0)
+        self.assertEqual(set(gaps["no_audio"]["rows"][0]["missing"]), {"audio", "quick_read", "cover", "video"})
+        self.assertNotIn("Complete", [row["title"] for key in gaps for row in gaps[key]["rows"]])
+
+    def test_publishing_counts_and_markers(self):
+        story = self._story("Fresh Story")
+        blog = Blog.objects.create(title="Fresh Blog", slug="fresh-blog", content="<p>x</p>")
+
+        data = self._get(days=7)
+        self.assertEqual((data["publishing"]["stories"], data["publishing"]["blogs"]), (1, 1))
+        self.assertEqual(sum(row["stories"] for row in data["publishing"]["series"]), 1)
+        self.assertEqual(sum(row["blogs"] for row in data["publishing"]["series"]), 1)
+        markers = {marker["title"]: marker for marker in data["views_over_time"]["publish_markers"]}
+        self.assertEqual(set(markers), {story.title, blog.title})
+        self.assertEqual(markers["Fresh Blog"]["type"], "blog")
+        self.assertIsNotNone(markers["Fresh Story"]["bucket"])
+
+    def test_content_export_still_works(self):
+        story = self._story("Exported")
+        self._read(story)
+        for file_format in ("csv", "xlsx"):
+            response = self.client.get(
+                reverse("admin-analytics-export"), {"sections": "content", "file_format": file_format, "days": 7}
+            )
+            self.assertEqual(response.status_code, 200, file_format)
