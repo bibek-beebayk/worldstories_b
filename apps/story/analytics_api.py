@@ -94,11 +94,16 @@ def get_time_interval(days):
     return "day"
 
 
-def filter_since(queryset, cutoff, field="created_at"):
-    """Apply a range lower bound, leaving an all-time queryset unbounded."""
-    if cutoff is None:
-        return queryset
-    return queryset.filter(**{f"{field}__gte": cutoff})
+def filter_since(queryset, cutoff, field="created_at", until=None):
+    """Apply a range lower bound, leaving an all-time queryset unbounded.
+
+    `until` is an optional exclusive upper bound, for windows that end before
+    now (the previous period of a comparison)."""
+    if cutoff is not None:
+        queryset = queryset.filter(**{f"{field}__gte": cutoff})
+    if until is not None:
+        queryset = queryset.filter(**{f"{field}__lt": until})
+    return queryset
 
 
 def build_with_previous_period(builder, days, *args, **kwargs):
@@ -235,15 +240,18 @@ def build_referral_sources(events):
     ]
 
 
-def build_content_rankings(days, kind):
+def build_content_rankings(days, kind, *, until=None):
     """Return comparable, interval-scoped metrics for every published title.
+
+    The window is the `days` before now, or the `days` before `until` when
+    that is given (the period preceding a comparison).
 
     The score intentionally uses understandable raw weights rather than a
     hidden statistical model: a view is 1 point, a read is 2, an interaction
     is 3, and each engaged minute is 1. Raw values are returned alongside it
     so admins can judge performance without relying on the score alone.
     """
-    cutoff = get_cutoff(days)
+    cutoff = get_cutoff(days) if until is None else until - timedelta(days=days)
     is_story = kind in {"story", "audiobook", "quick_read"}
     is_quick_read = kind == "quick_read"
     title_queryset = Story.objects.published() if is_story else Blog.objects.published()
@@ -272,13 +280,13 @@ def build_content_rankings(days, kind):
 
     if is_story and not is_quick_read:
         for row in (
-            audience_only(filter_since(StoryView.objects.filter(story_id__in=title_ids), cutoff))
+            audience_only(filter_since(StoryView.objects.filter(story_id__in=title_ids), cutoff, until=until))
             .values("story_id")
             .annotate(count=Count("id"))
         ):
             metrics[row["story_id"]]["views"] = row["count"]
 
-    events = audience_events(filter_since(AnalyticsEvent.objects.all(), cutoff))
+    events = audience_events(filter_since(AnalyticsEvent.objects.all(), cutoff, until=until))
     events = events.filter(story_id__in=title_ids) if is_story else events.filter(blog_id__in=title_ids)
     id_field = "story_id" if is_story else "blog_id"
     event_interaction_types = {
@@ -336,12 +344,12 @@ def build_content_rankings(days, kind):
     reviews = {}
     if is_story and not is_quick_read:
         favorites = dict(
-            audience_only(filter_since(Favorite.objects.filter(story_id__in=title_ids), cutoff))
+            audience_only(filter_since(Favorite.objects.filter(story_id__in=title_ids), cutoff, until=until))
             .values_list("story_id")
             .annotate(count=Count("id"))
         )
         reviews = dict(
-            audience_only(filter_since(Review.objects.filter(story_id__in=title_ids), cutoff))
+            audience_only(filter_since(Review.objects.filter(story_id__in=title_ids), cutoff, until=until))
             .values_list("story_id")
             .annotate(count=Count("id"))
         )
@@ -935,6 +943,20 @@ def _retention(events, cutoff, day_offset):
     return {"eligible": eligible, "returned": returned, "rate": _rate(returned, eligible)}
 
 
+def build_story_lifecycle_counts(cutoff, until=None):
+    """Story detail views, starts and completions over a window — the three
+    counts the engagement funnel's start and completion rates are built from.
+    Shared with the admin Overview so both read them the same way."""
+    events = audience_events(filter_since(AnalyticsEvent.objects.all(), cutoff, until=until))
+    return {
+        "detail_views": audience_only(
+            filter_since(StoryView.objects.all(), cutoff, until=until)
+        ).count(),
+        "starts": events.filter(event_type=AnalyticsEvent.EVENT_STORY_STARTED).count(),
+        "completions": events.filter(event_type=AnalyticsEvent.EVENT_STORY_COMPLETED).count(),
+    }
+
+
 def build_engagement_metrics_data(days):
     """The §12.2 funnel: the rates that say whether the engagement work worked.
 
@@ -949,10 +971,11 @@ def build_engagement_metrics_data(days):
     def count(event_type):
         return events.filter(event_type=event_type).count()
 
-    starts = count(AnalyticsEvent.EVENT_STORY_STARTED)
+    lifecycle = build_story_lifecycle_counts(cutoff)
+    starts = lifecycle["starts"]
+    completions = lifecycle["completions"]
+    detail_views = lifecycle["detail_views"]
     resumes = count(AnalyticsEvent.EVENT_STORY_RESUMED)
-    completions = count(AnalyticsEvent.EVENT_STORY_COMPLETED)
-    detail_views = audience_only(filter_since(StoryView.objects.all(), cutoff)).count()
 
     quick_read_completed = count(AnalyticsEvent.EVENT_QUICK_READ_COMPLETED)
     quick_read_converted = count(AnalyticsEvent.EVENT_QUICK_READ_FULL_STORY_CLICKED)

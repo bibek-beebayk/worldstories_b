@@ -12,6 +12,7 @@ from rest_framework.routers import DefaultRouter
 from rest_framework_simplejwt.views import TokenRefreshView
 from apps.story import api as story_api
 from apps.story import analytics_api as story_analytics_api
+from apps.story import overview_api
 from apps.stats import views as stats_views
 from apps.stats import nepalikatha as nepalikatha_api
 from apps.users import api as users_api
@@ -299,7 +300,7 @@ urlpatterns = [
         name="analytics-events",
     ),
     path("api/search/", story_api.SearchStoryAPIView.as_view(), name="search-data"),
-    path("api/admin/overview/", story_api.AdminOverviewAPIView.as_view(), name="admin-overview"),
+    path("api/admin/overview/", overview_api.AdminOverviewAPIView.as_view(), name="admin-overview"),
     path("api/admin/prompt-settings/", story_api.PromptSettingsAPIView.as_view(), name="admin-prompt-settings"),
     path(
         "api/admin/analytics/content/",

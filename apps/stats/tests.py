@@ -2624,3 +2624,312 @@ class AudienceDashboardBotShareTests(APITestCase):
         self.assertIn("audience_countries.csv", names)
         self.assertIn("audience_ua_families.csv", names)
         self.assertIn("audience_summary.csv", names)
+
+
+class AdminOverviewApiTests(APITestCase):
+    def setUp(self):
+        cache.clear()
+        self.admin = User.objects.create_user(
+            email="overview-admin@example.com", username="overviewadmin",
+            password="test-password", is_superuser=True, is_staff=True, is_active=True,
+        )
+        self.staff = User.objects.create_user(
+            email="overview-staff@example.com", username="overviewstaff",
+            password="test-password", is_staff=True, is_active=True,
+        )
+        self.reader = User.objects.create_user(
+            email="overview-reader@example.com", username="overviewreader", password="test-password"
+        )
+        self.url = reverse("admin-overview")
+        self.client.force_authenticate(self.admin)
+
+    def _story(self, title, **kwargs):
+        slug = title.lower().replace(" ", "-")
+        return Story.objects.create(title=title, slug=slug, is_published=True, **kwargs)
+
+    def _event(self, event_type, *, days_ago=0, **kwargs):
+        kwargs.setdefault("visitor_id", f"visitor-{uuid4().hex[:8]}")
+        event = AnalyticsEvent.objects.create(event_type=event_type, **kwargs)
+        if days_ago:
+            AnalyticsEvent.objects.filter(pk=event.pk).update(
+                created_at=timezone.now() - timedelta(days=days_ago)
+            )
+        return event
+
+    def _get(self, **params):
+        response = self.client.get(self.url, params)
+        self.assertEqual(response.status_code, 200, response.data)
+        return response.data
+
+    def test_requires_a_superuser(self):
+        self.client.force_authenticate(None)
+        self.assertEqual(self.client.get(self.url).status_code, 401)
+        self.client.force_authenticate(self.reader)
+        self.assertEqual(self.client.get(self.url).status_code, 403)
+
+    def test_staff_and_suspected_bot_activity_is_excluded(self):
+        story = self._story("Counted Story")
+        self._event(AnalyticsEvent.EVENT_VISIT, visitor_id="real-visitor")
+        self._event(AnalyticsEvent.EVENT_VISIT, visitor_id="bot-visitor", is_suspected_bot=True)
+        self._event(AnalyticsEvent.EVENT_VISIT, user=self.admin)
+        self._event(AnalyticsEvent.EVENT_VISIT, user=self.staff)
+        self._event(AnalyticsEvent.EVENT_STORY_STARTED, user=self.admin, story=story)
+        self._event(AnalyticsEvent.EVENT_STORY_STARTED, user=self.reader, story=story)
+        self._event(
+            AnalyticsEvent.EVENT_READING_SESSION, user=self.staff, story=story, duration_seconds=600
+        )
+        self._event(AnalyticsEvent.EVENT_AD_IMPRESSION, is_suspected_bot=True)
+
+        kpis = self._get()["kpis"]
+        self.assertEqual(kpis["unique_visitors"]["value"], 1)
+        self.assertEqual(kpis["stories_started"]["value"], 1)
+        self.assertEqual(kpis["engagement_minutes"]["value"], 0)
+        self.assertEqual(kpis["ad_impressions"]["value"], 0)
+
+    def test_visitors_are_counted_once_per_identity(self):
+        # One signed-in reader on two browsers is one person; a browser that
+        # visits twice is one visitor.
+        self._event(AnalyticsEvent.EVENT_VISIT, user=self.reader, visitor_id="laptop")
+        self._event(AnalyticsEvent.EVENT_VISIT, user=self.reader, visitor_id="phone")
+        self._event(AnalyticsEvent.EVENT_VISIT, visitor_id="anon")
+        self._event(AnalyticsEvent.EVENT_VISIT, visitor_id="anon")
+        self.assertEqual(self._get()["kpis"]["unique_visitors"]["value"], 2)
+
+    def test_previous_period_comparison(self):
+        for name in ("a", "b", "c"):
+            self._event(AnalyticsEvent.EVENT_VISIT, visitor_id=name)
+        for name in ("d", "e"):
+            self._event(AnalyticsEvent.EVENT_VISIT, visitor_id=name, days_ago=10)
+        # Older than both windows: must be in neither.
+        self._event(AnalyticsEvent.EVENT_VISIT, visitor_id="old", days_ago=40)
+        self._event(AnalyticsEvent.EVENT_READING_SESSION, duration_seconds=1200)
+        self._event(AnalyticsEvent.EVENT_LISTENING_SESSION, duration_seconds=600, days_ago=9)
+
+        kpis = self._get(days=7)["kpis"]
+        visitors = kpis["unique_visitors"]
+        self.assertEqual((visitors["value"], visitors["previous_value"]), (3, 2))
+        self.assertEqual(visitors["change_pct"], 50.0)
+        minutes = kpis["engagement_minutes"]
+        self.assertEqual((minutes["value"], minutes["previous_value"]), (20.0, 10.0))
+        self.assertEqual(minutes["change_pct"], 100.0)
+        # The sparkline has one entry per day bucket and adds up to the visits.
+        self.assertEqual(len(visitors["sparkline"]), 8)
+        self.assertEqual(sum(visitors["sparkline"]), 3)
+
+    def test_change_is_null_when_the_previous_value_is_zero(self):
+        self._event(AnalyticsEvent.EVENT_VISIT, visitor_id="only-now")
+        visitors = self._get(days=7)["kpis"]["unique_visitors"]
+        self.assertEqual((visitors["value"], visitors["previous_value"]), (1, 0))
+        self.assertIsNone(visitors["change_pct"])
+
+    def test_new_signups_exclude_staff(self):
+        # setUp's admin, staff and reader all joined just now; only the reader counts.
+        self.assertEqual(self._get(days=7)["kpis"]["new_signups"]["value"], 1)
+
+    def test_days_param_is_validated(self):
+        self.assertEqual(self._get()["range_days"], 7)
+        self.assertEqual(self._get(days=1)["range_days"], 1)
+        self.assertEqual(self._get(days=30)["range_days"], 30)
+        self.assertEqual(self._get(days=90)["range_days"], 90)
+        self.assertEqual(self._get(days=3)["range_days"], 7)
+        self.assertEqual(self._get(days="abc")["range_days"], 7)
+        self.assertEqual(self._get(days="-7")["range_days"], 7)
+        self.assertEqual(self._get(days=1)["time_interval"], "hour")
+        everything = self._get(days="all")
+        self.assertEqual(everything["range_days"], "all")
+        self.assertIsNone(everything["kpis"]["unique_visitors"]["previous_value"])
+
+    def test_response_is_cached_per_range(self):
+        self._event(AnalyticsEvent.EVENT_VISIT, visitor_id="first")
+        self.assertEqual(self._get(days=7)["kpis"]["unique_visitors"]["value"], 1)
+        self._event(AnalyticsEvent.EVENT_VISIT, visitor_id="second")
+        self.assertEqual(self._get(days=7)["kpis"]["unique_visitors"]["value"], 1)
+        self.assertEqual(self._get(days=30)["kpis"]["unique_visitors"]["value"], 2)
+
+    def test_funnel_steps_and_rates(self):
+        story = self._story("Funnel Story")
+        for index in range(4):
+            self._event(AnalyticsEvent.EVENT_VISIT, visitor_id=f"v{index}")
+        for _ in range(2):
+            StoryView.objects.create(story=story, ip_address="198.51.100.7")
+        self._event(AnalyticsEvent.EVENT_STORY_STARTED, story=story)
+        self._event(AnalyticsEvent.EVENT_STORY_COMPLETED, story=story)
+
+        funnel = {step["key"]: step for step in self._get()["funnel"]}
+        self.assertEqual(
+            [funnel[key]["count"] for key in ("visits", "story_opened", "started", "completed")],
+            [4, 2, 1, 1],
+        )
+        self.assertIsNone(funnel["visits"]["rate"])
+        self.assertEqual(funnel["story_opened"]["rate"], 0.5)
+        self.assertEqual(funnel["started"]["rate"], 0.5)
+        self.assertEqual(funnel["completed"]["rate"], 1.0)
+
+    def test_listening_is_grouped_by_story_not_by_audio_track(self):
+        story = self._story("Audiobook")
+        tracks = [Audio.objects.create(story=story, title=f"Part {n}", slug=f"part-{n}", order=n + 1) for n in range(3)]
+        for track, progress in zip(tracks, (1.0, 0.0, 0.0)):
+            AudioReadingProgress.objects.create(
+                user=self.reader, story=story, audio=track, progress=progress
+            )
+            self._event(
+                AnalyticsEvent.EVENT_LISTENING_SESSION,
+                user=self.reader, story=story, duration_seconds=300,
+            )
+
+        data = self._get()
+        listen = data["formats"]["listen"]
+        # One track finished out of three is a third of the book, not 100%.
+        self.assertEqual(listen["avg_completion"], 0.333)
+        self.assertEqual(listen["unique_users"], 1)
+        self.assertEqual(listen["minutes"], 15.0)
+        # No per-track lists any more.
+        self.assertNotIn("most_listened_audios", data)
+
+    def test_format_completion_ignores_staff_progress(self):
+        story = self._story("Read Story")
+        chapter = Chapter.objects.create(story=story, title="One", content="<p>x</p>", order=1)
+        ChapterReadingProgress.objects.create(user=self.reader, story=story, chapter=chapter, progress=0.5)
+        ChapterReadingProgress.objects.create(user=self.admin, story=story, chapter=chapter, progress=1.0)
+        self.assertEqual(self._get()["formats"]["read"]["avg_completion"], 0.5)
+
+    def test_trending_ranks_and_rank_change(self):
+        alpha, bravo, charlie = (self._story(name) for name in ("Alpha", "Bravo", "Charlie"))
+        for _ in range(3):
+            self._event(AnalyticsEvent.EVENT_READING_SESSION, story=alpha)
+        self._event(AnalyticsEvent.EVENT_READING_SESSION, story=alpha, days_ago=10)
+        self._event(AnalyticsEvent.EVENT_READING_SESSION, story=bravo)
+        for _ in range(2):
+            self._event(AnalyticsEvent.EVENT_READING_SESSION, story=bravo, days_ago=10)
+        self._event(AnalyticsEvent.EVENT_READING_SESSION, story=charlie)
+
+        trending = self._get(days=7)["movers"]["trending"]
+        self.assertEqual([row["title"] for row in trending], ["Alpha", "Bravo", "Charlie"])
+        # Alpha was 2nd last week and Bravo 1st; Charlie wasn't ranked at all.
+        self.assertEqual([row["rank_change"] for row in trending], [1, -1, None])
+
+    def test_hidden_gems_and_leaky_stories(self):
+        gem, leak, popular = (self._story(name) for name in ("Gem", "Leak", "Popular"))
+        for story in (leak, popular):
+            for _ in range(5):
+                StoryView.objects.create(story=story, ip_address="198.51.100.9")
+        for _ in range(4):
+            self._event(AnalyticsEvent.EVENT_STORY_STARTED, story=gem)
+        for _ in range(3):
+            self._event(AnalyticsEvent.EVENT_STORY_COMPLETED, story=gem)
+        for _ in range(6):
+            self._event(AnalyticsEvent.EVENT_STORY_STARTED, story=leak)
+        self._event(AnalyticsEvent.EVENT_STORY_COMPLETED, story=leak)
+        # Too few starts to say anything about.
+        thin = self._story("Thin")
+        self._event(AnalyticsEvent.EVENT_STORY_STARTED, story=thin)
+        self._event(AnalyticsEvent.EVENT_STORY_COMPLETED, story=thin)
+
+        movers = self._get()["movers"]
+        self.assertEqual([row["title"] for row in movers["hidden_gems"]], ["Gem"])
+        self.assertEqual(movers["hidden_gems"][0]["completion_rate"], 0.75)
+        self.assertEqual([row["title"] for row in movers["leaky"]], ["Leak"])
+
+    def test_sources_and_publish_markers(self):
+        story = self._story("Fresh Story", site_published_date=timezone.localdate())
+        self._event(AnalyticsEvent.EVENT_VISIT, country_code="NP", metadata={"referral_source": "google"})
+        self._event(AnalyticsEvent.EVENT_VISIT, country_code="NP", metadata={"referral_source": "google"})
+        self._event(AnalyticsEvent.EVENT_VISIT, country_code="US", metadata={})
+
+        data = self._get(days=7)
+        sources = data["sources"]
+        self.assertEqual(sources["referrers"][0], {"referral_source": "google", "count": 2})
+        self.assertEqual(sources["countries"][0], {"country_code": "NP", "visitors": 2})
+        markers = data["traffic"]["publish_markers"]
+        self.assertEqual([m["title"] for m in markers], [story.title])
+        self.assertIsNotNone(markers[0]["bucket"])
+        # The 24h chart is hourly, so a publish date has nowhere to sit.
+        self.assertIsNone(self._get(days=1)["traffic"]["publish_markers"][0]["bucket"])
+
+    def test_catalog_totals(self):
+        story = self._story("Catalogued")
+        Chapter.objects.create(story=story, title="One", content="<p>x</p>", order=1)
+        catalog = self._get()["catalog"]
+        self.assertEqual(catalog["stories"], 1)
+        self.assertEqual(catalog["chapters"], 1)
+        self.assertEqual(catalog["users"], 3)
+
+
+class AdminOverviewNeedsAttentionTests(APITestCase):
+    def setUp(self):
+        cache.clear()
+        self.admin = User.objects.create_user(
+            email="attention-admin@example.com", username="attentionadmin",
+            password="test-password", is_superuser=True, is_staff=True, is_active=True,
+        )
+        self.client.force_authenticate(self.admin)
+        self.url = reverse("admin-overview")
+
+    def _items(self):
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, 200, response.data)
+        return {item["key"]: item for item in response.data["needs_attention"]}
+
+    def test_nothing_to_flag_returns_an_empty_list(self):
+        self.assertEqual(self._items(), {})
+
+    def test_zero_count_items_are_left_out(self):
+        Submission.objects.create(user=self.admin, title="Pending", about="a", content="<p>x</p>")
+        items = self._items()
+        self.assertEqual(list(items), ["submissions"])
+        self.assertEqual(items["submissions"]["count"], 1)
+        self.assertEqual(items["submissions"]["link"], "/admin/submissions")
+
+    def test_each_attention_item_is_counted_and_linked(self):
+        from apps.feedback.models import Feedback
+        from apps.story.models import BookFetchJob, EpubImportJob, StoryQueue
+
+        Feedback.objects.create(message="Something is broken")
+        Feedback.objects.create(message="Already handled", status=Feedback.STATUS_RESOLVED)
+
+        # Live, with a cover and audio: flags nothing by itself.
+        complete = Story.objects.create(
+            title="Complete", slug="complete", is_published=True, cover_image="https://example.com/c.jpg"
+        )
+        Audio.objects.create(story=complete, title="Track one", slug="track-one")
+        Audio.objects.create(story=complete, title="Track two", slug="track-two", order=2)
+        # Live, but no cover and no audio.
+        Story.objects.create(title="Bare", slug="bare", is_published=True)
+        # A summary and a retrospective that both failed: still one story.
+        Story.objects.create(
+            title="Failed AI", slug="failed-ai", is_published=False, cover_image="https://example.com/f.jpg",
+            summary_status=Story.GEN_STATUS_FAILED, retrospective_status=Story.GEN_STATUS_FAILED,
+        )
+        # Going live in 3 days counts; in 30 days doesn't.
+        Story.objects.create(
+            title="Scheduled", slug="scheduled", is_published=True,
+            publish_at=timezone.now() + timedelta(days=3), cover_image="https://example.com/s.jpg",
+        )
+        Story.objects.create(
+            title="Later", slug="later", is_published=True,
+            publish_at=timezone.now() + timedelta(days=30), cover_image="https://example.com/l.jpg",
+        )
+        EpubImportJob.objects.create(story=complete, status=EpubImportJob.STATUS_FAILED)
+        EpubImportJob.objects.create(story=complete, status=EpubImportJob.STATUS_COMPLETED)
+        BookFetchJob.objects.create(requested_count=5, status=BookFetchJob.STATUS_FAILED)
+        old_failure = BookFetchJob.objects.create(requested_count=5, status=BookFetchJob.STATUS_FAILED)
+        BookFetchJob.objects.filter(pk=old_failure.pk).update(created_at=timezone.now() - timedelta(days=90))
+        StoryQueue.objects.create(title="Waiting")
+        StoryQueue.objects.create(title="Done", is_added=True)
+
+        items = self._items()
+        self.assertEqual(
+            {key: item["count"] for key, item in items.items()},
+            {
+                "feedback": 1,
+                "failed_ai": 1,
+                "failed_epub_imports": 1,
+                "failed_book_fetches": 1,
+                "scheduled": 1,
+                "missing_cover": 1,
+                "missing_audio": 1,
+                "queue_backlog": 1,
+            },
+        )
+        self.assertNotIn("submissions", items)
+        self.assertEqual(items["feedback"]["link"], "/admin/feedback")
