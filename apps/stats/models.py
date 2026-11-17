@@ -614,3 +614,27 @@ class NepalikathaEvent(models.Model):
 
     class Meta:
         indexes = [models.Index(fields=["event_type", "created_at"], name="np_event_type_time_idx")]
+
+
+class BotFlagRun(models.Model):
+    """One run of the flag_suspected_bots command.
+
+    The Audience tab reports when flagging last ran, because bot rows only drop
+    out of the dashboard after it has. A table rather than the cache: cache is
+    per-worker and lost on every restart, and this has to survive both.
+    `applied` is False for dry runs, which are logged too (they are how you
+    see what a rule *would* do) but never count as "flagging has run".
+    """
+
+    ran_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    applied = models.BooleanField(default=False)
+    days = models.PositiveSmallIntegerField()
+    rules = models.CharField(max_length=64, blank=True)
+    flagged_events = models.PositiveIntegerField(default=0)
+    flagged_visitors = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        ordering = ["-ran_at"]
+
+    def __str__(self):
+        return f"{'applied' if self.applied else 'dry run'} {self.ran_at:%Y-%m-%d %H:%M}: {self.flagged_events} events"

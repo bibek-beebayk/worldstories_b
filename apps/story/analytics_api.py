@@ -4,10 +4,11 @@ import json
 import contextvars
 import statistics
 import zipfile
+from collections import Counter
 from datetime import datetime, time, timedelta
 from unittest.mock import patch
 
-from django.db.models import Avg, Count, Exists, Min, OuterRef, Q, Sum
+from django.db.models import Avg, Count, Exists, OuterRef, Q, Sum
 from django.db.models.functions import TruncDate, TruncHour, TruncMonth, TruncWeek
 from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
@@ -254,17 +255,41 @@ def _content_identity(user_id, visitor_id):
     return f"u:{user_id}" if user_id else f"v:{visitor_id}"
 
 
+def normalize_referral_source(raw):
+    """Differently-cased or padded spellings, and a missing key, are one source:
+    a visit with no referral_source and one with "direct" are the same thing."""
+    return str(raw or "").strip().lower() or "direct"
+
+
+def first_touch_sources(rows):
+    """{identity: source} — the first way each visitor arrived within the rows.
+
+    `rows` is (identity, created_at, raw referral_source). "internal" is in-app
+    navigation, not a way the visitor arrived, so it can never be the first
+    touch; a visitor whose only rows are internal has no source at all (their
+    landing happened outside the window) and is left out."""
+    sources = {}
+    for identity, _created_at, raw in sorted(rows, key=lambda row: row[1]):
+        source = normalize_referral_source(raw)
+        if source != "internal":
+            sources.setdefault(identity, source)
+    return sources
+
+
 def build_referral_sources(events):
-    """Normalize referral labels and merge equivalent grouped values."""
-    counts = {}
-    for row in (
-        events.values("metadata__referral_source")
-        .annotate(count=Count("id"))
-    ):
-        source = str(row["metadata__referral_source"] or "").strip().lower() or "direct"
-        if source == "internal":
-            continue
-        counts[source] = counts.get(source, 0) + row["count"]
+    """Unique visitors per referral source, by each visitor's first touch.
+
+    This used to count page-visit events, so one person browsing ten pages
+    after arriving from Facebook was ten "facebook" visits, and a source that
+    sent a few heavy readers outranked one that sent many one-page visitors.
+    `count` is unique visitors."""
+    sources = first_touch_sources(
+        (_content_identity(user_id, visitor_id), created_at, raw)
+        for user_id, visitor_id, created_at, raw in events.values_list(
+            "user_id", "visitor_id", "created_at", "metadata__referral_source"
+        )
+    )
+    counts = Counter(sources.values())
     return [
         {"referral_source": source, "count": count}
         for source, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))
@@ -1402,437 +1427,6 @@ def build_submissions_data(days):
     }
 
 
-# The zero state of one daily_activity row. Doubles as the fill value for days
-# with no events at all, so an empty day and a day whose events were all of one
-# kind are shaped identically.
-EMPTY_DAILY_ACTIVITY = {
-    "ad_impressions": 0,
-    "downloads": 0,
-    "completions": 0,
-    "reading_minutes": 0,
-    "listening_minutes": 0,
-    "watching_minutes": 0,
-    "read_along_minutes": 0,
-}
-
-
-def build_audience_data(days):
-    cutoff = get_cutoff(days)
-    events = audience_events(filter_since(AnalyticsEvent.objects.all(), cutoff))
-
-    daily_events = (
-        events.annotate(day=time_trunc("created_at", days))
-        .values("day", "event_type")
-        .annotate(count=Count("id"), duration_seconds=Sum("duration_seconds"))
-        .order_by("day")
-    )
-    daily = {}
-    for row in daily_events:
-        entry = daily.setdefault(
-            row["day"],
-            {"day": row["day"], **EMPTY_DAILY_ACTIVITY},
-        )
-        event_type = row["event_type"]
-        if event_type == AnalyticsEvent.EVENT_AD_IMPRESSION:
-            entry["ad_impressions"] = row["count"]
-        elif event_type == AnalyticsEvent.EVENT_DOWNLOAD:
-            entry["downloads"] = row["count"]
-        elif event_type == AnalyticsEvent.EVENT_COMPLETION:
-            entry["completions"] = row["count"]
-        elif event_type == AnalyticsEvent.EVENT_READING_SESSION:
-            entry["reading_minutes"] = round((row["duration_seconds"] or 0) / 60, 1)
-        elif event_type == AnalyticsEvent.EVENT_LISTENING_SESSION:
-            entry["listening_minutes"] = round((row["duration_seconds"] or 0) / 60, 1)
-        elif event_type == AnalyticsEvent.EVENT_WATCHING_SESSION:
-            entry["watching_minutes"] = round((row["duration_seconds"] or 0) / 60, 1)
-
-    # `daily_events` groups by event_type only, so the Read Along slice of
-    # listening_session needs its own pass. Each such day already has an entry
-    # (the same rows fed listening_minutes above); setdefault is just defensive.
-    for row in (
-        events.filter(
-            event_type=AnalyticsEvent.EVENT_LISTENING_SESSION,
-            metadata__format="read_along",
-        )
-        .annotate(day=time_trunc("created_at", days))
-        .values("day")
-        .annotate(duration_seconds=Sum("duration_seconds"))
-    ):
-        entry = daily.setdefault(
-            row["day"],
-            {"day": row["day"], **EMPTY_DAILY_ACTIVITY},
-        )
-        entry["read_along_minutes"] = round((row["duration_seconds"] or 0) / 60, 1)
-
-    visit_events = audience_events(AnalyticsEvent.objects.filter(event_type=AnalyticsEvent.EVENT_VISIT))
-    authenticated_first = {
-        f"u:{row['user_id']}": row["first_seen"]
-        for row in visit_events.filter(user_id__isnull=False)
-        .values("user_id")
-        .annotate(first_seen=Min("created_at"))
-    }
-    anonymous_first = {
-        f"v:{row['visitor_id']}": row["first_seen"]
-        for row in visit_events.filter(user_id__isnull=True)
-        .values("visitor_id")
-        .annotate(first_seen=Min("created_at"))
-    }
-    first_seen = {**anonymous_first, **authenticated_first}
-    visitor_days = {}
-    page_view_counts = {}
-    page_unique_visitors = {}
-    # Every visit timestamp per browser tab session — summing the gaps
-    # between consecutive page loads (capped, so a tab left open for
-    # hours doesn't register as one enormous "active" gap) approximates
-    # how long that visit actually browsed the site, distinct from
-    # reading_minutes/listening_minutes above, which only count time
-    # spent inside a reader/player specifically.
-    session_timestamps = {}
-    for user_id, visitor_id, session_id, created_at, metadata in events.filter(
-        event_type=AnalyticsEvent.EVENT_VISIT
-    ).values_list("user_id", "visitor_id", "session_id", "created_at", "metadata"):
-        identity = f"u:{user_id}" if user_id else f"v:{visitor_id}"
-        day = python_time_bucket(created_at, days)
-        visitor_days.setdefault(day, set()).add(identity)
-
-        path = (metadata or {}).get("path") or "unknown"
-        page_view_counts[path] = page_view_counts.get(path, 0) + 1
-        page_unique_visitors.setdefault(path, set()).add(identity)
-
-        if session_id:
-            session_timestamps.setdefault(session_id, []).append(created_at)
-
-    top_pages = sorted(
-        (
-            {"path": path, "views": count, "unique_visitors": len(page_unique_visitors[path])}
-            for path, count in page_view_counts.items()
-        ),
-        key=lambda row: row["views"],
-        reverse=True,
-    )[:20]
-    total_page_views = sum(page_view_counts.values())
-
-    # A gap over 30 minutes between page loads reads as the tab having
-    # been left open/idle rather than active browsing, so it's excluded
-    # from the sum rather than inflating the session's duration.
-    IDLE_GAP_SECONDS = 30 * 60
-    browsing_session_seconds = []
-    for timestamps in session_timestamps.values():
-        timestamps.sort()
-        active_seconds = sum(
-            min((b - a).total_seconds(), IDLE_GAP_SECONDS) for a, b in zip(timestamps, timestamps[1:])
-        )
-        if active_seconds > 0:
-            browsing_session_seconds.append(active_seconds)
-    # Median rather than mean — a handful of very long, mostly-idle
-    # sessions would otherwise dominate the average even after the
-    # per-gap cap above, since a session can still have many small
-    # active gaps that add up over a long visit.
-    median_browsing_session_minutes = (
-        round(statistics.median(browsing_session_seconds) / 60, 1) if browsing_session_seconds else 0
-    )
-
-    new_returning = []
-    all_visitors = set()
-    returning_visitors = set()
-    for day in sorted(visitor_days):
-        new_ids = set()
-        returning_ids = set()
-        for identity in visitor_days[day]:
-            all_visitors.add(identity)
-            first = first_seen.get(identity)
-            if first and python_time_bucket(first, days) < day:
-                returning_ids.add(identity)
-                returning_visitors.add(identity)
-            else:
-                new_ids.add(identity)
-        new_returning.append(
-            {"day": day, "new_visitors": len(new_ids), "returning_visitors": len(returning_ids)}
-        )
-
-    sessions = events.filter(
-        event_type__in=[
-            AnalyticsEvent.EVENT_READING_SESSION,
-            AnalyticsEvent.EVENT_LISTENING_SESSION,
-            AnalyticsEvent.EVENT_WATCHING_SESSION,
-        ]
-    )
-    reading_seconds = sessions.filter(
-        event_type=AnalyticsEvent.EVENT_READING_SESSION
-    ).aggregate(total=Sum("duration_seconds"))["total"] or 0
-    listening_seconds = sessions.filter(
-        event_type=AnalyticsEvent.EVENT_LISTENING_SESSION
-    ).aggregate(total=Sum("duration_seconds"))["total"] or 0
-    watching_seconds = sessions.filter(
-        event_type=AnalyticsEvent.EVENT_WATCHING_SESSION
-    ).aggregate(total=Sum("duration_seconds"))["total"] or 0
-    # Additive breakdowns, not carve-outs — reading_seconds above already
-    # sums every reading_session regardless of content (blog and quick
-    # read reads were never excluded from it), same as it already did for
-    # quick read (a Story) before blog tracking existed.
-    blog_reading_seconds = sessions.filter(
-        event_type=AnalyticsEvent.EVENT_READING_SESSION, blog_id__isnull=False
-    ).aggregate(total=Sum("duration_seconds"))["total"] or 0
-    quick_read_reading_seconds = sessions.filter(
-        event_type=AnalyticsEvent.EVENT_READING_SESSION, metadata__format="quick_read"
-    ).aggregate(total=Sum("duration_seconds"))["total"] or 0
-    # Read Along is a listening surface — its time is already inside
-    # listening_seconds; surfaced separately so it isn't merged into audiobook
-    # listening (or into text reading).
-    read_along_sessions_qs = sessions.filter(
-        event_type=AnalyticsEvent.EVENT_LISTENING_SESSION, metadata__format="read_along"
-    )
-    read_along_listening_seconds = read_along_sessions_qs.aggregate(
-        total=Sum("duration_seconds")
-    )["total"] or 0
-    total_session_count = sessions.count()
-
-    reader_days = {}
-    engaged_titles = set()
-    for user_id, visitor_id, story_id, created_at in sessions.values_list(
-        "user_id", "visitor_id", "story_id", "created_at"
-    ):
-        identity = f"u:{user_id}" if user_id else f"v:{visitor_id}"
-        reader_days.setdefault(identity, set()).add(timezone.localtime(created_at).date())
-        if story_id:
-            engaged_titles.add((identity, story_id))
-    returning_readers = sum(1 for active_days in reader_days.values() if len(active_days) > 1)
-
-    completed_titles = {
-        (f"u:{user_id}" if user_id else f"v:{visitor_id}", story_id)
-        for user_id, visitor_id, story_id in events.filter(
-            event_type=AnalyticsEvent.EVENT_COMPLETION,
-            story_id__isnull=False,
-        ).values_list("user_id", "visitor_id", "story_id")
-    }
-    completed_engagements = len(completed_titles & engaged_titles)
-
-    ad_placements = list(
-        events.filter(event_type=AnalyticsEvent.EVENT_AD_IMPRESSION)
-        .values("metadata__path", "metadata__size")
-        .annotate(count=Count("id"))
-        .order_by("-count")[:12]
-    )
-    download_types = list(
-        events.filter(event_type=AnalyticsEvent.EVENT_DOWNLOAD)
-        .values("metadata__content_type")
-        .annotate(count=Count("id"), bytes=Sum("value"))
-        .order_by("-count")
-    )
-    completion_types = list(
-        events.filter(event_type=AnalyticsEvent.EVENT_COMPLETION)
-        .values("metadata__content_type")
-        .annotate(count=Count("id"))
-        .order_by("-count")
-    )
-    # Only starts getting populated once AdSpace.tsx sends content_type
-    # in metadata — existing/historical rows show up with a null key,
-    # same "unattributed" handling as download_types/completion_types.
-    ad_impressions_by_content_type = list(
-        events.filter(event_type=AnalyticsEvent.EVENT_AD_IMPRESSION)
-        .values("metadata__content_type")
-        .annotate(count=Count("id"))
-        .order_by("-count")
-    )
-    # Grouped in SQL by the raw value, then merged here: a visit with the key
-    # missing/blank and one with "direct" are the same source, as are
-    # differently-cased or padded spellings. "internal" is in-app navigation,
-    # not a way the visitor arrived, so it is left out of this table.
-    referral_sources = build_referral_sources(
-        events.filter(event_type=AnalyticsEvent.EVENT_VISIT)
-    )
-    countries = list(
-        events.exclude(country_code="")
-        .values("country_code")
-        .annotate(visitors=Count("visitor_id", distinct=True))
-        .order_by("-visitors", "country_code")[:15]
-    )
-    ua_families = list(
-        events.exclude(ua_family="")
-        .values("ua_family")
-        .annotate(visitors=Count("visitor_id", distinct=True))
-        .order_by("-visitors", "ua_family")
-    )
-    suspected_bot_events = audience_only(
-        filter_since(AnalyticsEvent.objects.filter(is_suspected_bot=True), cutoff)
-    ).count()
-    top_downloads = list(
-        events.filter(event_type=AnalyticsEvent.EVENT_DOWNLOAD, story_id__isnull=False)
-        .values("story_id", "story__title", "story__slug")
-        .annotate(count=Count("id"), bytes=Sum("value"))
-        .order_by("-count", "story__title")[:10]
-    )
-    top_listened = list(
-        events.filter(event_type=AnalyticsEvent.EVENT_LISTENING_SESSION, story_id__isnull=False)
-        .values("story_id", "story__title", "story__slug")
-        .annotate(duration_seconds=Sum("duration_seconds"), sessions=Count("id"))
-        .order_by("-duration_seconds")[:10]
-    )
-    top_read_along = list(
-        events.filter(
-            event_type=AnalyticsEvent.EVENT_LISTENING_SESSION,
-            metadata__format="read_along",
-            story_id__isnull=False,
-        )
-        .values("story_id", "story__title", "story__slug")
-        .annotate(duration_seconds=Sum("duration_seconds"), sessions=Count("id"))
-        .order_by("-duration_seconds")[:10]
-    )
-    top_watched = list(
-        events.filter(event_type=AnalyticsEvent.EVENT_WATCHING_SESSION, video_id__isnull=False)
-        .values("video_id", "video__title", "video__story__title")
-        .annotate(duration_seconds=Sum("duration_seconds"), sessions=Count("id"))
-        .order_by("-duration_seconds")[:10]
-    )
-    top_blogs_read = list(
-        events.filter(event_type=AnalyticsEvent.EVENT_READING_SESSION, blog_id__isnull=False)
-        .values("blog_id", "blog__title", "blog__slug")
-        .annotate(duration_seconds=Sum("duration_seconds"), sessions=Count("id"))
-        .order_by("-duration_seconds")[:10]
-    )
-
-    impressions = events.filter(event_type=AnalyticsEvent.EVENT_AD_IMPRESSION).count()
-    downloads = events.filter(event_type=AnalyticsEvent.EVENT_DOWNLOAD)
-    completions = events.filter(event_type=AnalyticsEvent.EVENT_COMPLETION)
-    unique_downloaders = {
-        f"u:{user_id}" if user_id else f"v:{visitor_id}"
-        for user_id, visitor_id in downloads.values_list("user_id", "visitor_id")
-    }
-
-    return {
-        "range_days": days,
-        "time_interval": get_time_interval(days),
-        "summary": {
-            "visitors": len(all_visitors),
-            "returning_visitors": len(returning_visitors),
-            "returning_rate": round(len(returning_visitors) / len(all_visitors), 3)
-            if all_visitors
-            else 0,
-            "readers": len(reader_days),
-            "returning_readers": returning_readers,
-            "reader_retention_rate": round(returning_readers / len(reader_days), 3)
-            if reader_days
-            else 0,
-            "ad_impressions": impressions,
-            "downloads": downloads.count(),
-            "unique_downloaders": len(unique_downloaders),
-            "completions": completions.count(),
-            "completion_rate": round(completed_engagements / len(engaged_titles), 3)
-            if engaged_titles
-            else 0,
-            "reading_minutes": round(reading_seconds / 60, 1),
-            "listening_minutes": round(listening_seconds / 60, 1),
-            "watching_minutes": round(watching_seconds / 60, 1),
-            "blog_reading_minutes": round(blog_reading_seconds / 60, 1),
-            "quick_read_reading_minutes": round(quick_read_reading_seconds / 60, 1),
-            "read_along_listening_minutes": round(read_along_listening_seconds / 60, 1),
-            "read_along_sessions": read_along_sessions_qs.count(),
-            "avg_session_minutes": round(
-                (reading_seconds + listening_seconds + watching_seconds) / total_session_count / 60, 1
-            )
-            if total_session_count
-            else 0,
-            "total_page_views": total_page_views,
-            "median_browsing_session_minutes": median_browsing_session_minutes,
-            "suspected_bot_events": suspected_bot_events,
-        },
-        "daily_activity": fill_time_buckets(
-            list(daily.values()), days, defaults=EMPTY_DAILY_ACTIVITY
-        ),
-        "visitor_retention": fill_time_buckets(
-            new_returning, days, defaults={"new_visitors": 0, "returning_visitors": 0}
-        ),
-        "ad_placements": [
-            {
-                "path": row["metadata__path"] or "unknown",
-                "size": row["metadata__size"] or "unknown",
-                "count": row["count"],
-            }
-            for row in ad_placements
-        ],
-        "download_types": [
-            {
-                "content_type": row["metadata__content_type"] or "unknown",
-                "count": row["count"],
-                "bytes": round(row["bytes"] or 0),
-            }
-            for row in download_types
-        ],
-        "completion_types": [
-            {
-                "content_type": row["metadata__content_type"] or "unknown",
-                "count": row["count"],
-            }
-            for row in completion_types
-        ],
-        "ad_impressions_by_content_type": [
-            {
-                "content_type": row["metadata__content_type"] or "unknown",
-                "count": row["count"],
-            }
-            for row in ad_impressions_by_content_type
-        ],
-        "referral_sources": referral_sources,
-        "countries": [
-            {"country_code": row["country_code"], "visitors": row["visitors"]} for row in countries
-        ],
-        "ua_families": [
-            {"ua_family": row["ua_family"], "visitors": row["visitors"]} for row in ua_families
-        ],
-        "top_downloads": [
-            {
-                "story_id": row["story_id"],
-                "title": row["story__title"],
-                "slug": row["story__slug"],
-                "count": row["count"],
-                "bytes": round(row["bytes"] or 0),
-            }
-            for row in top_downloads
-        ],
-        "top_listened": [
-            {
-                "story_id": row["story_id"],
-                "title": row["story__title"],
-                "slug": row["story__slug"],
-                "sessions": row["sessions"],
-                "minutes": round((row["duration_seconds"] or 0) / 60, 1),
-            }
-            for row in top_listened
-        ],
-        "top_read_along": [
-            {
-                "story_id": row["story_id"],
-                "title": row["story__title"],
-                "slug": row["story__slug"],
-                "sessions": row["sessions"],
-                "minutes": round((row["duration_seconds"] or 0) / 60, 1),
-            }
-            for row in top_read_along
-        ],
-        "top_watched": [
-            {
-                "video_id": row["video_id"],
-                "title": row["video__title"],
-                "story_title": row["video__story__title"],
-                "sessions": row["sessions"],
-                "minutes": round((row["duration_seconds"] or 0) / 60, 1),
-            }
-            for row in top_watched
-        ],
-        "top_blogs_read": [
-            {
-                "blog_id": row["blog_id"],
-                "title": row["blog__title"],
-                "slug": row["blog__slug"],
-                "sessions": row["sessions"],
-                "minutes": round((row["duration_seconds"] or 0) / 60, 1),
-            }
-            for row in top_blogs_read
-        ],
-        "top_pages": top_pages,
-    }
-
-
 class AdminAnalyticsContentAPIView(APIView):
     permission_classes = [IsSuperUser]
 
@@ -1913,12 +1507,10 @@ class AdminAnalyticsSubmissionsAPIView(APIView):
         return Response(build_with_previous_period(build_submissions_data, get_range_days(request)))
 
 
-class AdminAnalyticsAudienceAPIView(APIView):
-    permission_classes = [IsSuperUser]
+def _audience_export(days):
+    from .audience_api import build_audience_export_data
 
-    @method_decorator(cache_page(CACHE_SECONDS))
-    def get(self, request):
-        return Response(build_with_previous_period(build_audience_data, get_range_days(request)))
+    return build_audience_export_data(days)
 
 
 def _engagement_export(days):
@@ -1931,7 +1523,7 @@ def _engagement_export(days):
 EXPORT_SECTION_BUILDERS = {
     "content": build_content_export_data,
     "engagement": lambda days: _engagement_export(days),
-    "audience": build_audience_data,
+    "audience": lambda days: _audience_export(days),
     "users": build_users_data,
     "geography": build_geography_data,
     "submissions": build_submissions_data,
@@ -1974,21 +1566,12 @@ SECTION_TABLE_KEYS = {
     "submissions": {"submissions_over_time", "funnel", "by_story_type", "by_genre"},
     "engagement_metrics": {"funnel"},
     "audience": {
-        "daily_activity",
-        "visitor_retention",
-        "ad_placements",
-        "download_types",
-        "completion_types",
-        "ad_impressions_by_content_type",
-        "referral_sources",
+        "visitors_over_time",
+        "acquisition",
+        "landing_pages",
+        "devices",
         "countries",
-        "ua_families",
-        "top_downloads",
-        "top_listened",
-        "top_read_along",
-        "top_watched",
-        "top_blogs_read",
-        "top_pages",
+        "format_split",
     },
 }
 

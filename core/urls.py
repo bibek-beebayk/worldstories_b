@@ -14,6 +14,7 @@ from apps.story import api as story_api
 from apps.story import analytics_api as story_analytics_api
 from apps.story import overview_api
 from apps.story import engagement_api
+from apps.story import audience_api
 from apps.stats import views as stats_views
 from apps.stats import nepalikatha as nepalikatha_api
 from apps.users import api as users_api
@@ -359,8 +360,13 @@ urlpatterns = [
         name="admin-analytics-submissions",
     ),
     path(
+        "api/admin/analytics/monetization/",
+        audience_api.AdminAnalyticsMonetizationAPIView.as_view(),
+        name="admin-analytics-monetization",
+    ),
+    path(
         "api/admin/analytics/audience/",
-        story_analytics_api.AdminAnalyticsAudienceAPIView.as_view(),
+        audience_api.AdminAnalyticsAudienceAPIView.as_view(),
         name="admin-analytics-audience",
     ),
     path(

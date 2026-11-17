@@ -5,7 +5,7 @@ from django.utils import timezone
 from rest_framework.test import APITestCase, APIClient
 from apps.stats.models import NepalikathaEvent, AnalyticsEvent, ReadingProgress, StoryCompletion
 from apps.story.models import Story, Chapter, StoryView, StoryType
-from apps.story.analytics_api import build_audience_data
+from apps.story.audience_api import build_audience_data
 from apps.story.engagement_api import build_engagement_data
 from apps.users.models import User
 

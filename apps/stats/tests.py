@@ -2,6 +2,7 @@ from datetime import date, timedelta
 from uuid import uuid4
 
 from django.core.cache import cache
+from django.core.management.base import CommandError
 from django.test import SimpleTestCase
 from django.urls import reverse
 from django.utils import timezone
@@ -24,6 +25,7 @@ from apps.story.models import (
     Submission,
     Video,
 )
+from apps.pages.models import Page
 from apps.users.models import User
 
 from .completion import COMPLETION_THRESHOLD
@@ -31,6 +33,7 @@ from .models import (
     Achievement,
     AnalyticsEvent,
     AudioReadingProgress,
+    BotFlagRun,
     ChapterReadingProgress,
     FileReadingProgress,
     QuickReadProgress,
@@ -596,44 +599,39 @@ class AdminAudienceAnalyticsApiTests(APITestCase):
             metadata={"path": "/blog/analytics-post", "size": "banner", "content_type": "blog"},
         )
 
-    def test_superuser_receives_aggregated_audience_analytics(self):
+    def test_superuser_receives_the_audience_payload(self):
         self.client.force_authenticate(self.admin)
 
         response = self.client.get(reverse("admin-analytics-audience"), {"days": 30})
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.data["summary"]["visitors"], 1)
-        self.assertEqual(response.data["summary"]["returning_visitors"], 1)
-        # 2 ad_impression events now: the original story-page one, plus the
-        # blog one added for this test class's blog/quick-read coverage.
-        self.assertEqual(response.data["summary"]["ad_impressions"], 2)
-        self.assertEqual(response.data["summary"]["downloads"], 1)
-        self.assertEqual(response.data["summary"]["completions"], 1)
-        self.assertEqual(response.data["summary"]["readers"], 1)
-        self.assertEqual(response.data["summary"]["returning_readers"], 1)
-        self.assertEqual(response.data["summary"]["reader_retention_rate"], 1)
-        # completed_titles (only self.story) intersected with engaged_titles
-        # (self.story + self.quick_read_story, now that a reading_session on
-        # a second story exists) — 1/2, not 1/1 as before this class also
-        # covered quick-read reading sessions.
-        self.assertEqual(response.data["summary"]["completion_rate"], 0.5)
-        # 120 + 60 (original chapter reads) + 90 (blog) + 45 (quick read) = 315s = 5.25min
-        self.assertEqual(response.data["summary"]["reading_minutes"], 5.2)
-        self.assertEqual(response.data["summary"]["listening_minutes"], 3)
-        self.assertEqual(response.data["summary"]["blog_reading_minutes"], 1.5)
-        self.assertEqual(response.data["summary"]["quick_read_reading_minutes"], 0.8)
-        self.assertEqual(response.data["top_downloads"][0]["slug"], self.story.slug)
-        self.assertEqual(response.data["top_blogs_read"][0]["slug"], self.blog.slug)
-        self.assertEqual(response.data["top_blogs_read"][0]["minutes"], 1.5)
-        content_types = {row["content_type"]: row["count"] for row in response.data["ad_impressions_by_content_type"]}
-        self.assertEqual(content_types.get("blog"), 1)
-        self.assertEqual(content_types.get("unknown"), 1)
-        referral_sources = {row["referral_source"]: row["count"] for row in response.data["referral_sources"]}
-        self.assertEqual(referral_sources.get("facebook"), 1)
-        self.assertEqual(referral_sources.get("twitter"), 1)
-        self.assertEqual(referral_sources.get("direct"), 1)
+        data = response.data
+        self.assertEqual(
+            set(data),
+            {
+                "range_days", "time_interval", "min_sample", "traffic_quality", "kpis", "visitors_over_time",
+                "acquisition", "landing_pages", "slug_warnings", "behaviour",
+            },
+        )
+        # The old payload's ads, downloads, top lists and raw top pages are gone.
+        for removed in ("summary", "daily_activity", "ad_placements", "top_downloads", "top_pages", "top_blogs_read"):
+            self.assertNotIn(removed, data)
+        self.assertEqual(data["kpis"]["unique_visitors"]["value"], 1)
+        # One visitor is too few for a rate to mean anything.
+        self.assertEqual(data["kpis"]["returning_rate"]["sample_size"], 1)
+        self.assertIsNone(data["kpis"]["returning_rate"]["value"])
+        # The visitor arrived three times with three different sources; first touch wins.
+        self.assertEqual(
+            [(row["source"], row["unique_visitors"]) for row in data["acquisition"]], [("facebook", 1)]
+        )
+        formats = {row["format"]: row for row in data["behaviour"]["format_split"]}
+        self.assertEqual(formats["read"]["minutes"], 3.0)  # 120 + 60
+        self.assertEqual(formats["listen"]["minutes"], 3.0)
+        self.assertEqual(formats["blog"]["minutes"], 1.5)
+        self.assertEqual(formats["quick_read"]["minutes"], 0.8)
+        self.assertTrue(all(row["unique_people"] == 1 for row in formats.values() if row["format"] != "watch"))
 
-    def test_watching_sessions_feed_watch_metrics(self):
+    def test_watching_sessions_feed_the_watch_format(self):
         AnalyticsEvent.objects.create(
             event_type=AnalyticsEvent.EVENT_WATCHING_SESSION,
             visitor_id="returning-browser",
@@ -645,17 +643,10 @@ class AdminAudienceAnalyticsApiTests(APITestCase):
 
         response = self.client.get(reverse("admin-analytics-audience"), {"days": 30})
 
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.data["summary"]["watching_minutes"], 4)
-        self.assertEqual(response.data["top_watched"][0]["slug"], self.story.slug)
-        self.assertEqual(response.data["top_watched"][0]["minutes"], 4)
-        self.assertTrue(
-            any(day["watching_minutes"] for day in response.data["daily_activity"])
-        )
+        watch = next(row for row in response.data["behaviour"]["format_split"] if row["format"] == "watch")
+        self.assertEqual((watch["unique_people"], watch["minutes"]), (1, 4.0))
 
-    def test_read_along_listening_is_split_out_without_carve_out(self):
-        # The setUp listening_session (180s, no format) is plain audiobook.
-        # Add a read-along one on the same story.
+    def test_read_along_is_listening_time_and_its_completions_are_counted_apart(self):
         AnalyticsEvent.objects.create(
             event_type=AnalyticsEvent.EVENT_LISTENING_SESSION,
             visitor_id="returning-browser",
@@ -663,52 +654,26 @@ class AdminAudienceAnalyticsApiTests(APITestCase):
             duration_seconds=120,
             metadata={"format": "read_along"},
         )
-        AnalyticsEvent.objects.create(
-            event_type=AnalyticsEvent.EVENT_COMPLETION,
-            visitor_id="returning-browser",
-            story=self.story,
-            metadata={"content_type": "read_along"},
-        )
+        for content_type in ("read_along", "chapter", "story"):
+            AnalyticsEvent.objects.create(
+                event_type=AnalyticsEvent.EVENT_COMPLETION,
+                visitor_id="returning-browser",
+                story=self.story,
+                metadata={"content_type": content_type, "item_slug": content_type},
+            )
         cache.clear()
         self.client.force_authenticate(self.admin)
 
-        response = self.client.get(reverse("admin-analytics-audience"), {"days": 30})
+        data = self.client.get(reverse("admin-analytics-audience"), {"days": 30}).data
 
-        self.assertEqual(response.status_code, 200)
-        summary = response.data["summary"]
-        # 180 + 120 = 300s = 5.0min total listening; 2.0 of it is read-along.
-        self.assertEqual(summary["listening_minutes"], 5)
-        self.assertEqual(summary["read_along_listening_minutes"], 2)
-        self.assertEqual(summary["read_along_sessions"], 1)
-
-        # Additive, not a carve-out: the read-along minutes are also inside the
-        # same day's listening_minutes, and read_along_minutes is on every row.
-        today_rows = [
-            day for day in response.data["daily_activity"] if day["read_along_minutes"]
-        ]
-        self.assertEqual(len(today_rows), 1)
-        self.assertEqual(today_rows[0]["read_along_minutes"], 2)
-        self.assertGreaterEqual(today_rows[0]["listening_minutes"], 2)
-        self.assertTrue(
-            all("read_along_minutes" in day for day in response.data["daily_activity"])
+        listen = next(row for row in data["behaviour"]["format_split"] if row["format"] == "listen")
+        self.assertEqual(listen["minutes"], 5.0)  # 180 audiobook + 120 read-along
+        completions = data["behaviour"]["completions"]
+        # The setUp epub completion is neither a chapter, a story nor read-along.
+        self.assertEqual(
+            (completions["stories"], completions["chapters"], completions["read_along"], completions["other"]),
+            (1, 1, 1, 1),
         )
-
-        self.assertEqual(response.data["top_read_along"][0]["slug"], self.story.slug)
-        self.assertEqual(response.data["top_read_along"][0]["minutes"], 2)
-
-        completion_types = {
-            row["content_type"]: row["count"] for row in response.data["completion_types"]
-        }
-        self.assertEqual(completion_types.get("read_along"), 1)
-
-    def test_top_read_along_is_empty_without_read_along_sessions(self):
-        cache.clear()
-        self.client.force_authenticate(self.admin)
-
-        response = self.client.get(reverse("admin-analytics-audience"), {"days": 30})
-
-        self.assertEqual(response.data["summary"]["read_along_listening_minutes"], 0)
-        self.assertEqual(response.data["top_read_along"], [])
 
     def test_story_detail_audio_block_splits_read_along_listening(self):
         Audio.objects.create(
@@ -1174,24 +1139,14 @@ class TimeSeriesBucketFillTests(APITestCase):
 
         response = self.client.get(reverse("admin-analytics-audience"), {"days": 7})
 
-        activity = response.data["daily_activity"]
-        self.assertEqual(len(activity), 8)
-        for row in activity:
-            self.assertEqual(
-                set(row) - {"day"},
-                {
-                    "ad_impressions",
-                    "downloads",
-                    "completions",
-                    "reading_minutes",
-                    "listening_minutes",
-                    "watching_minutes",
-                    "read_along_minutes",
-                },
-            )
-        retention = response.data["visitor_retention"]
-        self.assertEqual(len(retention), 8)
-        self.assertEqual(sum(row["new_visitors"] for row in retention), 1)
+        chart = response.data["visitors_over_time"]
+        for series in (chart["series"], chart["previous_series"]):
+            self.assertEqual(len(series), 8)
+            for row in series:
+                self.assertEqual(set(row) - {"day"}, {"new_visitors", "returning_visitors"})
+        self.assertEqual(sum(row["new_visitors"] for row in chart["series"]), 1)
+        self.assertEqual(sum(row["returning_visitors"] for row in chart["series"]), 0)
+        self.assertEqual(sum(row["new_visitors"] for row in chart["previous_series"]), 0)
 
     def test_submissions_series_emits_every_day_for_every_status_in_range(self):
         """Two-dimensional series: the dashboard pivots these rows into one line
@@ -2536,27 +2491,23 @@ class AudienceDashboardBotShareTests(APITestCase):
 
         data = self._audience()
 
-        self.assertEqual(data["summary"]["visitors"], 1)
-        self.assertEqual(data["summary"]["total_page_views"], 1)
-        self.assertEqual(data["summary"]["suspected_bot_events"], 2)
-        self.assertEqual(data["countries"], [{"country_code": "NP", "visitors": 1}])
-        self.assertEqual(data["ua_families"], [{"ua_family": "chrome_mobile", "visitors": 1}])
+        self.assertEqual(data["kpis"]["unique_visitors"]["value"], 1)
+        quality = data["traffic_quality"]
+        self.assertEqual((quality["flagged_visit_events"], quality["visit_events"]), (2, 3))
+        self.assertEqual(quality["bot_share"], round(2 / 3, 4))
+        self.assertEqual(data["behaviour"]["devices"], [{"ua_family": "chrome_mobile", "visitors": 1}])
 
-    def test_countries_and_ua_families_count_distinct_visitors_and_skip_blanks(self):
-        self._visit("v1", country_code="NP", ua_family="chrome_mobile")
-        self._visit("v1", country_code="NP", ua_family="chrome_mobile")
-        self._visit("v2", country_code="NP", ua_family="safari_mobile")
-        self._visit("v3", country_code="IN", ua_family="chrome_mobile")
+    def test_devices_count_distinct_visitors_and_skip_blanks(self):
+        self._visit("v1", ua_family="chrome_mobile")
+        self._visit("v1", ua_family="chrome_mobile")
+        self._visit("v2", ua_family="safari_mobile")
+        self._visit("v3", ua_family="chrome_mobile")
         self._visit("v4")
 
         data = self._audience()
 
         self.assertEqual(
-            data["countries"],
-            [{"country_code": "NP", "visitors": 2}, {"country_code": "IN", "visitors": 1}],
-        )
-        self.assertEqual(
-            data["ua_families"],
+            data["behaviour"]["devices"],
             [{"ua_family": "chrome_mobile", "visitors": 2}, {"ua_family": "safari_mobile", "visitors": 1}],
         )
 
@@ -2571,11 +2522,11 @@ class AudienceDashboardBotShareTests(APITestCase):
 
         data = self._audience()
 
-        sources = {row["referral_source"]: row["count"] for row in data["referral_sources"]}
+        sources = {row["source"]: row["unique_visitors"] for row in data["acquisition"]}
         self.assertEqual(sources, {"direct": 4, "facebook": 2})
-        self.assertEqual(data["referral_sources"][0]["referral_source"], "direct")
+        self.assertEqual(data["acquisition"][0]["source"], "direct")
 
-    def test_export_includes_country_and_ua_family_tables(self):
+    def test_export_includes_country_and_device_tables(self):
         self._visit("human", country_code="NP", ua_family="chrome_mobile")
         cache.clear()
 
@@ -2587,7 +2538,7 @@ class AudienceDashboardBotShareTests(APITestCase):
         self.assertEqual(response.status_code, 200)
         names = zipfile.ZipFile(io.BytesIO(response.content)).namelist()
         self.assertIn("audience_countries.csv", names)
-        self.assertIn("audience_ua_families.csv", names)
+        self.assertIn("audience_devices.csv", names)
         self.assertIn("audience_summary.csv", names)
 
 
@@ -3714,3 +3665,395 @@ class AdminEngagementTabTests(APITestCase):
                 reverse("admin-analytics-export"), {"sections": "engagement", "file_format": file_format, "days": 7}
             )
             self.assertEqual(response.status_code, 200, file_format)
+
+
+class AdminAudienceTabTests(APITestCase):
+    def setUp(self):
+        cache.clear()
+        self.admin = User.objects.create_user(
+            email="aud-admin@example.com", username="audadmin",
+            password="test-password", is_superuser=True, is_staff=True, is_active=True,
+        )
+        self.staff = User.objects.create_user(
+            email="aud-staff@example.com", username="audstaff",
+            password="test-password", is_staff=True, is_active=True,
+        )
+        self.client.force_authenticate(self.admin)
+        self.url = reverse("admin-analytics-audience")
+
+    def _event(self, event_type, visitor_id, *, days_ago=0, **kwargs):
+        event = AnalyticsEvent.objects.create(event_type=event_type, visitor_id=visitor_id, **kwargs)
+        if days_ago:
+            AnalyticsEvent.objects.filter(pk=event.pk).update(created_at=timezone.now() - timedelta(days=days_ago))
+        return event
+
+    def _visit(self, visitor_id, *, path="/", source=None, session="s", **kwargs):
+        metadata = {"path": path}
+        if source is not None:
+            metadata["referral_source"] = source
+        return self._event(
+            AnalyticsEvent.EVENT_VISIT, visitor_id, session_id=f"{visitor_id}-{session}", metadata=metadata, **kwargs
+        )
+
+    def _story(self, title, slug=None, **kwargs):
+        return Story.objects.create(
+            title=title, slug=slug or title.lower().replace(" ", "-"), is_published=True, **kwargs
+        )
+
+    def _get(self, **params):
+        response = self.client.get(self.url, params)
+        self.assertEqual(response.status_code, 200, response.data)
+        return response.data
+
+    # --- referrals ------------------------------------------------------------------
+
+    def test_referral_sources_count_unique_visitors_by_first_touch(self):
+        # One person arriving from Google and then browsing ten more pages is one
+        # Google visitor, not eleven Google visits.
+        for index in range(11):
+            self._visit("heavy", path=f"/page-{index}", source="google", session="a")
+        self._visit("light", source="facebook")
+        self._visit("switcher", source="facebook", days_ago=2)
+        self._visit("switcher", source="twitter")
+
+        data = self._get(days=7)
+        self.assertEqual(
+            [(row["source"], row["unique_visitors"]) for row in data["acquisition"]],
+            [("facebook", 2), ("google", 1)],
+        )
+
+    # --- exclusions ------------------------------------------------------------------
+
+    def test_staff_and_suspected_bots_are_excluded(self):
+        self._visit("human", source="google")
+        self._visit("bot", source="direct", is_suspected_bot=True)
+        self._visit("staff-browser", user=self.staff)
+        self._visit("admin-browser", user=self.admin)
+        self._event(AnalyticsEvent.EVENT_READING_SESSION, "bot", is_suspected_bot=True, duration_seconds=900)
+
+        data = self._get(days=7)
+        self.assertEqual(data["kpis"]["unique_visitors"]["value"], 1)
+        self.assertEqual([row["source"] for row in data["acquisition"]], ["google"])
+        self.assertEqual(sum(row["minutes"] for row in data["behaviour"]["format_split"]), 0)
+        quality = data["traffic_quality"]
+        # Staff are not traffic at all; flagged bots are traffic that was filtered out.
+        self.assertEqual((quality["flagged_visit_events"], quality["visit_events"]), (1, 2))
+        self.assertEqual(quality["bot_share"], 0.5)
+
+    # --- minutes ---------------------------------------------------------------------
+
+    def test_session_minutes_are_capped(self):
+        story = self._story("Idle Tab")
+        for index in range(5):
+            visitor = f"idle-{index}"
+            self._visit(visitor)
+            self._event(AnalyticsEvent.EVENT_READING_SESSION, visitor, story=story, duration_seconds=20 * 3600)
+
+        data = self._get(days=7)
+        read = next(row for row in data["behaviour"]["format_split"] if row["format"] == "read")
+        # 5 readers, each capped at the 60 minutes allowed when a story's length is unknown.
+        self.assertEqual((read["unique_people"], read["minutes"]), (5, 300.0))
+        self.assertEqual(data["kpis"]["median_engaged_minutes"]["value"], 60.0)
+
+    # --- engaged visitors --------------------------------------------------------------
+
+    def test_engaged_visitor_definition(self):
+        story = self._story("Engaging")
+        self._visit("bounce")  # one page, nothing else
+        self._visit("two-pages", path="/a", session="x")
+        self._visit("two-pages", path="/b", session="x")
+        self._visit("started")
+        self._event(AnalyticsEvent.EVENT_STORY_STARTED, "started", story=story, session_id="started-s", metadata={"format": "chapter"})
+        self._visit("listener")
+        self._event(AnalyticsEvent.EVENT_LISTENING_SESSION, "listener", story=story, duration_seconds=5)
+        self._visit("two-visits-two-sessions", session="one")
+        self._visit("two-visits-two-sessions", session="two", days_ago=0)
+
+        kpis = self._get(days=7)["kpis"]
+        self.assertEqual(kpis["unique_visitors"]["value"], 5)
+        self.assertEqual(kpis["engaged_visitors"]["value"], 3)  # two-pages, started, listener
+        self.assertEqual(kpis["engaged_rate"]["value"], 0.6)
+
+    def test_rates_are_null_below_the_minimum_sample(self):
+        for index in range(4):
+            self._visit(f"few-{index}")
+        kpis = self._get(days=7)["kpis"]
+        self.assertEqual(kpis["unique_visitors"]["value"], 4)
+        for key in ("engaged_rate", "returning_rate", "signed_in_share"):
+            self.assertIsNone(kpis[key]["value"], key)
+            self.assertEqual(kpis[key]["sample_size"], 4)
+
+    def test_returning_and_signed_in_share(self):
+        user = User.objects.create_user(email="signed@example.com", username="signed", password="x")
+        for index in range(3):
+            self._visit(f"new-{index}")
+        self._visit("old-1", days_ago=20)  # seen before this 7-day window
+        self._visit("old-1")
+        self._visit("signed-visitor", user=user)
+
+        kpis = self._get(days=7)["kpis"]
+        self.assertEqual(kpis["unique_visitors"]["value"], 5)
+        self.assertEqual(kpis["returning_rate"]["value"], 0.2)
+        self.assertEqual(kpis["signed_in_share"]["value"], 0.2)
+
+    # --- landing pages ----------------------------------------------------------------------
+
+    def test_landing_pages_resolve_slugs_and_measure_bounce_and_starts(self):
+        story = self._story("My Tale")
+        Blog.objects.create(title="A Post", slug="a-post", content="<p>x</p>")
+        page = Page.objects.create(title="About Us", slug="about-us", status=Page.STATUS_PUBLISHED)
+        for index, path in enumerate(
+            ["/story/my-tale", "/read/my-tale/chapter-1", "/listen/my-tale", "/watch/my-tale", "/blog/a-post",
+             "/pages/about-us", "/", "/library", "/mystery-route", "/story/does-not-exist"]
+        ):
+            self._visit(f"lander-{index}", path=path)
+        # Two sessions land on /story/my-tale: one bounces, one starts reading.
+        self._visit("starter", path="/story/my-tale")
+        self._event(AnalyticsEvent.EVENT_STORY_STARTED, "starter", story=story, session_id="starter-s", metadata={"format": "chapter"})
+
+        pages = {row["path"]: row for row in self._get(days=7)["landing_pages"]}
+        self.assertEqual((pages["/story/my-tale"]["type"], pages["/story/my-tale"]["title"]), ("story", "My Tale"))
+        self.assertEqual(pages["/story/my-tale"]["admin_link"], f"/admin/content?storyId={story.id}")
+        self.assertEqual(pages["/read/my-tale/chapter-1"]["type"], "read")
+        self.assertEqual(pages["/listen/my-tale"]["type"], "listen")
+        self.assertEqual(pages["/watch/my-tale"]["type"], "watch")
+        self.assertEqual((pages["/blog/a-post"]["type"], pages["/blog/a-post"]["title"]), ("blog", "A Post"))
+        self.assertEqual((pages["/pages/about-us"]["type"], pages["/pages/about-us"]["title"]), ("page", page.title))
+        self.assertEqual((pages["/"]["type"], pages["/library"]["type"]), ("home", "library"))
+        # Unresolvable paths keep the raw path.
+        for raw in ("/mystery-route", "/story/does-not-exist"):
+            self.assertEqual((pages[raw]["type"], pages[raw]["title"], pages[raw]["resolved"]), ("other", raw, False))
+        tale = pages["/story/my-tale"]
+        self.assertEqual((tale["unique_visitors"], tale["sessions"]), (2, 2))
+        self.assertEqual((tale["bounce_rate"], tale["started_rate"]), (0.5, 0.5))
+
+    def test_placeholder_slugs_are_reported(self):
+        self._story("Untitled Import", slug="story-12")
+        self._story("Named Properly", slug="named-properly")
+        Story.objects.create(title="Draft", slug="story-99", is_published=False)
+
+        warnings = self._get(days=7)["slug_warnings"]
+        self.assertEqual(warnings["total"], 1)
+        self.assertEqual([row["slug"] for row in warnings["stories"]], ["story-12"])
+        self.assertTrue(warnings["stories"][0]["admin_link"].startswith("/admin/content?storyId="))
+
+    # --- completions ------------------------------------------------------------------------
+
+    def test_chapter_and_story_completions_are_separate_and_the_rate_is_stories_only(self):
+        story = self._story("Completions")
+        for index in range(6):
+            visitor = f"reader-{index}"
+            self._visit(visitor)
+            self._event(AnalyticsEvent.EVENT_STORY_STARTED, visitor, story=story, metadata={"format": "chapter"})
+        for chapter in ("one", "two", "three"):
+            self._event(
+                AnalyticsEvent.EVENT_COMPLETION, "reader-0", story=story,
+                metadata={"content_type": "chapter", "item_slug": chapter},
+            )
+        self._event(AnalyticsEvent.EVENT_COMPLETION, "reader-0", story=story, metadata={"content_type": "story", "item_slug": "x"})
+        # The same finish also recorded by the server for a signed-in reader isn't a second story.
+        user = User.objects.create_user(email="done@example.com", username="done", password="x")
+        self._event(AnalyticsEvent.EVENT_STORY_STARTED, f"u{user.pk}", user=user, story=story, metadata={"format": "chapter"})
+        self._event(AnalyticsEvent.EVENT_STORY_COMPLETED, "server", user=user, story=story, metadata={"source": "chapters"})
+        self._event(AnalyticsEvent.EVENT_COMPLETION, f"u{user.pk}", user=user, story=story, metadata={"content_type": "story", "item_slug": "x"})
+
+        completions = self._get(days=7)["behaviour"]["completions"]
+        self.assertEqual(completions["chapters"], 3)
+        self.assertEqual(completions["stories"], 2)  # reader-0 and the signed-in user, once each
+        self.assertEqual(completions["story_starters"], 7)
+        self.assertEqual(completions["story_completion_rate"], round(2 / 7, 4))
+
+    # --- previous period ----------------------------------------------------------------------
+
+    def test_kpis_visitors_chart_and_sources_carry_previous_period_values(self):
+        for index in range(6):
+            self._visit(f"now-{index}", source="google")
+        for index in range(3):
+            self._visit(f"then-{index}", source="google", days_ago=10)
+        self._visit("then-fb", source="facebook", days_ago=10)
+
+        data = self._get(days=7)
+        visitors = data["kpis"]["unique_visitors"]
+        self.assertEqual((visitors["value"], visitors["previous_value"]), (6, 4))
+        chart = data["visitors_over_time"]
+        self.assertEqual(len(chart["previous_series"]), 8)
+        self.assertEqual(sum(row["new_visitors"] + row["returning_visitors"] for row in chart["previous_series"]), 4)
+        google = next(row for row in data["acquisition"] if row["source"] == "google")
+        self.assertEqual((google["unique_visitors"], google["previous_unique_visitors"]), (6, 3))
+        self.assertIsNone(self._get(days="all")["kpis"]["unique_visitors"]["previous_value"])
+
+    def test_previous_value_is_zero_when_nothing_came_before(self):
+        self._visit("only-now")
+        visitors = self._get(days=7)["kpis"]["unique_visitors"]
+        self.assertEqual((visitors["value"], visitors["previous_value"]), (1, 0))
+
+    def test_visitors_over_time_splits_new_from_returning(self):
+        self._visit("regular", days_ago=3)
+        self._visit("regular")
+        self._visit("newcomer")
+        self._visit("veteran", days_ago=30)
+        self._visit("veteran")
+
+        series = self._get(days=7)["visitors_over_time"]["series"]
+        self.assertEqual(sum(row["new_visitors"] for row in series), 2)  # regular's first day, newcomer
+        self.assertEqual(sum(row["returning_visitors"] for row in series), 2)  # regular again, veteran
+
+    # --- traffic quality ---------------------------------------------------------------------------
+
+    def test_traffic_quality_reports_coverage_and_when_flagging_last_ran(self):
+        for source in ("google", "google", "facebook", "direct"):
+            self._visit(f"q-{uuid4().hex[:6]}", source=source)
+        self.assertIsNone(self._get(days=7)["traffic_quality"]["last_bot_flag_run"])
+
+        BotFlagRun.objects.create(applied=False, days=30, flagged_events=999)  # a dry run isn't a run
+        cache.clear()
+        self.assertIsNone(self._get(days=7)["traffic_quality"]["last_bot_flag_run"])
+
+        BotFlagRun.objects.create(applied=True, days=30, rules="ip_burst", flagged_events=12, flagged_visitors=4)
+        cache.clear()
+        quality = self._get(days=7)["traffic_quality"]
+        self.assertEqual(quality["referrer_coverage"], 0.75)
+        self.assertEqual(quality["direct_share"], 0.25)
+        self.assertEqual(quality["last_bot_flag_run"]["flagged_events"], 12)
+        self.assertLess(quality["last_bot_flag_run"]["hours_ago"], 1)
+
+    def test_export_still_works(self):
+        self._visit("exported")
+        for file_format in ("csv", "xlsx"):
+            response = self.client.get(
+                reverse("admin-analytics-export"), {"sections": "audience", "file_format": file_format, "days": 7}
+            )
+            self.assertEqual(response.status_code, 200, file_format)
+
+
+class FlagSuspectedBotsSpikeRuleTests(APITestCase):
+    """The spike rule: a day's single-hit visitors jump, are concentrated, and arrive with no referrer."""
+
+    def _single_hits(self, count, *, source=None, ua="other_desktop", country="US", prefix="v"):
+        events = []
+        for index in range(count):
+            metadata = {"path": "/"}
+            if source:
+                metadata["referral_source"] = source
+            events.append(
+                AnalyticsEvent(
+                    event_type=AnalyticsEvent.EVENT_VISIT, visitor_id=f"{prefix}{index}", ua_family=ua,
+                    country_code=country, ip_hash=f"{prefix}ip{index % 40}", metadata=metadata,
+                )
+            )
+        AnalyticsEvent.objects.bulk_create(events)
+
+    def _run(self, *args):
+        out = io.StringIO()
+        call_command("flag_suspected_bots", "--rules", "spike", *args, stdout=out)
+        return out.getvalue()
+
+    def test_a_concentrated_direct_spike_is_flagged(self):
+        self._single_hits(60)
+
+        dry = self._run()
+        self.assertIn("Would flag 60 events from 60 visitors", dry)
+        self.assertIn("Spike", dry)
+        self.assertFalse(AnalyticsEvent.objects.filter(is_suspected_bot=True).exists())
+
+        self._run("--apply")
+        self.assertEqual(AnalyticsEvent.objects.filter(is_suspected_bot=True).count(), 60)
+        self.assertEqual(BotFlagRun.objects.filter(applied=True).count(), 1)
+
+    def test_a_spike_that_arrives_from_a_social_network_is_left_alone(self):
+        self._single_hits(60, source="facebook")
+        self.assertIn("Flagged 0 events", self._run("--apply"))
+        self.assertFalse(AnalyticsEvent.objects.filter(is_suspected_bot=True).exists())
+
+    def test_a_small_or_spread_out_day_is_left_alone(self):
+        self._single_hits(20)  # under the minimum spike size
+        self.assertIn("Flagged 0 events", self._run("--apply"))
+        AnalyticsEvent.objects.all().delete()
+        # Big, but every browser, country and IP is different.
+        AnalyticsEvent.objects.bulk_create(
+            [
+                AnalyticsEvent(
+                    event_type=AnalyticsEvent.EVENT_VISIT, visitor_id=f"s{index}", ua_family=f"ua{index}",
+                    country_code=f"{chr(65 + index % 26)}{chr(65 + (index // 26) % 26)}", ip_hash=f"ip{index}",
+                    metadata={"path": "/"},
+                )
+                for index in range(60)
+            ]
+        )
+        self.assertIn("Flagged 0 events", self._run("--apply"))
+
+    def test_visitors_who_did_anything_besides_load_a_page_are_never_flagged(self):
+        self._single_hits(60)
+        AnalyticsEvent.objects.create(
+            event_type=AnalyticsEvent.EVENT_READING_SESSION, visitor_id="v0", duration_seconds=30
+        )
+        self._run("--apply")
+        # v0 isn't single-hit any more, so only the other 59 can be flagged.
+        self.assertEqual(AnalyticsEvent.objects.filter(is_suspected_bot=True).count(), 59)
+
+    def test_unknown_rules_are_rejected(self):
+        with self.assertRaises(CommandError):
+            call_command("flag_suspected_bots", "--rules", "nonsense", stdout=io.StringIO())
+
+
+class AuditTrafficCommandTests(APITestCase):
+    def test_report_lists_days_with_the_quality_signals(self):
+        AnalyticsEvent.objects.create(
+            event_type=AnalyticsEvent.EVENT_VISIT, visitor_id="a", ua_family="chrome_mobile", country_code="NP",
+            metadata={"path": "/story/x", "referral_source": "google"},
+        )
+        out = io.StringIO()
+        call_command("audit_traffic", "--days", "3", stdout=out)
+        report = out.getvalue()
+        self.assertIn("1-page%", report)
+        self.assertIn("chrome_mobile", report)
+
+    def test_empty_window_is_reported(self):
+        out = io.StringIO()
+        call_command("audit_traffic", "--days", "3", stdout=out)
+        self.assertIn("No anonymous events", out.getvalue())
+
+
+class AdminMonetizationApiTests(APITestCase):
+    def setUp(self):
+        cache.clear()
+        self.admin = User.objects.create_user(
+            email="mon-admin@example.com", username="monadmin",
+            password="test-password", is_superuser=True, is_staff=True, is_active=True,
+        )
+        self.client.force_authenticate(self.admin)
+        self.url = reverse("admin-analytics-monetization")
+
+    def test_reports_no_data_when_there_are_no_ads_or_downloads(self):
+        data = self.client.get(self.url, {"days": 7}).data
+        self.assertFalse(data["has_data"])
+        self.assertEqual(data["kpis"]["ad_impressions"]["value"], 0)
+
+    def test_ads_and_downloads_with_previous_period_and_resolved_pages(self):
+        story = Story.objects.create(title="Downloaded Tale", slug="downloaded-tale", is_published=True)
+        for _ in range(3):
+            AnalyticsEvent.objects.create(
+                event_type=AnalyticsEvent.EVENT_AD_IMPRESSION, visitor_id=f"ad-{uuid4().hex[:6]}",
+                metadata={"path": "/story/downloaded-tale", "size": "banner", "content_type": "story"},
+            )
+        old = AnalyticsEvent.objects.create(event_type=AnalyticsEvent.EVENT_AD_IMPRESSION, visitor_id="old-ad")
+        AnalyticsEvent.objects.filter(pk=old.pk).update(created_at=timezone.now() - timedelta(days=10))
+        AnalyticsEvent.objects.create(
+            event_type=AnalyticsEvent.EVENT_DOWNLOAD, visitor_id="dl", story=story, value=2048,
+            metadata={"content_type": "epub"},
+        )
+        staff = User.objects.create_user(email="s@example.com", username="s", password="x", is_staff=True)
+        AnalyticsEvent.objects.create(event_type=AnalyticsEvent.EVENT_DOWNLOAD, visitor_id="staff-dl", user=staff, story=story)
+
+        data = self.client.get(self.url, {"days": 7}).data
+        self.assertTrue(data["has_data"])
+        ads = data["kpis"]["ad_impressions"]
+        self.assertEqual((ads["value"], ads["previous_value"]), (3, 1))
+        self.assertEqual(data["kpis"]["downloads"]["value"], 1)  # staff download excluded
+        self.assertEqual((data["ad_placements"][0]["title"], data["ad_placements"][0]["type"]), ("Downloaded Tale", "story"))
+        self.assertEqual(data["top_downloads"][0]["title"], "Downloaded Tale")
+        self.assertEqual(data["download_types"][0]["bytes"], 2048)
+
+    def test_non_superuser_is_forbidden(self):
+        self.client.force_authenticate(User.objects.create_user(email="r@example.com", username="r", password="x"))
+        self.assertEqual(self.client.get(self.url).status_code, 403)
