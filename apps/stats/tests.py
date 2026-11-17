@@ -1,3 +1,4 @@
+import json
 from datetime import date, timedelta
 from uuid import uuid4
 
@@ -26,7 +27,7 @@ from apps.story.models import (
     Video,
 )
 from apps.pages.models import Page
-from apps.users.models import User
+from apps.users.models import User, UserLoginLocation
 
 from .completion import COMPLETION_THRESHOLD
 from .models import (
@@ -1013,26 +1014,28 @@ class AdminContentAnalyticsApiTests(APITestCase):
         self.assertEqual(story["reading_minutes"], 1)
 
     def test_user_metrics_exclude_operator_accounts(self):
-        User.objects.create_user(
+        reader = User.objects.create_user(
             email="reader1@example.com",
             username="reader1",
             password="test-password",
             login_count=2,
             last_login=timezone.now(),
         )
-        self.admin.login_count = 40
-        self.admin.last_login = timezone.now()
-        self.admin.save(update_fields=["login_count", "last_login"])
+        # An operator with plenty of activity of their own.
+        AnalyticsEvent.objects.create(
+            event_type=AnalyticsEvent.EVENT_READING_SESSION, visitor_id="admin-browser", user=self.admin, duration_seconds=60
+        )
+        AnalyticsEvent.objects.create(
+            event_type=AnalyticsEvent.EVENT_READING_SESSION, visitor_id="reader-browser", user=reader, duration_seconds=60
+        )
         self.client.force_authenticate(self.admin)
 
         response = self.client.get(reverse("admin-analytics-users"), {"days": 30})
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.data["total_users"], 1)
-        self.assertEqual(response.data["active_users"], 1)
-        buckets = {row["bucket"]: row["count"] for row in response.data["login_frequency_buckets"]}
-        self.assertEqual(buckets["1-2"], 1)
-        self.assertEqual(buckets["11+"], 0)
+        self.assertEqual(response.data["kpis"]["registered_users"]["value"], 1)
+        self.assertEqual(response.data["kpis"]["active_users"]["value"], 1)
+        self.assertEqual([row["username"] for row in response.data["users"]], ["reader1"])
 
 
 class TimeSeriesBucketFillTests(APITestCase):
@@ -1114,7 +1117,7 @@ class TimeSeriesBucketFillTests(APITestCase):
             ("views_over_time", content["views_over_time"]["series"]),
             ("previous views_over_time", content["views_over_time"]["previous_series"]),
             ("publishing", content["publishing"]["series"]),
-            ("signups_over_time", users["signups_over_time"]),
+            ("signups_over_time", users["signups_over_time"]["series"]),
         ):
             with self.subTest(series=key):
                 self.assertEqual(len(series), 8)
@@ -4057,3 +4060,478 @@ class AdminMonetizationApiTests(APITestCase):
     def test_non_superuser_is_forbidden(self):
         self.client.force_authenticate(User.objects.create_user(email="r@example.com", username="r", password="x"))
         self.assertEqual(self.client.get(self.url).status_code, 403)
+
+
+class ClassifyStatusTests(SimpleTestCase):
+    """The status boundaries, at fixed instants so they can't flake."""
+
+    def setUp(self):
+        from apps.story.users_api import classify_status
+
+        self.classify = classify_status
+        self.now = timezone.now()
+
+    def _status(self, joined_days, active_days, verified=True):
+        joined = self.now - timedelta(days=joined_days)
+        last_active = None if active_days is None else self.now - timedelta(days=active_days)
+        return self.classify(joined, last_active, verified, self.now)
+
+    def test_unverified_beats_everything(self):
+        self.assertEqual(self._status(1, 0, verified=False), "unverified")
+        self.assertEqual(self._status(100, None, verified=False), "unverified")
+
+    def test_new_is_the_first_fourteen_days_inclusive(self):
+        self.assertEqual(self._status(14, 0), "new")
+        self.assertEqual(self._status(14, 40), "new")  # even if they haven't come back
+        self.assertEqual(self._status(14.001, 0), "active")
+
+    def test_active_is_fourteen_days_inclusive(self):
+        self.assertEqual(self._status(60, 14), "active")
+        self.assertEqual(self._status(60, 14.001), "at_risk")
+
+    def test_at_risk_is_up_to_thirty_days_inclusive(self):
+        self.assertEqual(self._status(90, 30), "at_risk")
+        self.assertEqual(self._status(90, 30.001), "dormant")
+
+    def test_never_active_is_dormant_once_no_longer_new(self):
+        self.assertEqual(self._status(60, None), "dormant")
+
+
+class AdminUsersTabTests(APITestCase):
+    def setUp(self):
+        cache.clear()
+        self.admin = User.objects.create_user(
+            email="users-admin@example.com", username="usersadmin",
+            password="test-password", is_superuser=True, is_staff=True, is_active=True, otp_verified=True,
+        )
+        self.staff = User.objects.create_user(
+            email="users-staff@example.com", username="usersstaff",
+            password="test-password", is_staff=True, is_active=True, otp_verified=True,
+        )
+        self.client.force_authenticate(self.admin)
+        self.url = reverse("admin-analytics-users")
+        self.counter = 0
+
+    def _user(self, *, joined_days_ago=1, verified=True, **kwargs):
+        self.counter += 1
+        user = User.objects.create_user(
+            email=f"reader{self.counter}@example.com", username=f"reader{self.counter}", password="x", **kwargs
+        )
+        User.objects.filter(pk=user.pk).update(
+            date_joined=timezone.now() - timedelta(days=joined_days_ago), otp_verified=verified
+        )
+        user.refresh_from_db()
+        return user
+
+    def _event(self, event_type, *, user=None, visitor_id=None, days_ago=0, hours_ago=0, **kwargs):
+        event = AnalyticsEvent.objects.create(
+            event_type=event_type, user=user, visitor_id=visitor_id or (f"u{user.pk}" if user else f"v{uuid4().hex[:8]}"), **kwargs
+        )
+        if days_ago or hours_ago:
+            AnalyticsEvent.objects.filter(pk=event.pk).update(
+                created_at=timezone.now() - timedelta(days=days_ago, hours=hours_ago)
+            )
+        return event
+
+    def _story(self, title="A Story", **kwargs):
+        return Story.objects.create(title=title, slug=title.lower().replace(" ", "-"), is_published=True, **kwargs)
+
+    def _get(self, **params):
+        response = self.client.get(self.url, params)
+        self.assertEqual(response.status_code, 200, response.data)
+        return response.data
+
+    def _rows(self, data):
+        return {row["username"]: row for row in data["users"]}
+
+    # --- exclusions ---------------------------------------------------------------------
+
+    def test_staff_and_superusers_are_excluded_everywhere(self):
+        reader = self._user()
+        story = self._story()
+        for operator in (self.admin, self.staff):
+            self._event(AnalyticsEvent.EVENT_STORY_STARTED, user=operator, story=story, metadata={"format": "chapter"})
+            Favorite.objects.create(story=story, user=operator)
+        self._event(AnalyticsEvent.EVENT_STORY_STARTED, user=reader, story=story, metadata={"format": "chapter"})
+
+        data = self._get(days=30)
+        self.assertEqual(data["kpis"]["registered_users"]["value"], 1)
+        self.assertEqual(data["kpis"]["new_users"]["value"], 1)
+        self.assertEqual(data["kpis"]["active_users"]["value"], 1)
+        self.assertEqual(list(self._rows(data)), [reader.username])
+        self.assertEqual(sum(data["segments"].values()), 1)
+
+    def test_suspected_bot_events_do_not_make_a_user_active(self):
+        reader = self._user(joined_days_ago=60)
+        self._event(AnalyticsEvent.EVENT_READING_SESSION, user=reader, duration_seconds=60, is_suspected_bot=True)
+        data = self._get(days=7)
+        self.assertEqual(data["kpis"]["active_users"]["value"], 0)
+        self.assertIsNone(self._rows(data)[reader.username]["last_active"])
+
+    # --- signup source --------------------------------------------------------------------
+
+    def test_signup_source_comes_from_the_visitor_id_before_signup(self):
+        story = self._story("Landing Story")
+        browser = "signup-browser"
+        # Anonymous visits before the account existed: Facebook first, Google later.
+        self._event(
+            AnalyticsEvent.EVENT_VISIT, visitor_id=browser, days_ago=3,
+            metadata={"path": "/story/landing-story", "referral_source": "facebook", "landing": True},
+        )
+        self._event(
+            AnalyticsEvent.EVENT_STORY_STARTED, visitor_id=browser, days_ago=3, story=story, metadata={"format": "chapter"}
+        )
+        self._event(AnalyticsEvent.EVENT_VISIT, visitor_id=browser, days_ago=2, metadata={"path": "/", "referral_source": "google"})
+        user = self._user(joined_days_ago=1)
+        # After signing up, on the same browser, the user's own events carry that visitor_id.
+        self._event(AnalyticsEvent.EVENT_VISIT, user=user, visitor_id=browser, metadata={"path": "/library", "referral_source": "internal"})
+
+        row = self._rows(self._get(days=30))[user.username]
+        self.assertEqual(row["signup_source"], "facebook")  # first touch, not last
+        self.assertEqual(row["signup_method"], "before_signup")
+        self.assertEqual(
+            (row["signup_landing"]["type"], row["signup_landing"]["title"]), ("story", "Landing Story")
+        )
+        self.assertEqual(row["signup_story"]["title"], "Landing Story")
+
+    def test_signup_source_falls_back_to_the_first_visit_after_signup_then_to_unknown(self):
+        after = self._user(joined_days_ago=5)
+        self._event(AnalyticsEvent.EVENT_VISIT, user=after, metadata={"path": "/", "referral_source": "internal"}, days_ago=4)
+        self._event(AnalyticsEvent.EVENT_VISIT, user=after, metadata={"path": "/", "referral_source": "twitter"}, days_ago=3)
+        silent = self._user(joined_days_ago=5)
+        # The server's own events (visitor_id "server") must not link anyone to a browser.
+        self._event(AnalyticsEvent.EVENT_STORY_COMPLETED, user=silent, visitor_id="server", metadata={"source": "chapters"})
+        # Another visitor who browsed anonymously but never signed up.
+        self._event(AnalyticsEvent.EVENT_VISIT, visitor_id="stranger", days_ago=6, metadata={"path": "/", "referral_source": "google"})
+
+        data = self._get(days=30)
+        rows = self._rows(data)
+        self.assertEqual((rows[after.username]["signup_source"], rows[after.username]["signup_method"]), ("twitter", "after_signup"))
+        self.assertIsNone(rows[silent.username]["signup_source"])
+        self.assertEqual(
+            data["attribution"],
+            {"attributed": 1, "total": 2, "before_signup": 0, "after_signup": 1, "none": 1},
+        )
+
+    def test_a_shared_browser_does_not_pull_in_another_users_events(self):
+        browser = "family-laptop"
+        self._event(AnalyticsEvent.EVENT_VISIT, visitor_id=browser, days_ago=4, metadata={"path": "/", "referral_source": "google"})
+        first = self._user(joined_days_ago=3)
+        self._event(AnalyticsEvent.EVENT_VISIT, user=first, visitor_id=browser, days_ago=3, metadata={"referral_source": "internal"})
+        second = self._user(joined_days_ago=2)
+        self._event(AnalyticsEvent.EVENT_VISIT, user=second, visitor_id=browser, days_ago=1, metadata={"path": "/library", "referral_source": "facebook"})
+
+        rows = self._rows(self._get(days=30))
+        # Both can see the pre-signup anonymous trail; neither inherits the other's own visit.
+        self.assertEqual(rows[first.username]["signup_source"], "google")
+        self.assertEqual(rows[second.username]["signup_source"], "google")
+
+    # --- activation -------------------------------------------------------------------------
+
+    def test_activation_counts_a_story_started_within_a_week_of_joining(self):
+        story = self._story()
+        within, late, never = [], [], []
+        for _ in range(3):
+            user = self._user(joined_days_ago=20)
+            self._event(AnalyticsEvent.EVENT_STORY_STARTED, user=user, story=story, days_ago=17, metadata={"format": "chapter"})
+            within.append(user)
+        user = self._user(joined_days_ago=20)
+        self._event(AnalyticsEvent.EVENT_STORY_STARTED, user=user, story=story, days_ago=10, metadata={"format": "chapter"})
+        for _ in range(2):
+            never.append(self._user(joined_days_ago=20))
+        # Joined two days ago: their first week isn't over, so they can't count either way.
+        recent = self._user(joined_days_ago=2)
+        self._event(AnalyticsEvent.EVENT_STORY_STARTED, user=recent, story=story, days_ago=1, metadata={"format": "chapter"})
+
+        activation = self._get(days=30)["kpis"]["activation_rate"]
+        self.assertEqual(activation["sample_size"], 6)  # the 6 whose first week is over
+        self.assertEqual(activation["value"], 0.5)
+
+    def test_activation_is_null_with_too_few_eligible_users(self):
+        story = self._story()
+        user = self._user(joined_days_ago=20)
+        self._event(AnalyticsEvent.EVENT_STORY_STARTED, user=user, story=story, days_ago=19, metadata={"format": "chapter"})
+        activation = self._get(days=30)["kpis"]["activation_rate"]
+        self.assertEqual(activation["sample_size"], 1)
+        self.assertIsNone(activation["value"])
+
+    # --- the other KPIs -----------------------------------------------------------------------
+
+    def test_visitor_to_signup_rate_and_signed_in_minutes_share(self):
+        story = self._story()
+        for index in range(8):  # anonymous visitors, three of whom read
+            visitor = f"anon-{index}"
+            self._event(AnalyticsEvent.EVENT_VISIT, visitor_id=visitor, metadata={"path": "/"})
+            if index < 3:
+                self._event(AnalyticsEvent.EVENT_READING_SESSION, visitor_id=visitor, story=story, duration_seconds=600)
+        users = [self._user(joined_days_ago=2) for _ in range(2)]
+        for user in users:
+            self._event(AnalyticsEvent.EVENT_READING_SESSION, user=user, story=story, duration_seconds=600)
+
+        kpis = self._get(days=30)["kpis"]
+        self.assertEqual((kpis["visitor_to_signup_rate"]["value"], kpis["visitor_to_signup_rate"]["sample_size"]), (0.25, 8))
+        share = kpis["signed_in_minutes_share"]
+        self.assertEqual(share["value"], 0.4)  # 20 of 50 capped minutes
+        self.assertEqual(share["sample_size"], 5)
+
+    def test_signed_in_minutes_are_capped(self):
+        story = self._story()
+        user = self._user(joined_days_ago=5)
+        self._event(AnalyticsEvent.EVENT_READING_SESSION, user=user, story=story, duration_seconds=20 * 3600)
+        row = self._rows(self._get(days=30))[user.username]
+        self.assertEqual(row["reading_minutes"], 60.0)
+
+    def test_registered_users_has_a_weekly_sparkline(self):
+        for days_ago in (1, 10, 40):
+            self._user(joined_days_ago=days_ago)
+        registered = self._get(days=30)["kpis"]["registered_users"]
+        self.assertEqual(registered["value"], 3)
+        self.assertEqual(len(registered["sparkline"]), 12)
+        self.assertEqual(registered["sparkline"][-1], 3)
+        self.assertEqual(registered["sparkline"][0], 0)  # nobody had joined 11 weeks ago
+        self.assertEqual(registered["sparkline"], sorted(registered["sparkline"]))  # a running total only rises
+
+    # --- funnel ---------------------------------------------------------------------------------------
+
+    def test_signup_funnel_is_nested_and_has_no_signup_started_step(self):
+        story = self._story()
+        for index in range(10):
+            self._event(AnalyticsEvent.EVENT_VISIT, visitor_id=f"visitor-{index}", metadata={"path": "/"})
+        verified_started = self._user(joined_days_ago=5)
+        self._event(AnalyticsEvent.EVENT_STORY_STARTED, user=verified_started, story=story, days_ago=4, metadata={"format": "chapter"})
+        self._event(AnalyticsEvent.EVENT_STORY_PROGRESSED, user=verified_started, story=story, days_ago=2, metadata={"format": "chapter"})
+        StoryCompletion.objects.create(user=verified_started, story=story, source="chapters")
+        self._user(joined_days_ago=4)  # verified, never started
+        unverified = self._user(joined_days_ago=4, verified=False)
+        self._event(AnalyticsEvent.EVENT_STORY_STARTED, user=unverified, story=story, metadata={"format": "chapter"})
+
+        steps = {step["key"]: step for step in self._get(days=30)["signup_funnel"]}
+        self.assertNotIn("signup_started", steps)
+        counts = [steps[key]["count"] for key in ("visitors", "account_created", "otp_verified", "first_story_started", "first_story_completed", "second_day")]
+        # 10 visitors, 3 accounts, 2 verified, 1 of them started, completed it, and came back on another day.
+        self.assertEqual(counts, [10, 3, 2, 1, 1, 1])
+        self.assertEqual(counts[1:], sorted(counts[1:], reverse=True))
+        self.assertEqual(steps["otp_verified"]["rate"], round(2 / 3, 4))
+
+    def test_second_day_is_only_counted_for_people_who_got_that_far(self):
+        story = self._story()
+        returner = self._user(joined_days_ago=6)  # started and came back, but never finished
+        self._event(AnalyticsEvent.EVENT_STORY_STARTED, user=returner, story=story, days_ago=5, metadata={"format": "chapter"})
+        self._event(AnalyticsEvent.EVENT_READING_SESSION, user=returner, story=story, days_ago=1, duration_seconds=60)
+        counts = [step["count"] for step in self._get(days=30)["signup_funnel"]]
+        self.assertEqual(counts[-3:], [1, 0, 0])  # started, completed, active on a 2nd day
+
+    # --- the table -------------------------------------------------------------------------------------------
+
+    def test_users_row_carries_activity_and_all_time_signals(self):
+        story = self._story("Nepali Tale", country="NP")
+        other = self._story("Another Tale", country="IN")
+        user = self._user(joined_days_ago=40)
+        for days_ago in (0, 1, 2, 8):
+            self._event(AnalyticsEvent.EVENT_READING_SESSION, user=user, story=story, duration_seconds=300, days_ago=days_ago)
+        self._event(AnalyticsEvent.EVENT_STORY_STARTED, user=user, story=story, metadata={"format": "chapter"})
+        self._event(AnalyticsEvent.EVENT_STORY_STARTED, user=user, story=other, metadata={"format": "chapter"})
+        self._event(AnalyticsEvent.EVENT_LISTENING_SESSION, user=user, story=story, duration_seconds=180)
+        StoryCompletion.objects.create(user=user, story=story, source="chapters")
+        StoryCompletion.objects.create(user=user, story=other, source="chapters")
+        self._event(AnalyticsEvent.EVENT_STORY_COMPLETED, user=user, visitor_id="server", story=story, metadata={"source": "chapters"})
+        Favorite.objects.create(story=story, user=user)
+        Review.objects.create(story=story, user=user, rating=5, comment="great")
+        StoryReaction.objects.create(story=story, user=user, reaction_type="loved")
+        achievement = Achievement.objects.first()
+        UserAchievement.objects.create(user=user, achievement=achievement, progress=achievement.target_value, completed=True, completed_at=timezone.now())
+        UserLoginLocation.objects.create(user=user, country="Nepal", country_code="NP")
+
+        row = self._rows(self._get(days=30))[user.username]
+        self.assertEqual(row["active_days"], 4)
+        self.assertEqual(row["stories_started"], 2)
+        self.assertEqual(row["stories_completed"], 1)
+        self.assertEqual(row["reading_minutes"], 20.0)
+        self.assertEqual(row["listening_minutes"], 3.0)
+        self.assertEqual((row["favorites"], row["reviews"], row["reactions"]), (1, 1, 1))
+        self.assertEqual((row["current_streak"], row["longest_streak"]), (3, 3))
+        self.assertEqual(row["achievements_count"], 1)
+        self.assertEqual(row["passport_countries"], 2)
+        self.assertEqual(row["country"], "Nepal")
+        self.assertEqual(row["status"], "active")
+        self.assertTrue(row["otp_verified"])
+
+    def test_segments_count_each_status(self):
+        story = self._story()
+        self._user(joined_days_ago=2)  # new
+        self._user(joined_days_ago=60, verified=False)  # unverified
+        active = self._user(joined_days_ago=60)
+        self._event(AnalyticsEvent.EVENT_READING_SESSION, user=active, story=story, duration_seconds=60, days_ago=3)
+        at_risk = self._user(joined_days_ago=90)
+        self._event(AnalyticsEvent.EVENT_READING_SESSION, user=at_risk, story=story, duration_seconds=60, days_ago=20)
+        dormant = self._user(joined_days_ago=90)
+        self._event(AnalyticsEvent.EVENT_READING_SESSION, user=dormant, story=story, duration_seconds=60, days_ago=45)
+        self._user(joined_days_ago=90)  # never active
+
+        data = self._get(days=30)
+        self.assertEqual(data["segments"], {"new": 1, "active": 1, "at_risk": 1, "dormant": 2, "unverified": 1})
+        # Most recently active first; the never-active last.
+        self.assertEqual(data["users"][-1]["last_active"], None)
+
+    def test_the_payload_has_no_ip_hash_user_agent_or_otp_fields(self):
+        user = self._user()
+        self._event(AnalyticsEvent.EVENT_VISIT, user=user, ip_hash="secret-hash", ua_family="chrome_mobile", metadata={"path": "/"})
+        payload = json.dumps(self._get(days=30), default=str)
+        for forbidden in ("ip_hash", "secret-hash", "ua_family", "user_agent", "otp_code", "ip_address"):
+            self.assertNotIn(forbidden, payload)
+
+    # --- signups over time --------------------------------------------------------------------------------------
+
+    def test_signups_over_time_are_weekly_for_30_days_and_daily_for_7_split_by_source(self):
+        for source in ("google", "google", "facebook"):
+            user = self._user(joined_days_ago=2)
+            self._event(AnalyticsEvent.EVENT_VISIT, user=user, days_ago=2, metadata={"path": "/", "referral_source": source})
+        self._user(joined_days_ago=2)  # no source at all
+
+        weekly = self._get(days=30)["signups_over_time"]
+        self.assertEqual(weekly["interval"], "week")
+        self.assertEqual(sum(point["total"] for point in weekly["series"]), 4)
+        self.assertTrue(all(date.fromisoformat(str(point["day"])).weekday() == 0 for point in weekly["series"]))
+        self.assertEqual(set(weekly["sources"]), {"google", "facebook", "unknown"})
+        self.assertEqual(sum(point["by_source"].get("google", 0) for point in weekly["series"]), 2)
+
+        daily = self._get(days=7)["signups_over_time"]
+        self.assertEqual(daily["interval"], "day")
+        self.assertEqual(len(daily["series"]), 8)
+
+    # --- cohorts ----------------------------------------------------------------------------------------------------
+
+    def test_cohorts_are_gated_below_thirty_users(self):
+        for _ in range(5):
+            self._user(joined_days_ago=40)
+        cohorts = self._get(days=30)["cohorts"]
+        self.assertFalse(cohorts["available"])
+        self.assertEqual((cohorts["total_users"], cohorts["rows"]), (5, []))
+
+    def test_cohort_retention_by_week_after_signup(self):
+        story = self._story()
+        users = [self._user(joined_days_ago=40) for _ in range(30)]
+        for user in users[:12]:  # came back 8 days after joining: week 1
+            self._event(AnalyticsEvent.EVENT_READING_SESSION, user=user, story=story, duration_seconds=60, days_ago=32)
+        for user in users[:3]:  # and again 15 days after: week 2
+            self._event(AnalyticsEvent.EVENT_READING_SESSION, user=user, story=story, duration_seconds=60, days_ago=25)
+
+        cohorts = self._get(days=30)["cohorts"]
+        self.assertTrue(cohorts["available"])
+        weeks = {w["week"]: w for row in cohorts["rows"] for w in row["weeks"]}
+        # Everyone joined 40 days ago, so all four weeks are over for the whole cohort.
+        total = sum(row["size"] for row in cohorts["rows"])
+        self.assertEqual(total, 30)
+        self.assertEqual(sum(w["eligible"] for row in cohorts["rows"] for w in row["weeks"] if w["week"] == 1), 30)
+        week1_active = sum(w["active"] for row in cohorts["rows"] for w in row["weeks"] if w["week"] == 1)
+        week2_active = sum(w["active"] for row in cohorts["rows"] for w in row["weeks"] if w["week"] == 2)
+        self.assertEqual((week1_active, week2_active), (12, 3))
+        self.assertIn(1, weeks)
+
+    # --- previous period -----------------------------------------------------------------------------------------------
+
+    def test_kpis_and_funnel_carry_previous_period_values(self):
+        for _ in range(3):
+            self._user(joined_days_ago=2)
+        for _ in range(2):
+            self._user(joined_days_ago=10)
+        for _ in range(4):
+            self._user(joined_days_ago=60)
+
+        data = self._get(days=7)
+        new = data["kpis"]["new_users"]
+        self.assertEqual((new["value"], new["previous_value"]), (3, 2))
+        registered = data["kpis"]["registered_users"]
+        # Everyone who had joined by the end of the previous week vs. everyone now.
+        self.assertEqual((registered["value"], registered["previous_value"]), (9, 6))
+        created = next(step for step in data["signup_funnel"] if step["key"] == "account_created")
+        self.assertEqual((created["count"], created["previous_count"]), (3, 2))
+        self.assertIsNone(self._get(days="all")["kpis"]["new_users"]["previous_value"])
+
+    def test_previous_value_is_zero_when_nobody_signed_up_before(self):
+        self._user(joined_days_ago=2)
+        new = self._get(days=7)["kpis"]["new_users"]
+        self.assertEqual((new["value"], new["previous_value"]), (1, 0))
+
+    def test_export_still_works(self):
+        self._user()
+        for file_format in ("csv", "xlsx"):
+            response = self.client.get(
+                reverse("admin-analytics-export"), {"sections": "users", "file_format": file_format, "days": 30}
+            )
+            self.assertEqual(response.status_code, 200, file_format)
+
+
+class AdminUserTimelineApiTests(APITestCase):
+    def setUp(self):
+        cache.clear()
+        self.admin = User.objects.create_user(
+            email="tl-admin@example.com", username="tladmin",
+            password="test-password", is_superuser=True, is_staff=True, is_active=True,
+        )
+        self.reader = User.objects.create_user(email="tl-reader@example.com", username="tlreader", password="x")
+        self.other = User.objects.create_user(email="tl-other@example.com", username="tlother", password="x")
+        self.story = Story.objects.create(title="Timeline Story", slug="timeline-story", is_published=True)
+
+    def _url(self, user):
+        return reverse("admin-analytics-user-timeline", args=[user.pk])
+
+    def test_requires_a_superuser(self):
+        self.assertEqual(self.client.get(self._url(self.reader)).status_code, 401)
+        self.client.force_authenticate(self.other)
+        self.assertEqual(self.client.get(self._url(self.reader)).status_code, 403)
+
+    def test_operators_have_no_timeline(self):
+        self.client.force_authenticate(self.admin)
+        self.assertEqual(self.client.get(self._url(self.admin)).status_code, 404)
+
+    def test_timeline_merges_sessions_completions_favorites_reviews_and_achievements(self):
+        self.client.force_authenticate(self.admin)
+        blog = Blog.objects.create(title="Timeline Post", slug="timeline-post", content="<p>x</p>")
+        for seconds in (120, 180):  # two sessions the same day collapse into one item
+            AnalyticsEvent.objects.create(
+                event_type=AnalyticsEvent.EVENT_READING_SESSION, visitor_id="b", user=self.reader,
+                story=self.story, duration_seconds=seconds,
+            )
+        AnalyticsEvent.objects.create(
+            event_type=AnalyticsEvent.EVENT_READING_SESSION, visitor_id="b", user=self.reader, blog=blog,
+            duration_seconds=20 * 3600,
+        )
+        AnalyticsEvent.objects.create(
+            event_type=AnalyticsEvent.EVENT_LISTENING_SESSION, visitor_id="b", user=self.reader,
+            story=self.story, duration_seconds=60,
+        )
+        ChapterReadingProgress.objects.create(
+            user=self.reader, story=self.story,
+            chapter=Chapter.objects.create(story=self.story, title="One", slug="one", content="x", order=1), progress=0.5,
+        )
+        StoryCompletion.objects.create(user=self.reader, story=self.story, source="chapters")
+        Favorite.objects.create(story=self.story, user=self.reader)
+        Review.objects.create(story=self.story, user=self.reader, rating=4, comment="good")
+        achievement = Achievement.objects.first()
+        UserAchievement.objects.create(
+            user=self.reader, achievement=achievement, progress=achievement.target_value, completed=True,
+            completed_at=timezone.now(),
+        )
+
+        data = self.client.get(self._url(self.reader)).data
+        kinds = [item["kind"] for item in data["items"]]
+        self.assertEqual(
+            sorted(kinds),
+            sorted(["story_session", "blog_session", "audio_session", "completion", "favorite", "review", "achievement"]),
+        )
+        story = next(item for item in data["items"] if item["kind"] == "story_session")
+        self.assertEqual((story["title"], story["minutes"], story["sessions"], story["progress"]), ("Timeline Story", 5.0, 2, 0.5))
+        blog_item = next(item for item in data["items"] if item["kind"] == "blog_session")
+        self.assertEqual(blog_item["minutes"], 60.0)  # capped
+        ats = [item["at"] for item in data["items"]]
+        self.assertEqual(ats, sorted(ats, reverse=True))
+        self.assertNotIn("ip_hash", json.dumps(data, default=str))
+
+    def test_timeline_is_capped_at_one_hundred_items(self):
+        self.client.force_authenticate(self.admin)
+        Favorite.objects.bulk_create(
+            [Favorite(story=Story.objects.create(title=f"S{i}", slug=f"s{i}", is_published=True), user=self.reader) for i in range(120)]
+        )
+        data = self.client.get(self._url(self.reader)).data
+        self.assertEqual((len(data["items"]), data["total"]), (100, 120))

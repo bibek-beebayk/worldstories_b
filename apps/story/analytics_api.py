@@ -29,7 +29,7 @@ from apps.stats.models import (
     ChapterReadingProgress,
     ReadingProgress,
 )
-from apps.users.models import User, UserLoginLocation
+from apps.users.models import UserLoginLocation
 
 from .api import IsSuperUser
 from .content_scoring import SCORE_FORMULA, SessionCaps, score_rows
@@ -1047,56 +1047,6 @@ def build_detail_time_series(days, *, story=None, blog=None):
 # itself shows.
 
 
-def build_users_data(days):
-    cutoff = get_cutoff(days)
-
-    # Operator accounts are excluded from every user metric here. record_login()
-    # fires on the admin login endpoint too, so without this an admin's own
-    # sessions inflate active_users and skew the login-frequency histogram —
-    # an admin logs in far more often than any reader.
-    audience_users = User.objects.filter(is_superuser=False, is_staff=False)
-
-    signups_over_time = (
-        filter_since(audience_users, cutoff, "date_joined")
-        .annotate(day=time_trunc("date_joined", days))
-        .values("day")
-        .annotate(count=Count("id"))
-        .order_by("day")
-    )
-
-    active_users = filter_since(audience_users, cutoff, "last_login").count()
-
-    login_bucket_defs = [("0", 0, 1), ("1-2", 1, 3), ("3-5", 3, 6), ("6-10", 6, 11), ("11+", 11, None)]
-    login_frequency_buckets = []
-    for label, lo, hi in login_bucket_defs:
-        bucket_qs = audience_users.filter(login_count__gte=lo)
-        if hi is not None:
-            bucket_qs = bucket_qs.filter(login_count__lt=hi)
-        login_frequency_buckets.append({"bucket": label, "count": bucket_qs.count()})
-
-    joined_in_range = filter_since(audience_users, cutoff, "date_joined")
-    joined_count = joined_in_range.count()
-    verified_count = joined_in_range.filter(otp_verified=True).count()
-
-    return {
-        "range_days": days,
-        "time_interval": get_time_interval(days),
-        "signups_over_time": fill_time_buckets(
-            [{"day": row["day"], "count": row["count"]} for row in signups_over_time],
-            days,
-            defaults={"count": 0},
-        ),
-        "total_users": audience_users.count(),
-        "active_users": active_users,
-        "login_frequency_buckets": login_frequency_buckets,
-        "otp_conversion": {
-            "joined": joined_count,
-            "verified": verified_count,
-            "rate": round(verified_count / joined_count, 3) if joined_count else 0,
-        },
-    }
-
-
 def build_geography_data(days):
     cutoff = get_cutoff(days)
 
@@ -1469,14 +1419,6 @@ class AdminAnalyticsContentRankingsAPIView(APIView):
         )
 
 
-class AdminAnalyticsUsersAPIView(APIView):
-    permission_classes = [IsSuperUser]
-
-    @method_decorator(cache_page(CACHE_SECONDS))
-    def get(self, request):
-        return Response(build_with_previous_period(build_users_data, get_range_days(request)))
-
-
 class AdminAnalyticsGeographyAPIView(APIView):
     """Where users are signing in from — powers the admin panel's country
     heatmap and city breakdown. Backed by UserLoginLocation, one row per
@@ -1507,6 +1449,12 @@ class AdminAnalyticsSubmissionsAPIView(APIView):
         return Response(build_with_previous_period(build_submissions_data, get_range_days(request)))
 
 
+def _users_export(days):
+    from .users_api import build_users_export_data
+
+    return build_users_export_data(days)
+
+
 def _audience_export(days):
     from .audience_api import build_audience_export_data
 
@@ -1524,7 +1472,7 @@ EXPORT_SECTION_BUILDERS = {
     "content": build_content_export_data,
     "engagement": lambda days: _engagement_export(days),
     "audience": lambda days: _audience_export(days),
-    "users": build_users_data,
+    "users": lambda days: _users_export(days),
     "geography": build_geography_data,
     "submissions": build_submissions_data,
     "engagement_metrics": build_engagement_metrics_data,
@@ -1539,6 +1487,9 @@ def _json_safe(value):
     # crashing the export.
     if isinstance(value, (list, dict)):
         return json.dumps(value, ensure_ascii=False)
+    # Excel can't store a timezone: write the local wall-clock time instead.
+    if isinstance(value, datetime) and timezone.is_aware(value):
+        return timezone.localtime(value).replace(tzinfo=None)
     return value
 
 
@@ -1561,7 +1512,7 @@ SECTION_TABLE_KEYS = {
         "catalogue_gaps",
     },
     "engagement": {"funnel_steps", "depth_curve", "drop_off_stories", "retention"},
-    "users": {"signups_over_time", "login_frequency_buckets"},
+    "users": {"users", "signup_funnel", "signups_over_time", "cohorts"},
     "geography": {"by_country", "by_city", "logins_over_time"},
     "submissions": {"submissions_over_time", "funnel", "by_story_type", "by_genre"},
     "engagement_metrics": {"funnel"},
