@@ -1,7 +1,8 @@
 """Coarse, privacy-preserving request provenance for AnalyticsEvent.
 
-Only the derived values ever reach the database: a country code, a keyed IP
-hash, and a coarse browser bucket. The raw IP and the full User-Agent string
+Only the derived values ever reach the database: a country code, an optional
+city / region name (Cloudflare headers), a keyed IP hash, and a coarse browser
+bucket. The raw IP and the full User-Agent string
 are deliberately never stored.
 """
 
@@ -37,6 +38,36 @@ def country_code_from_request(request):
     return raw
 
 
+# Cloudflare sends these literals when it has no location for the visitor.
+_UNKNOWN_PLACES = {"", "unknown", "xx", "t1", "-", "n/a", "none", "null"}
+_PLACE_MAX_LENGTH = 64
+
+
+def _place_from_header(request, meta_key):
+    """A city or region name from a Cloudflare location header, or "".
+
+    WSGI hands headers over as latin-1, so a UTF-8 name ("Kathmandu" is safe,
+    "Zürich" is not) arrives mangled; it is re-decoded when that round-trips.
+    Whitespace is collapsed and the length capped; unknown markers are blank."""
+    raw = request.META.get(meta_key) or ""
+    try:
+        raw = raw.encode("latin-1").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        pass
+    cleaned = " ".join(raw.split())
+    if cleaned.lower() in _UNKNOWN_PLACES or any(ord(ch) < 32 for ch in cleaned):
+        return ""
+    return cleaned[:_PLACE_MAX_LENGTH]
+
+
+def city_from_request(request):
+    return _place_from_header(request, "HTTP_CF_IPCITY")
+
+
+def region_from_request(request):
+    return _place_from_header(request, "HTTP_CF_REGION")
+
+
 def hash_ip(ip_address):
     if not ip_address:
         return ""
@@ -62,6 +93,8 @@ def request_provenance(request):
 
     return {
         "country_code": country_code_from_request(request),
+        "city": city_from_request(request),
+        "region": region_from_request(request),
         "ip_hash": hash_ip(get_client_ip(request)),
         "ua_family": ua_family(request.META.get("HTTP_USER_AGENT", "")),
     }

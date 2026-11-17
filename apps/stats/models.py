@@ -397,6 +397,11 @@ class AnalyticsEvent(models.Model):
     country_code = models.CharField(max_length=2, blank=True, default="", db_index=True)
     ip_hash = models.CharField(max_length=64, blank=True, default="", db_index=True)
     ua_family = models.CharField(max_length=32, blank=True, default="")
+    # Coarse location below country, from Cloudflare's optional "Add visitor
+    # location headers" managed transform (CF-IPCity / CF-Region). Blank when
+    # the headers are not enabled. Never looked up from an IP here.
+    city = models.CharField(max_length=64, blank=True, default="")
+    region = models.CharField(max_length=64, blank=True, default="")
     # Set by the flag_suspected_bots management command, never at ingest.
     # Dashboard audience metrics exclude these rows; nothing is deleted.
     is_suspected_bot = models.BooleanField(default=False, db_index=True)

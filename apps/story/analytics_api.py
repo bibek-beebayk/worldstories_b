@@ -1419,18 +1419,6 @@ class AdminAnalyticsContentRankingsAPIView(APIView):
         )
 
 
-class AdminAnalyticsGeographyAPIView(APIView):
-    """Where users are signing in from — powers the admin panel's country
-    heatmap and city breakdown. Backed by UserLoginLocation, one row per
-    login, populated by apps.users.geo.record_login on every real login."""
-
-    permission_classes = [IsSuperUser]
-
-    @method_decorator(cache_page(CACHE_SECONDS))
-    def get(self, request):
-        return Response(build_with_previous_period(build_geography_data, get_range_days(request)))
-
-
 class AdminAnalyticsEngagementMetricsAPIView(APIView):
     """The §12.2 funnel. Reads events the milestones already emit."""
 

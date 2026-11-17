@@ -15,6 +15,7 @@ from apps.story import analytics_api as story_analytics_api
 from apps.story import overview_api
 from apps.story import engagement_api
 from apps.story import audience_api
+from apps.story import geography_api
 from apps.story import users_api as users_analytics_api
 from apps.stats import views as stats_views
 from apps.stats import nepalikatha as nepalikatha_api
@@ -327,8 +328,13 @@ urlpatterns = [
     ),
     path(
         "api/admin/analytics/geography/",
-        story_analytics_api.AdminAnalyticsGeographyAPIView.as_view(),
+        geography_api.AdminAnalyticsGeographyAPIView.as_view(),
         name="admin-analytics-geography",
+    ),
+    path(
+        "api/admin/analytics/geography/<str:country_code>/",
+        geography_api.AdminAnalyticsGeographyCountryAPIView.as_view(),
+        name="admin-analytics-geography-country",
     ),
     path(
         "api/admin/analytics/export/",

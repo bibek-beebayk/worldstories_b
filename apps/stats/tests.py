@@ -1175,7 +1175,7 @@ class TimeSeriesBucketFillTests(APITestCase):
         self.assertEqual([row["count"] for row in series].count(0), 7)
 
     def test_geography_series_is_filled(self):
-        response = self.client.get(reverse("admin-analytics-geography"), {"days": 7})
+        response = self.client.get(reverse("admin-analytics-geography"), {"days": 7, "scope": "signed_in"})
 
         series = response.data["logins_over_time"]
         self.assertEqual(len(series), 8)
@@ -4535,3 +4535,247 @@ class AdminUserTimelineApiTests(APITestCase):
         )
         data = self.client.get(self._url(self.reader)).data
         self.assertEqual((len(data["items"]), data["total"]), (100, 120))
+
+
+class AdminGeographyTabTests(APITestCase):
+    """Geography tab, visitors scope: anonymous visitors placed by the country
+    on their browser events."""
+
+    def setUp(self):
+        cache.clear()
+        self.admin = User.objects.create_user(
+            email="geo-admin@example.com", username="geoadmin",
+            password="test-password", is_superuser=True, is_staff=True, is_active=True,
+        )
+        self.staff = User.objects.create_user(
+            email="geo-staff@example.com", username="geostaff",
+            password="test-password", is_staff=True, is_active=True,
+        )
+        self.member = User.objects.create_user(
+            email="geo-member@example.com", username="geomember", password="test-password", is_active=True
+        )
+        self.client.force_authenticate(self.admin)
+        self.url = reverse("admin-analytics-geography")
+        self.story = Story.objects.create(title="Geo Story", slug="geo-story", is_published=True, language="en")
+
+    def _event(self, event_type, visitor_id, *, days_ago=0, **kwargs):
+        event = AnalyticsEvent.objects.create(event_type=event_type, visitor_id=visitor_id, **kwargs)
+        if days_ago:
+            AnalyticsEvent.objects.filter(pk=event.pk).update(created_at=timezone.now() - timedelta(days=days_ago))
+        return event
+
+    def _visit(self, visitor_id, country="NP", *, path="/", source=None, days_ago=0, **kwargs):
+        metadata = {"path": path}
+        if source is not None:
+            metadata["referral_source"] = source
+        return self._event(
+            AnalyticsEvent.EVENT_VISIT, visitor_id, session_id=f"{visitor_id}-s", country_code=country,
+            metadata=metadata, days_ago=days_ago, **kwargs,
+        )
+
+    def _get(self, **params):
+        response = self.client.get(self.url, params)
+        self.assertEqual(response.status_code, 200, response.data)
+        return response.data
+
+    def _row(self, data, code):
+        return next(row for row in data["by_country"] if row["country_code"] == code)
+
+    def test_anonymous_visitors_are_counted_per_country(self):
+        for visitor in ("a", "b", "c"):
+            self._visit(visitor, "NP")
+        self._visit("a", "NP", path="/library")  # same person, second page
+        self._visit("d", "IN")
+        self._visit("e", "US")
+
+        data = self._get(days=7)
+        self.assertEqual(data["scope"], "visitors")
+        self.assertEqual([(r["country_code"], r["visitors"]) for r in data["by_country"]], [("NP", 3), ("IN", 1), ("US", 1)])
+        self.assertEqual(self._row(data, "NP")["country"], "Nepal")
+        self.assertEqual(data["kpis"]["countries_reached"]["value"], 3)
+        top = data["kpis"]["top_country"]["value"]
+        self.assertEqual((top["country_code"], top["visitors"], top["share"]), ("NP", 3, 0.6))
+        self.assertEqual(data["kpis"]["outside_top_country_share"]["value"], 0.4)
+
+    def test_engagement_minutes_readers_and_completions_per_country(self):
+        for visitor in ("r1", "r2", "bounce"):
+            self._visit(visitor, "NP")
+        # r1: starts a story, reads 100 seconds (under the cap), finishes it
+        self._event(AnalyticsEvent.EVENT_STORY_STARTED, "r1", story=self.story, country_code="NP")
+        self._event(AnalyticsEvent.EVENT_READING_SESSION, "r1", story=self.story, duration_seconds=120, country_code="NP")
+        self._event(AnalyticsEvent.EVENT_STORY_COMPLETED, "server", user=self.member, story=self.story, metadata={"source": "chapters"})
+        # r2: a listen session only
+        self._event(AnalyticsEvent.EVENT_LISTENING_SESSION, "r2", story=self.story, duration_seconds=60, country_code="NP")
+
+        row = self._row(self._get(days=7), "NP")
+        self.assertEqual(row["visitors"], 3)
+        self.assertEqual(row["engaged_visitors"], 2)  # the bounce is neither engaged nor a multi-page visit
+        self.assertEqual(row["engaged_rate"], round(2 / 3, 4))
+        self.assertEqual(row["readers"], 1)
+        self.assertEqual(row["minutes"], 3.0)
+        self.assertEqual(row["top_story"]["title"], "Geo Story")
+        self.assertIn(row["top_format"], ("read", "listen"))
+        # the server-raised completion has no country, so it never reaches a row
+        self.assertEqual(row["completions"], 0)
+
+    def test_signed_in_users_and_completions_attach_through_the_user(self):
+        # A signed-in reader's browser events carry the country; the server's
+        # completion event is theirs through the user id.
+        self._visit("m", "IN", user=self.member)
+        self._event(AnalyticsEvent.EVENT_STORY_COMPLETED, "server", user=self.member, story=self.story)
+        row = self._row(self._get(days=7), "IN")
+        self.assertEqual(row["signed_in_users"], 1)
+        self.assertEqual(row["completions"], 1)
+
+    def test_staff_and_suspected_bots_are_excluded_and_bot_share_counts_bots(self):
+        self._visit("real1", "NP")
+        self._visit("real2", "NP")
+        self._visit("bot1", "NP", is_suspected_bot=True)
+        self._visit("bot2", "NP", is_suspected_bot=True)
+        self._visit("staff", "NP", user=self.staff)
+        self._visit("botland", "RU", is_suspected_bot=True)
+
+        data = self._get(days=7)
+        self.assertEqual([r["country_code"] for r in data["by_country"]], ["NP"])  # RU is all bot
+        nepal = self._row(data, "NP")
+        self.assertEqual(nepal["visitors"], 2)
+        # share is taken before bot exclusion: 2 of the 4 non-staff NP visits
+        self.assertEqual(nepal["bot_share"], 0.5)
+        self.assertEqual(data["kpis"]["bot_share"]["value"], round(3 / 5, 4))
+
+    def test_country_coverage_counts_browser_events_only(self):
+        for i in range(6):
+            self._visit(f"has{i}", "NP")
+        for i in range(2):
+            self._visit(f"none{i}", "")
+        # server-raised events never count against coverage
+        self._event(AnalyticsEvent.EVENT_STORY_COMPLETED, "server", user=self.member, story=self.story)
+        # staff events are excluded entirely
+        self._visit("staff", "", user=self.staff)
+
+        kpi = self._get(days=7)["kpis"]["country_coverage"]
+        self.assertEqual(kpi["value"], 0.75)
+        self.assertEqual(kpi["sample_size"], 8)
+
+    def test_previous_period_values(self):
+        for i in range(5):
+            self._visit(f"now{i}", "NP")
+        for i in range(2):
+            self._visit(f"old{i}", "NP", days_ago=10)
+        self._visit("oldin", "IN", days_ago=10)
+
+        data = self._get(days=7)
+        self.assertTrue(data["has_previous"])
+        self.assertEqual(self._row(data, "NP")["previous_visitors"], 2)
+        self.assertEqual(data["kpis"]["countries_reached"]["previous_value"], 2)
+        self.assertEqual(data["kpis"]["top_country"]["previous_value"]["visitors"], 2)
+        self.assertEqual(data["kpis"]["countries_reached"]["value"], 1)
+
+    def test_over_time_has_top_five_plus_other_and_every_bucket(self):
+        for index, code in enumerate(["NP", "IN", "US", "GB", "DE", "FR", "JP"]):
+            for n in range(7 - index):
+                self._visit(f"{code}{n}", code)
+        data = self._get(days=7)
+        self.assertEqual([s["key"] for s in data["series"]], ["NP", "IN", "US", "GB", "DE", "other"])
+        self.assertEqual(data["time_interval"], "day")
+        self.assertEqual(len(data["over_time"]), 8)
+        self.assertEqual(sum(row["other"] for row in data["over_time"]), 2 + 1)
+
+    def test_data_since_is_the_first_located_event(self):
+        self._visit("nolocation", "", days_ago=40)
+        self._visit("old", "NP", days_ago=20)
+        self._visit("new", "NP")
+        since = self._get(days=7)["data_since"]
+        self.assertIsNotNone(since)
+        self.assertLess(timezone.now() - since, timedelta(days=21))
+        self.assertGreater(timezone.now() - since, timedelta(days=19))
+
+    def test_cities_come_from_events_or_fall_back_to_signed_in_logins(self):
+        UserLoginLocation.objects.create(user=self.member, country="Nepal", country_code="NP", city="Pokhara")
+        self._visit("a", "NP")
+        data = self._get(days=7)
+        self.assertEqual(data["cities_source"], "signed_in_only")
+        self.assertEqual([c["city"] for c in data["cities"]], ["Pokhara"])
+
+        self._visit("b", "NP", city="Kathmandu", region="Bagmati")
+        self._visit("b", "NP", city="Kathmandu", region="Bagmati", path="/library")
+        self._visit("c", "IN", city="Delhi", region="Delhi")
+        cache.clear()
+        data = self._get(days=7)
+        self.assertEqual(data["cities_source"], "events")
+        self.assertEqual([(c["city"], c["visitors"]) for c in data["cities"]], [("Delhi", 1), ("Kathmandu", 1)])
+
+    def test_signed_in_scope_keeps_the_original_output(self):
+        UserLoginLocation.objects.create(user=self.member, country="Nepal", country_code="NP", city="Pokhara")
+        self._visit("anon", "IN")
+        data = self._get(days=7, scope="signed_in")
+        self.assertEqual(data["scope"], "signed_in")
+        for key in ("total_logins", "unresolved_logins", "countries_reached", "by_country", "by_city", "logins_over_time", "comparison"):
+            self.assertIn(key, data)
+        self.assertEqual([r["country_code"] for r in data["by_country"]], ["NP"])
+        self.assertEqual(data["by_country"][0]["logins"], 1)
+
+    # --- country detail ---------------------------------------------------------
+
+    def test_country_detail_requires_a_superuser(self):
+        url = reverse("admin-analytics-geography-country", args=["NP"])
+        self.client.force_authenticate(None)
+        self.assertEqual(self.client.get(url).status_code, 401)
+        self.client.force_authenticate(self.member)
+        self.assertEqual(self.client.get(url).status_code, 403)
+        self.client.force_authenticate(self.admin)
+        self.assertEqual(self.client.get(reverse("admin-analytics-geography-country", args=["nope"])).status_code, 404)
+
+    def test_country_detail_contents(self):
+        self._visit("a", "NP", path=f"/story/{self.story.slug}", source="facebook", ua_family="chrome_mobile")
+        self._visit("b", "NP", path="/", source="google", ua_family="chrome_desktop")
+        self._visit("z", "IN", path="/library", source="twitter")
+        self._event(AnalyticsEvent.EVENT_STORY_STARTED, "a", story=self.story, country_code="NP")
+        self._event(AnalyticsEvent.EVENT_READING_SESSION, "a", story=self.story, duration_seconds=60, country_code="NP")
+
+        response = self.client.get(reverse("admin-analytics-geography-country", args=["np"]), {"days": 7})
+        self.assertEqual(response.status_code, 200)
+        data = response.data
+        self.assertEqual((data["country_code"], data["country"], data["visitors"]), ("NP", "Nepal", 2))
+        self.assertEqual(data["top_stories"][0]["title"], "Geo Story")
+        self.assertEqual(data["top_stories"][0]["readers"], 1)
+        self.assertEqual(data["top_stories"][0]["minutes"], 1.0)
+        titles = {row["title"] for row in data["landing_pages"]}
+        self.assertEqual(titles, {"Geo Story", "Home"})  # resolved, India's /library not included
+        self.assertEqual({r["referral_source"] for r in data["referral_sources"]}, {"facebook", "google"})
+        self.assertEqual({d["ua_family"] for d in data["devices"]}, {"chrome_mobile", "chrome_desktop"})
+        self.assertEqual(data["languages"][0]["language"], "en")
+
+
+class CityRegionCaptureTests(APITestCase):
+    """City and region come from Cloudflare headers only — nothing is looked up."""
+
+    def setUp(self):
+        cache.clear()
+        self.client = APIClient(HTTP_USER_AGENT=BROWSER_USER_AGENT)
+
+    def _post(self, **headers):
+        event_id = str(uuid4())
+        response = self.client.post(
+            reverse("analytics-events"),
+            {"event_id": event_id, "event_type": "visit", "visitor_id": "city-visitor", "metadata": {"path": "/"}},
+            format="json", **headers,
+        )
+        self.assertEqual(response.status_code, 201, response.content)
+        return AnalyticsEvent.objects.get(event_id=event_id)
+
+    def test_city_and_region_are_captured_from_headers(self):
+        event = self._post(HTTP_CF_IPCOUNTRY="NP", HTTP_CF_IPCITY="  Kathmandu ", HTTP_CF_REGION="Bagmati")
+        self.assertEqual((event.country_code, event.city, event.region), ("NP", "Kathmandu", "Bagmati"))
+
+    def test_non_ascii_names_survive_the_latin1_header_round_trip(self):
+        event = self._post(HTTP_CF_IPCITY="Zürich".encode("utf-8").decode("latin-1"))
+        self.assertEqual(event.city, "Zürich")
+
+    def test_city_and_region_are_blank_when_absent_or_unknown(self):
+        self.assertEqual((self._post().city, self._post().region), ("", ""))
+        event = self._post(HTTP_CF_IPCITY="Unknown", HTTP_CF_REGION="XX")
+        self.assertEqual((event.city, event.region), ("", ""))
+
+    def test_overlong_names_are_capped(self):
+        self.assertEqual(len(self._post(HTTP_CF_IPCITY="x" * 200).city), 64)
