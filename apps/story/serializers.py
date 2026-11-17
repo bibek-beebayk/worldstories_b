@@ -2425,6 +2425,10 @@ class HomeSectionAdminSerializer(serializers.ModelSerializer):
             HomeSection.CONTENT_TYPES | {HomeSection.TYPE_BANNER, HomeSection.TYPE_NEW_ENTRIES}
         ) and not (title or "").strip():
             raise serializers.ValidationError({"title": "A title is required for this section type."})
+        starts_at = attrs.get("starts_at", self.instance.starts_at if self.instance else None)
+        ends_at = attrs.get("ends_at", self.instance.ends_at if self.instance else None)
+        if starts_at and ends_at and ends_at <= starts_at:
+            raise serializers.ValidationError({"ends_at": "The end must be after the start."})
         return attrs
 
     class Meta:
@@ -2433,6 +2437,7 @@ class HomeSectionAdminSerializer(serializers.ModelSerializer):
             "id", "title", "subtitle", "section_type", "variant", "position", "is_enabled", "icon",
             "layout", "columns_mobile", "columns_desktop", "card_style", "item_limit", "allow_repeats",
             "show_see_all", "see_all_label", "see_all_url", "config", "stories_detail", "updated_at",
+            "show_to", "starts_at", "ends_at",
         ]
         read_only_fields = ["updated_at"]
         extra_kwargs = {"position": {"required": False}}

@@ -309,6 +309,9 @@ class AnalyticsEvent(models.Model):
     EVENT_DAILY_STORY_VIEWED = "daily_story_viewed"
     EVENT_DAILY_STORY_STARTED = "daily_story_started"
     EVENT_DAILY_STORY_COMPLETED = "daily_story_completed"
+    # A click on an item inside a homepage section; metadata carries section_id,
+    # section_type, position and the clicked item's id/type.
+    EVENT_HOME_SECTION_CLICK = "home_section_click"
     EVENT_CHOICES = [
         (EVENT_VISIT, "Visit"),
         (EVENT_AD_IMPRESSION, "Ad impression"),
@@ -338,6 +341,7 @@ class AnalyticsEvent(models.Model):
         (EVENT_DAILY_STORY_VIEWED, "Daily Story viewed"),
         (EVENT_DAILY_STORY_STARTED, "Daily Story started"),
         (EVENT_DAILY_STORY_COMPLETED, "Daily Story completed"),
+        (EVENT_HOME_SECTION_CLICK, "Homepage section click"),
     ]
 
     # visitor_id for an event the server raises itself rather than receiving

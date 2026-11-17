@@ -39,6 +39,7 @@ from apps.users.recommendations import (
     recommend_because_finished,
     recommend_stories_for,
 )
+from .home_metrics import get_home_stats
 from .home_sections import resolve_home_sections
 from .models import (
     HomeSection,
@@ -2305,6 +2306,27 @@ class HomeSectionAdminViewSet(ModelViewSet):
         return Response(self.get_serializer(copy).data, status=status.HTTP_201_CREATED)
 
     @action(detail=False, methods=["get"])
+    def analytics(self, request):
+        """Clicks and click-through per section for the last 7 and 30 days."""
+        from .home_metrics import section_click_stats
+
+        return Response(section_click_stats())
+
+    @action(detail=False, methods=["get"], url_path="missing-covers")
+    def missing_covers(self, request):
+        """Published stories with neither cover image nor cover URL — they
+        render the placeholder tile, and are skipped by sections that turn on
+        "only stories with a cover"."""
+        from .home_sections import missing_cover_q
+
+        stories = Story.objects.published().filter(missing_cover_q()).order_by("-views", "title")
+        rows = [
+            {"id": s.pk, "title": s.title, "slug": s.slug, "views": s.views}
+            for s in stories.only("id", "title", "slug", "views")
+        ]
+        return Response({"total": len(rows), "results": rows})
+
+    @action(detail=False, methods=["get"])
     def types(self, request):
         """Static description of the section types and choice lists the admin
         form is built from."""
@@ -2320,6 +2342,7 @@ class HomeSectionAdminViewSet(ModelViewSet):
                 "variants": [{"value": v, "label": l} for v, l in HomeSection.VARIANT_CHOICES],
                 "layouts": [{"value": v, "label": l} for v, l in HomeSection.LAYOUT_CHOICES],
                 "card_styles": [{"value": v, "label": l} for v, l in HomeSection.CARD_STYLE_CHOICES],
+                "show_to": [{"value": v, "label": l} for v, l in HomeSection.SHOW_TO_CHOICES],
                 "sorts": list(STORY_SORTS),
                 "banner_themes": BANNER_THEMES,
                 "ad_sizes": AD_SIZES,
@@ -2751,14 +2774,9 @@ class HomeDataAPIView(APIView):
             .order_by("-site_published_date", "-id")[:12]
         )
 
-        readers_count = (
-            Story.objects.published().aggregate(total_readers=Sum("views")).get("total_readers") or 0
-        )
-        stats = {
-            "creators": Author.objects.count(),
-            "stories": Story.objects.published().count(),
-            "readers": readers_count,
-        }
+        # Cached for an hour (see home_metrics); includes the legacy
+        # creators/readers keys for templates and clients that still read them.
+        stats = get_home_stats()
 
         return Response(
             {

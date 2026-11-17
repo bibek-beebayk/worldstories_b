@@ -6453,3 +6453,261 @@ class FeaturedVideoTests(APITestCase):
         both = self.client.put("/api/admin/stories/daily/", {"date": today}, format="json")
         # no target in the payload keeps the existing one, so still valid
         self.assertEqual(both.status_code, 200)
+
+
+class HomepageImprovementsTests(APITestCase):
+    """Honest hero stats, trending sort, audience/schedule gating, require_cover,
+    click tracking and the recommended-layout seed."""
+
+    UA = {"HTTP_USER_AGENT": "Mozilla/5.0 Chrome"}
+
+    def setUp(self):
+        from apps.story.models import HomeSection
+
+        cache.clear()
+        self.HomeSection = HomeSection
+        HomeSection.objects.all().delete()
+        HeroTemplate.objects.all().delete()
+        self.now = timezone.now()
+        self.admin = User.objects.create(
+            email="hpadmin@example.com", username="hpadmin", is_superuser=True, is_staff=True, is_active=True
+        )
+        self.reader = User.objects.create(email="hpreader@example.com", username="hpreader", is_active=True)
+
+    def _story(self, n, **extra):
+        return Story.objects.create(
+            title=f"HP Story {n}", slug=f"hp-story-{n}", is_published=True, cover_image="https://example.com/c.jpg", **extra
+        )
+
+    def _event(self, story, visitor, days_ago=1, event_type=None, **extra):
+        event = AnalyticsEvent.objects.create(
+            event_type=event_type or AnalyticsEvent.EVENT_READING_SESSION,
+            visitor_id=visitor, story=story, **extra,
+        )
+        AnalyticsEvent.objects.filter(pk=event.pk).update(created_at=self.now - timedelta(days=days_ago))
+        return event
+
+    def _home(self, **headers):
+        cache.clear()
+        return self.client.get("/api/home/", **{**self.UA, **headers}).json()
+
+    def _sections(self, **headers):
+        return self._home(**headers)["sections"]
+
+    # -- hero stats ---------------------------------------------------------
+
+    def test_hero_stats_are_honest_and_cached(self):
+        a = self._story(1, country="NP", language="en", views=500)
+        b = self._story(2, country="IN", language="ne", views=500)
+        self._story(3, country="NP", language="en")
+        self._event(a, "v1")
+        self._event(a, "v1", days_ago=2)  # same person twice
+        self._event(b, "v2")
+        self._event(b, "v-old", days_ago=40)  # outside 30 days
+        self._event(b, "v-bot", is_suspected_bot=True)
+        self._event(b, "v-staff", user=self.admin)
+        stats = self._home()["sidebar"]["stats"]
+        self.assertEqual(stats["readers_30d"], 2)
+        self.assertEqual(stats["countries"], 2)
+        self.assertEqual(stats["languages"], 2)
+        self.assertEqual(stats["stories"], 3)
+        self.assertEqual(stats["readers"], 1000)  # legacy key still lifetime views
+
+        self._event(b, "v3")
+        from apps.story.home_metrics import HOME_STATS_CACHE_KEY, get_home_stats
+
+        self.assertIsNotNone(cache.get(HOME_STATS_CACHE_KEY))
+        self.assertEqual(get_home_stats()["readers_30d"], 2)  # served from cache
+        cache.clear()
+        self.assertEqual(get_home_stats()["readers_30d"], 3)
+
+    def test_hero_resolves_new_stat_sources(self):
+        a = self._story(1, country="NP", language="en")
+        self._event(a, "v1")
+        HeroTemplate.objects.create(
+            name="Honest", is_default=True,
+            stat_1_source="readers_30d", stat_1_label="readers this month",
+            stat_2_source="countries", stat_2_label="countries",
+            stat_3_source="languages", stat_3_label="languages",
+        )
+        hero = self._home()["hero"]
+        self.assertEqual([s["value"] for s in hero["stats"]], [1, 1, 1])
+
+    # -- trending -----------------------------------------------------------
+
+    def _trending_section(self, **config):
+        return self.HomeSection.objects.create(
+            section_type="stories_query", title="Trending", position=0, item_limit=10,
+            allow_repeats=True, config={"sort": "trending", **config},
+        )
+
+    def test_trending_ranks_by_recent_unique_audience_readers_only(self):
+        stories = [self._story(n) for n in range(6)]
+        # story 0 has many OLD events; stories 1..5 have recent readers, 5 the most.
+        for i in range(10):
+            self._event(stories[0], f"old{i}", days_ago=20)
+        for n in range(1, 6):
+            for i in range(n):
+                self._event(stories[n], f"r{n}-{i}", days_ago=2)
+        self._event(stories[1], "bot", is_suspected_bot=True)
+        self._event(stories[1], "staff", user=self.admin)
+        self._trending_section()
+        items = self._sections()[0]["items"]
+        self.assertEqual([i["title"] for i in items], [f"HP Story {n}" for n in (5, 4, 3, 2, 1)])
+
+    def test_trending_falls_back_to_30_days_when_few_stories_qualify(self):
+        a, b = self._story(1), self._story(2)
+        self._event(a, "x", days_ago=15)
+        self._event(b, "y1", days_ago=20)
+        self._event(b, "y2", days_ago=20)
+        self._trending_section()
+        titles = [i["title"] for i in self._sections()[0]["items"]]
+        self.assertEqual(titles, ["HP Story 2", "HP Story 1"])
+
+    def test_trending_ids_are_cached(self):
+        from apps.story.home_metrics import TRENDING_CACHE_KEY, trending_story_ids
+
+        a = self._story(1)
+        self._event(a, "x")
+        self.assertEqual(trending_story_ids(), [a.pk])
+        self.assertEqual(cache.get(TRENDING_CACHE_KEY), [a.pk])
+        self._event(self._story(2), "y")
+        self.assertEqual(trending_story_ids(), [a.pk])
+
+    def test_trending_is_an_admin_sort_option(self):
+        self.client.force_authenticate(self.admin)
+        sorts = self.client.get("/api/admin/home-sections/types/").json()["sorts"]
+        self.assertIn("trending", sorts)
+        r = self.client.post(
+            "/api/admin/home-sections/",
+            {"section_type": "stories_query", "title": "T", "layout": "trending", "config": {"sort": "trending"}},
+            format="json",
+        )
+        self.assertEqual(r.status_code, 201, r.content)
+
+    # -- audience and schedule ----------------------------------------------
+
+    def test_show_to_filters_by_sign_in_state(self):
+        self._story(1)
+        for position, show_to in enumerate(["all", "signed_in", "signed_out"]):
+            self.HomeSection.objects.create(
+                section_type="stories_query", title=show_to, position=position, show_to=show_to
+            )
+        self.assertEqual([s["title"] for s in self._sections()], ["all", "signed_out"])
+        self.client.force_authenticate(self.reader)
+        self.assertEqual([s["title"] for s in self._sections()], ["all", "signed_in"])
+
+    def test_schedule_window_is_respected(self):
+        self._story(1)
+
+        def mk(title, pos, **kw):
+            return self.HomeSection.objects.create(section_type="stories_query", title=title, position=pos, **kw)
+
+        mk("live", 0, starts_at=self.now - timedelta(days=1), ends_at=self.now + timedelta(days=1))
+        mk("future", 1, starts_at=self.now + timedelta(hours=1))
+        mk("expired", 2, ends_at=self.now - timedelta(minutes=1))
+        mk("open", 3)
+        self.assertEqual([s["title"] for s in self._sections()], ["live", "open"])
+
+    def test_admin_rejects_schedule_ending_before_it_starts(self):
+        self.client.force_authenticate(self.admin)
+        r = self.client.post(
+            "/api/admin/home-sections/",
+            {
+                "section_type": "explore_tiles", "title": "x",
+                "starts_at": (self.now + timedelta(days=2)).isoformat(),
+                "ends_at": (self.now + timedelta(days=1)).isoformat(),
+            },
+            format="json",
+        )
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("ends_at", r.json())
+
+    def test_explore_tiles_is_a_served_widget_section(self):
+        self.HomeSection.objects.create(section_type="explore_tiles", title="Explore", position=0)
+        self.assertEqual([s["section_type"] for s in self._sections()], ["explore_tiles"])
+
+    # -- require_cover ------------------------------------------------------
+
+    def test_require_cover_excludes_stories_without_any_cover(self):
+        with_url = self._story(1)
+        no_cover = Story.objects.create(title="No cover", slug="no-cover", is_published=True)
+        section = self.HomeSection.objects.create(
+            section_type="stories_query", title="Covers", position=0, config={"sort": "newest"}
+        )
+        self.assertEqual(len(self._sections()[0]["items"]), 2)
+        section.config = {"sort": "newest", "require_cover": True}
+        section.save()
+        titles = [i["title"] for i in self._sections()[0]["items"]]
+        self.assertEqual(titles, [with_url.title])
+
+        self.client.force_authenticate(self.admin)
+        rows = self.client.get("/api/admin/home-sections/missing-covers/").json()
+        self.assertEqual(rows["total"], 1)
+        self.assertEqual(rows["results"][0]["id"], no_cover.pk)
+
+    # -- click tracking -----------------------------------------------------
+
+    def test_ingest_accepts_home_section_click(self):
+        from uuid import uuid4
+
+        r = self.client.post(
+            reverse("analytics-events"),
+            {
+                "event_id": str(uuid4()), "event_type": "home_section_click", "visitor_id": "vis",
+                "metadata": {"section_id": 7, "section_type": "stories_query", "position": 2, "item_id": 5, "item_type": "story"},
+            },
+            format="json", **self.UA,
+        )
+        self.assertEqual(r.status_code, 201, r.content)
+        self.assertEqual(AnalyticsEvent.objects.get(event_type="home_section_click").metadata["section_id"], 7)
+
+    def test_admin_click_stats_are_audience_filtered_and_windowed(self):
+        section = self.HomeSection.objects.create(section_type="stories_query", title="S", position=0)
+
+        def click(visitor, days_ago, **kw):
+            e = AnalyticsEvent.objects.create(
+                event_type="home_section_click", visitor_id=visitor, metadata={"section_id": section.pk}, **kw
+            )
+            AnalyticsEvent.objects.filter(pk=e.pk).update(created_at=self.now - timedelta(days=days_ago))
+
+        def visit(visitor, days_ago, path="/"):
+            e = AnalyticsEvent.objects.create(event_type="visit", visitor_id=visitor, metadata={"path": path})
+            AnalyticsEvent.objects.filter(pk=e.pk).update(created_at=self.now - timedelta(days=days_ago))
+
+        for i in range(4):
+            visit(f"h{i}", 1)
+        visit("h-old", 20)
+        visit("elsewhere", 1, path="/library")
+        click("a", 1)
+        click("b", 3)
+        click("c", 20)
+        click("bot", 1, is_suspected_bot=True)
+        click("staff", 1, user=self.admin)
+
+        self.client.force_authenticate(self.admin)
+        data = self.client.get("/api/admin/home-sections/analytics/").json()
+        self.assertEqual(data["visits"], {"7": 4, "30": 5})
+        entry = data["sections"][str(section.pk)]
+        self.assertEqual(entry["7"]["clicks"], 2)
+        self.assertEqual(entry["7"]["click_through"], 0.5)
+        self.assertEqual(entry["30"]["clicks"], 3)
+
+    # -- seeding ------------------------------------------------------------
+
+    def test_seed_creates_layout_only_when_no_sections_exist(self):
+        from django.core.management import call_command
+
+        call_command("seed_home_sections", stdout=io.StringIO())
+        count = self.HomeSection.objects.count()
+        self.assertGreater(count, 5)
+        types = list(self.HomeSection.objects.values_list("section_type", flat=True))
+        self.assertIn("explore_tiles", types)
+        self.assertNotIn("journeys_banner", types)
+
+        mine = self.HomeSection.objects.first()
+        mine.title = "Custom"
+        mine.save()
+        call_command("seed_home_sections", stdout=io.StringIO())
+        self.assertEqual(self.HomeSection.objects.count(), count)
+        self.assertEqual(self.HomeSection.objects.get(pk=mine.pk).title, "Custom")

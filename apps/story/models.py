@@ -792,11 +792,22 @@ class HeroTemplate(TimeStampModel):
     STAT_STORIES = "stories"
     STAT_CREATORS = "creators"
     STAT_READERS = "readers"
+    STAT_READERS_30D = "readers_30d"
+    STAT_COUNTRIES = "countries"
+    STAT_LANGUAGES = "languages"
+    STAT_AUDIO_HOURS = "audio_hours"
     STAT_CUSTOM = "custom"
     STAT_SOURCE_CHOICES = [
         (STAT_STORIES, "Live: published stories"),
-        (STAT_CREATORS, "Live: creators"),
-        (STAT_READERS, "Live: readers"),
+        (STAT_READERS_30D, "Live: readers in the last 30 days"),
+        (STAT_COUNTRIES, "Live: countries covered"),
+        (STAT_LANGUAGES, "Live: languages"),
+        (STAT_AUDIO_HOURS, "Live: hours of audiobooks"),
+        # Kept so existing templates keep resolving. Neither is a reader or
+        # creator count in the everyday sense: "readers" is lifetime story
+        # views, "creators" is every Author row.
+        (STAT_CREATORS, "Live: authors (legacy)"),
+        (STAT_READERS, "Live: lifetime story views (legacy)"),
         (STAT_CUSTOM, "Custom value"),
     ]
 
@@ -857,14 +868,14 @@ class HeroTemplate(TimeStampModel):
     info_line_2_text = models.CharField(max_length=120, blank=True)
 
     # A blank label hides that stat.
-    stat_1_source = models.CharField(max_length=10, choices=STAT_SOURCE_CHOICES, default=STAT_STORIES)
+    stat_1_source = models.CharField(max_length=16, choices=STAT_SOURCE_CHOICES, default=STAT_STORIES)
     stat_1_label = models.CharField(max_length=40, blank=True, default="stories")
     stat_1_value = models.CharField(max_length=20, blank=True)
-    stat_2_source = models.CharField(max_length=10, choices=STAT_SOURCE_CHOICES, default=STAT_CREATORS)
-    stat_2_label = models.CharField(max_length=40, blank=True, default="creators")
+    stat_2_source = models.CharField(max_length=16, choices=STAT_SOURCE_CHOICES, default=STAT_COUNTRIES)
+    stat_2_label = models.CharField(max_length=40, blank=True, default="countries")
     stat_2_value = models.CharField(max_length=20, blank=True)
-    stat_3_source = models.CharField(max_length=10, choices=STAT_SOURCE_CHOICES, default=STAT_READERS)
-    stat_3_label = models.CharField(max_length=40, blank=True, default="readers")
+    stat_3_source = models.CharField(max_length=16, choices=STAT_SOURCE_CHOICES, default=STAT_READERS_30D)
+    stat_3_label = models.CharField(max_length=40, blank=True, default="readers this month")
     stat_3_value = models.CharField(max_length=20, blank=True)
 
     cta_label = models.CharField(max_length=40, default="Start Reading")
@@ -1654,6 +1665,7 @@ class HomeSection(TimeStampModel):
     TYPE_READING_JOURNEY = "reading_journey"
     TYPE_RECOMMENDED = "recommended"
     TYPE_JOURNEYS_BANNER = "journeys_banner"
+    TYPE_EXPLORE_TILES = "explore_tiles"
     TYPE_CHOICES = [
         (TYPE_STORIES_QUERY, "Stories — by rules (sort + filters)"),
         (TYPE_STORIES_MANUAL, "Stories — hand-picked"),
@@ -1666,6 +1678,7 @@ class HomeSection(TimeStampModel):
         (TYPE_READING_JOURNEY, "Reading journey card (signed-in)"),
         (TYPE_RECOMMENDED, "Recommended for you (signed-in)"),
         (TYPE_JOURNEYS_BANNER, "Story journeys banner"),
+        (TYPE_EXPLORE_TILES, "Explore tiles (journeys, map, surprise me, mood)"),
     ]
     CONTENT_TYPES = {TYPE_STORIES_QUERY, TYPE_STORIES_MANUAL, TYPE_VIDEOS, TYPE_BLOGS}
 
@@ -1680,7 +1693,12 @@ class HomeSection(TimeStampModel):
 
     LAYOUT_GRID = "grid"
     LAYOUT_RAIL = "rail"
-    LAYOUT_CHOICES = [(LAYOUT_GRID, "Grid"), (LAYOUT_RAIL, "Scrolling rail")]
+    LAYOUT_TRENDING = "trending"
+    LAYOUT_CHOICES = [
+        (LAYOUT_GRID, "Grid"),
+        (LAYOUT_RAIL, "Scrolling rail"),
+        (LAYOUT_TRENDING, "Ranked list (best with the Trending sort)"),
+    ]
 
     CARD_DEFAULT = "default"
     CARD_COMPACT = "compact"
@@ -1716,6 +1734,19 @@ class HomeSection(TimeStampModel):
 
     # Type-specific settings, validated per type by HomeSectionAdminSerializer.
     config = models.JSONField(default=dict, blank=True)
+
+    SHOW_TO_ALL = "all"
+    SHOW_TO_SIGNED_IN = "signed_in"
+    SHOW_TO_SIGNED_OUT = "signed_out"
+    SHOW_TO_CHOICES = [
+        (SHOW_TO_ALL, "Everyone"),
+        (SHOW_TO_SIGNED_IN, "Signed-in readers only"),
+        (SHOW_TO_SIGNED_OUT, "Signed-out visitors only"),
+    ]
+    show_to = models.CharField(max_length=10, choices=SHOW_TO_CHOICES, default=SHOW_TO_ALL)
+    # Optional schedule window (both ends optional, ends exclusive).
+    starts_at = models.DateTimeField(null=True, blank=True)
+    ends_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         ordering = ["position", "id"]

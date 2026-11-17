@@ -8,7 +8,8 @@ sections carry only their presentation settings.
 
 from urllib.parse import urlencode
 
-from django.db.models import Q
+from django.db.models import Case, IntegerField, Q, When
+from django.utils import timezone
 
 from .filters import public_story_mood_q
 from .models import (
@@ -33,7 +34,12 @@ STORY_SORTS = {
     "recently_added": ("-id",),
     "popular": ("-views", "-rating", "-id"),
     "top_rated": ("-rating", "-views", "-id"),
+    # Not a column ordering: ranked by unique recent audience readers (see
+    # home_metrics.trending_story_ids). The tuple is only the tie-break
+    # fallback and what a non-special-cased caller would get.
+    "trending": ("-id",),
 }
+TRENDING_SORT = "trending"
 BANNER_THEMES = ["ocean", "violet", "rose", "amber", "emerald"]
 AD_SIZES = ["banner", "square", "rectangle"]
 
@@ -51,6 +57,7 @@ TYPE_META = {
     HomeSection.TYPE_READING_JOURNEY: {"content": False, "fields": []},
     HomeSection.TYPE_RECOMMENDED: {"content": False, "fields": ["see_all", "icon"]},
     HomeSection.TYPE_JOURNEYS_BANNER: {"content": False, "fields": []},
+    HomeSection.TYPE_EXPLORE_TILES: {"content": False, "fields": []},
 }
 
 
@@ -112,6 +119,7 @@ def clean_config(section_type, config):
             "has_audio": bool(config.get("has_audio")),
             "has_video": bool(config.get("has_video")),
             "has_read_along": bool(config.get("has_read_along")),
+            "require_cover": bool(config.get("require_cover")),
         }
     if section_type == HomeSection.TYPE_STORIES_MANUAL:
         return {"story_ids": _int_list(config.get("story_ids"), "story_ids", max_len=48)}
@@ -179,9 +187,26 @@ def story_queryset(section):
         qs = qs.filter(
             pk__in=Audio.objects.exclude(transcript="").exclude(audio_file="").values("story_id")
         )
+    if config.get("require_cover"):
+        # A story with neither cover would render the placeholder tile.
+        qs = qs.exclude(missing_cover_q())
     if config.get("original_only"):
         qs = with_preferred_translation_only(qs.filter(is_original=True))
+    if config.get("sort") == TRENDING_SORT:
+        from .home_metrics import trending_story_ids
+
+        ids = trending_story_ids()
+        rank = Case(*[When(pk=story_id, then=position) for position, story_id in enumerate(ids)], default=len(ids), output_field=IntegerField())
+        return qs.filter(pk__in=ids).order_by(rank, "-id")
     return qs.order_by(*STORY_SORTS.get(config.get("sort"), STORY_SORTS["newest"]))
+
+
+def missing_cover_q():
+    """Stories with neither an uploaded cover nor a cover URL — the same
+    definition the Analytics "catalogue gaps" use for `no_cover`."""
+    return (Q(cover_image_file__isnull=True) | Q(cover_image_file="")) & (
+        Q(cover_image__isnull=True) | Q(cover_image="")
+    )
 
 
 def video_queryset(section):
@@ -231,13 +256,31 @@ def _blog_cards(blogs, request):
     return BlogCardSerializer(blogs, many=True, context={"request": request}).data
 
 
+def section_is_visible(section, *, signed_in, now):
+    """Audience + schedule gate for one section. `ends_at` is exclusive."""
+    if section.show_to == HomeSection.SHOW_TO_SIGNED_IN and not signed_in:
+        return False
+    if section.show_to == HomeSection.SHOW_TO_SIGNED_OUT and signed_in:
+        return False
+    if section.starts_at and section.starts_at > now:
+        return False
+    if section.ends_at and section.ends_at <= now:
+        return False
+    return True
+
+
 def resolve_home_sections(request):
     # Imported here: serializers import models, and this module is imported by api.
     from .serializers import PublicVideoSerializer, StoryListSerializer
 
     context = {"request": request}
     resolved = []
+    now = timezone.now()
+    user = getattr(request, "user", None)
+    signed_in = bool(user and user.is_authenticated)
     for section in HomeSection.objects.filter(is_enabled=True).order_by("position", "id"):
+        if not section_is_visible(section, signed_in=signed_in, now=now):
+            continue
         kind = section.section_type
         items = []
         if kind == HomeSection.TYPE_STORIES_QUERY or kind == HomeSection.TYPE_STORIES_MANUAL:
