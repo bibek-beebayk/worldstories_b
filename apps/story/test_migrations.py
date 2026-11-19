@@ -265,3 +265,37 @@ class StoryFeaturedRankMigrationTests(TransactionTestCase):
         Story = self.apps.get_model("story", "Story")
         story = Story.objects.get(pk=self.story_id)
         self.assertIsNone(story.featured_rank)
+
+
+class VideoSeriesMigrationTests(TransactionTestCase):
+    serialized_rollback = True
+    migrate_from = ("story", "0097_seed_blog_topics_and_reading_times")
+    migrate_to = ("story", "0098_video_series_and_display_title")
+
+    def setUp(self):
+        super().setUp()
+        executor = MigrationExecutor(connection)
+        executor.migrate([self.migrate_from])
+        old_apps = executor.loader.project_state([self.migrate_from]).apps
+        Video = old_apps.get_model("story", "Video")
+        VideoType = old_apps.get_model("story", "VideoType")
+        summary = VideoType.objects.create(name="Book Summary")
+        audiobook = VideoType.objects.create(name="Audiobook")
+        self.short_id = Video.objects.create(title="Short title | SEO suffix", youtube_id="short000001", youtube_url="https://youtu.be/short000001", aspect_ratio="9:16").pk
+        self.summary_id = Video.objects.create(title="Classic", youtube_id="summary0001", youtube_url="https://youtu.be/summary0001", video_type=summary).pk
+        self.audio_id = Video.objects.create(title="Audio", youtube_id="audio000001", youtube_url="https://youtu.be/audio000001", video_type=audiobook).pk
+        executor = MigrationExecutor(connection)
+        executor.migrate([self.migrate_to])
+        self.apps = executor.loader.project_state([self.migrate_to]).apps
+
+    def tearDown(self):
+        executor = MigrationExecutor(connection)
+        executor.migrate(executor.loader.graph.leaf_nodes())
+        super().tearDown()
+
+    def test_backfills_display_title_and_assigns_series(self):
+        Video = self.apps.get_model("story", "Video")
+        self.assertEqual(Video.objects.get(pk=self.short_id).display_title, "Short title")
+        self.assertEqual(Video.objects.get(pk=self.short_id).series.slug, "under-2-minute-stories")
+        self.assertEqual(Video.objects.get(pk=self.summary_id).series.slug, "4-minute-illustrated-classics")
+        self.assertEqual(Video.objects.get(pk=self.audio_id).series.slug, "full-audiobooks-read-alongs")

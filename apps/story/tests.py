@@ -23,7 +23,7 @@ import anthropic
 import openpyxl
 from pydantic import ValidationError as PydanticValidationError
 
-from apps.stats.models import AnalyticsEvent, StoryCompletion
+from apps.stats.models import AnalyticsEvent, StoryCompletion, VideoWatchProgress
 from apps.story.api import StoryMapAPIView, StoryViewSet, open_s3_audio_stream
 from apps.story.models import HeroTemplate, Mood, StoryJourney, StoryMood, StoryReaction
 from apps.story.ai_generation import GenerationError, _GenerationOutput, _to_plain_text, generate
@@ -58,6 +58,7 @@ from apps.story.models import (
     Audio,
     AudioTranscriptCue,
     Video,
+    VideoSeries,
     Author,
     Blog,
     BookFetchJob,
@@ -3517,6 +3518,88 @@ class VideoAdminApiTests(APITestCase):
 
         self.assertEqual(response.status_code, 204)
         self.assertFalse(Video.objects.filter(pk=video.pk).exists())
+
+
+class WatchCatalogueApiTests(APITestCase):
+    def setUp(self):
+        cache.clear()
+        self.wide = VideoSeries.objects.create(name="Wide", slug="wide-test", order=1, layout="wide")
+        self.tall = VideoSeries.objects.create(name="Tall", slug="tall-test", order=2, layout="tall")
+        self.story = Story.objects.create(title="Shared Story", slug="shared-story", is_published=True)
+
+    def video(self, title, duration, series=None, story=None, order=1, **kwargs):
+        return Video.objects.create(
+            title=title,
+            display_title=kwargs.pop("display_title", title),
+            slug=kwargs.pop("slug", title.lower().replace(" ", "-")),
+            youtube_id=kwargs.pop("youtube_id", f"id{Video.objects.count():09d}"),
+            youtube_url="https://youtu.be/dQw4w9WgXcQ",
+            duration_seconds=duration,
+            series=series or self.wide,
+            story=story,
+            order=order,
+            **kwargs,
+        )
+
+    def ids(self, response):
+        return [row["id"] for row in response.data["results"]]
+
+    def test_series_length_search_and_duration_null_behaviour(self):
+        short = self.video("Short", 299, self.tall)
+        mid = self.video("Needle Display", 300, self.wide, display_title="Needle Display")
+        long = self.video("Long", 1200, self.wide)
+        unknown = self.video("Unknown", None, self.wide)
+
+        self.assertEqual(self.ids(self.client.get("/api/videos/", {"series": self.tall.slug})), [short.id])
+        self.assertEqual(self.ids(self.client.get("/api/videos/", {"length": "short"})), [short.id])
+        self.assertEqual(self.ids(self.client.get("/api/videos/", {"length": "mid"})), [mid.id])
+        self.assertEqual(self.ids(self.client.get("/api/videos/", {"length": "long"})), [long.id])
+        self.assertIn(unknown.id, self.ids(self.client.get("/api/videos/")))
+        self.assertEqual(self.ids(self.client.get("/api/videos/", {"q": "needle"})), [mid.id])
+
+    def test_shortest_and_longest_sort(self):
+        short = self.video("Short", 60)
+        long = self.video("Long", 600)
+        self.video("Unknown", None)
+        self.assertEqual(self.ids(self.client.get("/api/videos/", {"sort": "shortest"})), [short.id, long.id])
+        self.assertEqual(self.ids(self.client.get("/api/videos/", {"sort": "longest"})), [long.id, short.id])
+
+    def test_most_watched_uses_audience_events_and_excludes_staff_and_bots(self):
+        popular = self.video("Popular", 60)
+        noise = self.video("Noise", 60)
+        staff = User.objects.create(email="staff-watch@example.com", username="staff-watch", is_staff=True)
+        AnalyticsEvent.objects.create(event_type="watching_session", visitor_id="real-1", video=popular)
+        AnalyticsEvent.objects.create(event_type="watching_session", visitor_id="real-2", video=popular)
+        AnalyticsEvent.objects.create(event_type="watching_session", visitor_id="bot", video=noise, is_suspected_bot=True)
+        AnalyticsEvent.objects.create(event_type="watching_session", visitor_id="staff", video=noise, user=staff)
+        self.assertEqual(self.ids(self.client.get("/api/videos/", {"sort": "most_watched"}))[:2], [popular.id, noise.id])
+
+    def test_other_versions_excludes_the_video_itself(self):
+        first = self.video("First", 60, story=self.story, order=1)
+        second = self.video("Second", 120, story=self.story, order=2)
+        response = self.client.get(f"/api/videos/{first.id}/")
+        self.assertEqual([row["id"] for row in response.data["other_versions"]], [second.id])
+
+    def test_overview_featured_rank_and_fallback(self):
+        older = self.video("Older", 60, featured_rank=2)
+        chosen = self.video("Chosen", 60, featured_rank=1)
+        response = self.client.get("/api/videos/overview/")
+        self.assertEqual(response.data["featured"]["id"], chosen.id)
+        Video.objects.update(featured_rank=None)
+        cache.clear()
+        response = self.client.get("/api/videos/overview/")
+        self.assertEqual(response.data["featured"]["id"], chosen.id)
+        self.assertNotEqual(older.id, chosen.id)
+
+    def test_continue_watching_is_only_returned_to_authenticated_user(self):
+        video = self.video("Continue", 100)
+        user = User.objects.create(email="watcher@example.com", username="watcher", is_active=True)
+        VideoWatchProgress.objects.create(user=user, video=video, progress=.4, position_seconds=40, duration_seconds=100)
+        self.assertEqual(self.client.get("/api/videos/overview/").data["continue_watching"], [])
+        self.client.force_authenticate(user=user)
+        response = self.client.get("/api/videos/overview/")
+        self.assertEqual(response.data["continue_watching"][0]["video"]["id"], video.id)
+        self.assertEqual(response.data["continue_watching"][0]["seconds_left"], 60)
 
 
 def _mock_response(text="Generated text.", confident=True, note=""):

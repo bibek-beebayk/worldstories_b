@@ -18,6 +18,7 @@ from django.utils.text import slugify
 from django.utils.decorators import method_decorator
 from django.views.decorators.cache import cache_page
 from django.views.decorators.vary import vary_on_headers
+from django.core.cache import cache
 from datetime import date, timedelta
 from storages.backends.s3 import S3Storage
 from rest_framework.parsers import FormParser, MultiPartParser, JSONParser
@@ -64,6 +65,7 @@ from .models import (
     StoryQueue,
     StoryType,
     VideoType,
+    VideoSeries,
     DailyStory,
     Tag,
     Theme,
@@ -140,6 +142,7 @@ from .serializers import (
     ReadAlongSerializer,
     VideoSerializer,
     PublicVideoSerializer,
+    VideoSeriesSerializer,
     ReviewSerializer,
     ReviewWriteSerializer,
     SubmissionSerializer,
@@ -363,12 +366,13 @@ class VideoViewSet(ReadOnlyModelViewSet):
 
     serializer_class = PublicVideoSerializer
     filter_backends = [SearchFilter]
-    search_fields = ["title", "story__title"]
+    search_fields = ["display_title", "title", "story__title"]
     http_method_names = ["get", "head", "options"]
 
     def get_queryset(self):
         queryset = (
-            Video.objects.select_related("story", "video_type")
+            Video.objects.select_related("story", "story__author", "video_type", "series")
+            .prefetch_related("story__audios", "story__videos__series")
             .filter(Q(story__isnull=True) | published_story_q("story"))
             .order_by("-created_at", "-id")
         )
@@ -376,7 +380,93 @@ class VideoViewSet(ReadOnlyModelViewSet):
         video_type = self.request.query_params.get("video_type")
         if self.action == "list" and video_type and video_type.isdigit():
             queryset = queryset.filter(video_type_id=int(video_type))
+        if self.action == "list":
+            series = self.request.query_params.get("series")
+            if series:
+                queryset = queryset.filter(series__slug=series)
+
+            length = self.request.query_params.get("length")
+            if length == "short":
+                queryset = queryset.filter(duration_seconds__lt=300)
+            elif length == "mid":
+                queryset = queryset.filter(duration_seconds__gte=300, duration_seconds__lt=1200)
+            elif length == "long":
+                queryset = queryset.filter(duration_seconds__gte=1200)
+
+            query = (self.request.query_params.get("q") or "").strip()
+            if query:
+                queryset = queryset.filter(
+                    Q(display_title__icontains=query) | Q(title__icontains=query) | Q(story__title__icontains=query)
+                )
+
+            sort = self.request.query_params.get("sort", "newest")
+            if sort == "shortest":
+                queryset = queryset.filter(duration_seconds__isnull=False).order_by("duration_seconds", "id")
+            elif sort == "longest":
+                queryset = queryset.filter(duration_seconds__isnull=False).order_by("-duration_seconds", "id")
+            elif sort == "most_watched":
+                cutoff = timezone.now() - timedelta(days=30)
+                watched = (
+                    AnalyticsEvent.objects.filter(
+                        video_id=OuterRef("pk"),
+                        event_type=AnalyticsEvent.EVENT_WATCHING_SESSION,
+                        created_at__gte=cutoff,
+                        is_suspected_bot=False,
+                    )
+                    .filter(Q(user__isnull=True) | Q(user__is_staff=False, user__is_superuser=False))
+                    .order_by()
+                    .values("video_id")
+                    .annotate(total=Count("visitor_id", distinct=True))
+                    .values("total")[:1]
+                )
+                queryset = queryset.annotate(watchers_30d=Coalesce(Subquery(watched), 0)).order_by(
+                    "-watchers_30d", "-created_at", "-id"
+                )
         return queryset
+
+    @action(detail=False, methods=["get"])
+    def overview(self, request):
+        cache_key = "watch-overview-anonymous-v1"
+        anonymous = cache.get(cache_key)
+        if anonymous is None:
+            base = self.get_queryset().order_by("-created_at", "-id")
+            featured = base.filter(featured_rank__isnull=False).order_by("featured_rank", "id").first()
+            if featured is None:
+                featured = base.filter(Q(series__layout="wide") | Q(aspect_ratio="16:9")).first()
+            shelves = []
+            for series in VideoSeries.objects.filter(is_active=True).order_by("order", "name"):
+                videos = list(base.filter(series=series).order_by("order", "-created_at", "-id")[:13])
+                shelves.append(
+                    {
+                        "series": VideoSeriesSerializer(series).data,
+                        "videos": PublicVideoSerializer(videos, many=True, context=self.get_serializer_context()).data,
+                    }
+                )
+            anonymous = {
+                "featured": PublicVideoSerializer(featured, context=self.get_serializer_context()).data if featured else None,
+                "shelves": shelves,
+                "count": base.count(),
+            }
+            cache.set(cache_key, anonymous, 60 * 15)
+
+        continue_watching = []
+        if request.user.is_authenticated:
+            rows = (
+                VideoWatchProgress.objects.filter(user=request.user, progress__gt=0, progress__lt=1)
+                .select_related("video", "video__story", "video__story__author", "video__video_type", "video__series")
+                .prefetch_related("video__story__audios", "video__story__videos__series")
+                .order_by("-updated_at")[:6]
+            )
+            for progress in rows:
+                duration = progress.duration_seconds or progress.video.duration_seconds or 0
+                continue_watching.append(
+                    {
+                        "video": PublicVideoSerializer(progress.video, context=self.get_serializer_context()).data,
+                        "progress_percent": round(max(0, min(progress.progress, 1)) * 100),
+                        "seconds_left": max(0, round(duration - progress.position_seconds)),
+                    }
+                )
+        return Response({**anonymous, "continue_watching": continue_watching})
 
     def retrieve(self, request, *args, **kwargs):
         video = self.get_object()
@@ -414,6 +504,12 @@ class VideoTypeViewSet(ReadOnlyModelViewSet):
             .filter(videos_count__gt=0)
             .order_by("name")
         )
+
+
+class VideoSeriesViewSet(ReadOnlyModelViewSet):
+    serializer_class = VideoSeriesSerializer
+    pagination_class = None
+    queryset = VideoSeries.objects.filter(is_active=True).order_by("order", "name")
 
 
 class TagViewSet(ReadOnlyModelViewSet):
@@ -2123,7 +2219,7 @@ class VideoAdminViewSet(ModelViewSet):
     (`?story=<id>`, unpaginated, in playback order) and the standalone
     Videos admin page (paged, newest first, optionally `?has_story=`)."""
 
-    queryset = Video.objects.select_related("story", "video_type").all().order_by("-created_at", "-id")
+    queryset = Video.objects.select_related("story", "video_type", "series").all().order_by("-created_at", "-id")
     serializer_class = VideoAdminSerializer
     parser_classes = [MultiPartParser, FormParser, JSONParser]
     permission_classes = [IsSuperUser]
@@ -2149,6 +2245,9 @@ class VideoAdminViewSet(ModelViewSet):
             queryset = queryset.filter(story__isnull=False)
         elif has_story == "false":
             queryset = queryset.filter(story__isnull=True)
+        series = self.request.query_params.get("series")
+        if series:
+            queryset = queryset.filter(series__slug=series)
         return queryset
 
     def perform_destroy(self, instance):

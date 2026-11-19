@@ -1,0 +1,78 @@
+current_name,display_name,sort_name,current_titles,birth_year,death_year,years_label,country_code,country,era,known_for,is_traditional,is_house,needs_portrait,action,notes
+Aesop,Aesop,Aesop,2,-620,-564,c. 620–564 BC,GR,Ancient Greece,ancient,Aesop's Fables,false,false,false,keep,Semi-legendary; dates are traditional estimates
+Alexandre Dumas,Alexandre Dumas,"Dumas, Alexandre",2,1802,1870,1802–1870,FR,France,1800s,The Three Musketeers,false,false,false,keep,
+Arthur Conan Doyle,Arthur Conan Doyle,"Doyle, Arthur Conan",18,1859,1930,1859–1930,GB,United Kingdom,1800s,Sherlock Holmes,false,false,false,keep,Scottish-born
+Arthur Machen,Arthur Machen,"Machen, Arthur",1,1863,1947,1863–1947,GB,United Kingdom,1800s,The Great God Pan,false,false,false,keep,Welsh
+Arthur Ransome,Arthur Ransome,"Ransome, Arthur",1,1884,1967,1884–1967,GB,United Kingdom,1900s,Swallows and Amazons,false,false,true,keep,"Check the title is public domain where you serve it (he died 1967; e.g. Old Peter's Russian Tales, 1916, is PD in the US)"
+Baroness Orczy,Baroness Orczy,"Orczy, Baroness",1,1865,1947,1865–1947,GB,United Kingdom,1900s,The Scarlet Pimpernel,false,false,true,keep,Born in Hungary
+Beatrix Potter,Beatrix Potter,"Potter, Beatrix",1,1866,1943,1866–1943,GB,United Kingdom,1900s,The Tale of Peter Rabbit,false,false,true,keep,
+Bram Stoker,Bram Stoker,"Stoker, Bram",1,1847,1912,1847–1912,IE,Ireland,1800s,Dracula,false,false,false,keep,
+Charles Dickens,Charles Dickens,"Dickens, Charles",2,1812,1870,1812–1870,GB,United Kingdom,1800s,A Christmas Carol,false,false,false,keep,
+Charlotte Perkins Gilman,Charlotte Perkins Gilman,"Gilman, Charlotte Perkins",2,1860,1935,1860–1935,US,United States,1800s,The Yellow Wallpaper,false,false,false,keep,
+Edgar Allan Poe,Edgar Allan Poe,"Poe, Edgar Allan",1,1809,1849,1809–1849,US,United States,1800s,The Raven,false,false,false,keep,
+Edgar Rice Burroughs,Edgar Rice Burroughs,"Burroughs, Edgar Rice",5,1875,1950,1875–1950,US,United States,1900s,Tarzan of the Apes,false,false,false,keep,
+Edward Bellamy,Edward Bellamy,"Bellamy, Edward",1,1850,1898,1850–1898,US,United States,1800s,Looking Backward,false,false,false,keep,
+Edward Everett Hale,Edward Everett Hale,"Hale, Edward Everett",1,1822,1909,1822–1909,US,United States,1800s,The Man Without a Country,false,false,false,keep,
+Ellen C. Babbitt,Ellen C. Babbitt,"Babbitt, Ellen C.",1,,,,US,United States,1900s,Jataka Tales (1912),false,false,false,keep,"Life dates not reliably recorded; one catalogue's 1866–1952 belongs to her illustrator Ellsworth Young, so don't use it"
+E. M. Forster,E. M. Forster,"Forster, E. M.",4,1879,1970,1879–1970,GB,United Kingdom,1900s,A Room with a View,false,false,false,keep,
+E. Nesbit,E. Nesbit,"Nesbit, E.",1,1858,1924,1858–1924,GB,United Kingdom,1900s,The Railway Children,false,false,false,keep,
+Fitz-James O'Brien,Fitz-James O'Brien,"O'Brien, Fitz-James",1,1828,1862,1828–1862,IE,Ireland,1800s,The Diamond Lens,false,false,false,keep,Irish-born; career in the US
+Francis Stevens,Francis Stevens,"Stevens, Francis",1,1883,1948,1883–1948,US,United States,1900s,The Citadel of Fear,false,false,false,keep,Pen name of Gertrude Barrows Bennett
+Franz Kafka,Franz Kafka,"Kafka, Franz",1,1883,1924,1883–1924,CZ,Czechia (Austria-Hungary),1900s,The Metamorphosis,false,false,false,keep,Born in Prague
+Frederick Douglass,Frederick Douglass,"Douglass, Frederick",0,1818,1895,1818–1895,US,United States,1800s,Narrative of the Life of Frederick Douglass,false,false,true,merge,"DUPLICATE (0 titles, no portrait): merge into the Frederick Douglass record that has 1 title, then delete"
+Frederick Douglass,Frederick Douglass,"Douglass, Frederick",1,1818,1895,1818–1895,US,United States,1800s,Narrative of the Life of Frederick Douglass,false,false,false,keep,Keep this one (has the title and portrait)
+Friedrich Giese,Friedrich Giese,"Giese, Friedrich",2,1870,1944,1870–1944,DE,Germany,1900s,Türkische Märchen (Turkish Fairy Tales),false,false,true,keep,German Turkologist; edited the 1925 Turkish fairy-tale collection
+Fyodor Dostoyevsky,Fyodor Dostoyevsky,"Dostoyevsky, Fyodor",1,1821,1881,1821–1881,RU,Russia,1800s,Crime and Punishment,false,false,false,keep,
+Gaston Leroux,Gaston Leroux,"Leroux, Gaston",1,1868,1927,1868–1927,FR,France,1900s,The Phantom of the Opera,false,false,false,keep,
+George MacDonald,George MacDonald,"MacDonald, George",1,1824,1905,1824–1905,GB,United Kingdom,1800s,The Princess and the Goblin,false,false,false,keep,Scottish
+Grant Allen,Grant Allen,"Allen, Grant",1,1848,1899,1848–1899,CA,Canada,1800s,The Woman Who Did,false,false,false,keep,Canadian-born; career in England
+Hartwell James,Hartwell James,"James, Hartwell",1,,,,US,United States,1900s,Fairy-tale collections (The Magic Bed; The Man Elephant),false,false,true,keep,"Editor of a 1906 Henry Altemus (Philadelphia) fairy-tale series; life dates unknown"
+Henrik Ibsen,Henrik Ibsen,"Ibsen, Henrik",1,1828,1906,1828–1906,NO,Norway,1800s,A Doll's House,false,false,false,keep,
+Henry David Thoreau,Henry David Thoreau,"Thoreau, Henry David",1,1817,1862,1817–1862,US,United States,1800s,Walden,false,false,false,keep,
+Henry James,Henry James,"James, Henry",1,1843,1916,1843–1916,US,United States,1800s,The Turn of the Screw,false,false,false,keep,Lived mostly in England
+Herman Melville,Herman Melville,"Melville, Herman",1,1819,1891,1819–1891,US,United States,1800s,Moby-Dick,false,false,false,keep,
+H.G. Wells,H. G. Wells,"Wells, H. G.",10,1866,1946,1866–1946,GB,United Kingdom,1800s,The Time Machine,false,false,false,rename,Normalise initials spacing
+Homer,Homer,Homer,1,,,c. 8th century BC,GR,Ancient Greece,ancient,The Odyssey,false,false,false,keep,Dates traditional
+Hugh Lofting,Hugh Lofting,"Lofting, Hugh",1,1886,1947,1886–1947,GB,United Kingdom,1900s,The Story of Doctor Dolittle,false,false,false,keep,
+Jack London,Jack London,"London, Jack",1,1876,1916,1876–1916,US,United States,1900s,The Call of the Wild,false,false,false,keep,
+James A. Honey,James A. Honey,"Honey, James A.",1,1880,,b. 1880,ZA,South Africa,1900s,South-African Folk-Tales (1910),false,false,true,keep,South African-born physician; death year unknown
+Jane Austen,Jane Austen,"Austen, Jane",1,1775,1817,1775–1817,GB,United Kingdom,1800s,Pride and Prejudice,false,false,false,keep,
+Jean de La Fontaine,Jean de La Fontaine,"La Fontaine, Jean de",0,1621,1695,1621–1695,FR,France,pre_1800,Fables,false,false,false,hide,0 titles: hide from the list until a story is published
+Jerome K. Jerome,Jerome K. Jerome,"Jerome, Jerome K.",1,1859,1927,1859–1927,GB,United Kingdom,1800s,Three Men in a Boat,false,false,true,keep,
+John William Polidori,John William Polidori,"Polidori, John William",1,1795,1821,1795–1821,GB,United Kingdom,1800s,The Vampyre,false,false,false,keep,
+Jonathan Swift,Jonathan Swift,"Swift, Jonathan",1,1667,1745,1667–1745,IE,Ireland,pre_1800,Gulliver's Travels,false,false,false,keep,
+Jon Krakauer,Jon Krakauer,"Krakauer, Jon",0,1954,,b. 1954,US,United States,contemporary,Into the Wild,false,false,false,review,"0 titles and a living, in-copyright author: check why this record exists (blog link? test data?) and delete if unused"
+Jules Verne,Jules Verne,"Verne, Jules",8,1828,1905,1828–1905,FR,France,1800s,Twenty Thousand Leagues Under the Seas,false,false,false,keep,
+Knut Hamsun,Knut Hamsun,"Hamsun, Knut",1,1859,1952,1859–1952,NO,Norway,1800s,Hunger,false,false,true,keep,
+Lafcadio Hearn,Lafcadio Hearn,"Hearn, Lafcadio",1,1850,1904,1850–1904,JP,Japan,1900s,Kwaidan,false,false,false,keep,Greek-born Irish-Greek writer; became a Japanese citizen (Koizumi Yakumo)
+Lewis Carroll,Lewis Carroll,"Carroll, Lewis",1,1832,1898,1832–1898,GB,United Kingdom,1800s,Alice's Adventures in Wonderland,false,false,false,keep,
+Liu Cixin,Liu Cixin,Liu Cixin,0,1963,,b. 1963,CN,China,contemporary,The Three-Body Problem,false,false,false,review,"0 titles and a living, in-copyright author: check why this record exists and delete if unused"
+L. M. Montgomery,L. M. Montgomery,"Montgomery, L. M.",2,1874,1942,1874–1942,CA,Canada,1900s,Anne of Green Gables,false,false,false,keep,
+Marcus Aurelius,Marcus Aurelius,Marcus Aurelius,1,121,180,121–180,IT,Roman Empire,ancient,Meditations,false,false,false,keep,
+Mark Twain,Mark Twain,"Twain, Mark",1,1835,1910,1835–1910,US,United States,1800s,Adventures of Huckleberry Finn,false,false,false,keep,
+Mary E. Bradley Lane,Mary E. Bradley Lane,"Lane, Mary E. Bradley",1,1844,1930,1844–1930,US,United States,1800s,Mizora: A Prophecy,false,false,false,keep,
+Mary Woolstonecraft Shelly,Mary Wollstonecraft Shelley,"Shelley, Mary Wollstonecraft",2,1797,1851,1797–1851,GB,United Kingdom,1800s,Frankenstein,false,false,false,rename,"Fix spelling: Wollstonecraft, Shelley (also 'Shelly' in the Frankenstein video title)"
+M.P. Shiel,M. P. Shiel,"Shiel, M. P.",1,1865,1947,1865–1947,GB,United Kingdom,1900s,The Purple Cloud,false,false,false,rename,Born in Montserrat; normalise initials spacing
+M.R. James,M. R. James,"James, M. R.",1,1862,1936,1862–1936,GB,United Kingdom,1900s,Ghost Stories of an Antiquary,false,false,false,rename,Normalise initials spacing
+Nikolai Gogol,Nikolai Gogol,"Gogol, Nikolai",1,1809,1852,1809–1852,RU,Russia,1800s,Dead Souls,false,false,false,keep,Born in present-day Ukraine
+Oscar Wilde,Oscar Wilde,"Wilde, Oscar",3,1854,1900,1854–1900,IE,Ireland,1800s,The Picture of Dorian Gray,false,false,false,keep,
+Phaedrus,Phaedrus,Phaedrus,1,,,c. 15 BC – c. AD 50,IT,Roman Empire,ancient,Fables,false,false,true,keep,No authentic portrait exists; use the monogram tile or a classical-relief illustration
+Rabindranath Tagore,Rabindranath Tagore,"Tagore, Rabindranath",1,1861,1941,1861–1941,IN,India,1900s,Gitanjali,false,false,false,keep,
+Ralph Waldo Emerson,Ralph Waldo Emerson,"Emerson, Ralph Waldo",1,1803,1882,1803–1882,US,United States,1800s,Self-Reliance,false,false,false,keep,
+Richard Marsh,Richard Marsh,"Marsh, Richard",4,1857,1915,1857–1915,GB,United Kingdom,1800s,The Beetle,false,false,false,keep,
+Robert Louis Stevenson,Robert Louis Stevenson,"Stevenson, Robert Louis",7,1850,1894,1850–1894,GB,United Kingdom,1800s,Treasure Island,false,false,false,keep,Scottish
+Rudyard Kipling,Rudyard Kipling,"Kipling, Rudyard",2,1865,1936,1865–1936,GB,United Kingdom,1800s,The Jungle Book,false,false,false,keep,Born in India
+Samuel Butler,Samuel Butler,"Butler, Samuel",1,1835,1902,1835–1902,GB,United Kingdom,1800s,Erewhon,false,false,false,keep,"Assumes the Erewhon novelist; check against the title (there is also a 17th-century poet of the same name)"
+Sheridan Le Fanu,J. Sheridan Le Fanu,"Le Fanu, J. Sheridan",1,1814,1873,1814–1873,IE,Ireland,1800s,Carmilla,false,false,true,rename,Use the usual byline 'J. Sheridan Le Fanu'
+Sir Edwin Arnold,Sir Edwin Arnold,"Arnold, Edwin",1,1832,1904,1832–1904,GB,United Kingdom,1800s,The Light of Asia,false,false,true,keep,
+Sun Tzu,Sun Tzu,Sun Tzu,1,,,c. 544–496 BC,CN,Ancient China,ancient,The Art of War,false,false,false,keep,Dates traditional
+Thea von Harbou,Thea von Harbou,"Harbou, Thea von",1,1888,1954,1888–1954,DE,Germany,1900s,Metropolis,false,false,false,keep,
+The Brothers Grimm,The Brothers Grimm,"Grimm, Brothers",11,1785,1863,Jacob 1785–1863 · Wilhelm 1786–1859,DE,Germany,1800s,Grimms' Fairy Tales,false,false,false,keep,Two people; birth/death fields hold Jacob's dates
+Voltaire,Voltaire,Voltaire,1,1694,1778,1694–1778,FR,France,pre_1800,Candide,false,false,false,keep,Pen name of François-Marie Arouet
+W. H. Barker and Cecilia Sinclair,W. H. Barker & Cecilia Sinclair,"Barker, W. H.",1,1882,1929,W. H. Barker 1882–1929,GB,United Kingdom,1900s,West African Folk-Tales (1917),false,false,true,keep,Collected Gold Coast (Ghana) tales; Sinclair (also the illustrator) has no recorded dates
+Wilkie Collins,Wilkie Collins,"Collins, Wilkie",1,1824,1889,1824–1889,GB,United Kingdom,1800s,The Moonstone,false,false,false,keep,
+William Hope Hodgson,William Hope Hodgson,"Hodgson, William Hope",2,1877,1918,1877–1918,GB,United Kingdom,1900s,The House on the Borderland,false,false,false,keep,
+William Shakespeare,William Shakespeare,"Shakespeare, William",2,1564,1616,1564–1616,GB,United Kingdom,pre_1800,Hamlet,false,false,false,keep,
+Worldstories,WorldStories Originals,WorldStories Originals,5,,,,,,contemporary,Original serial fiction,false,true,false,house,"House byline: exclude from the author grid and link to the Originals page instead; uses the site logo as its image"
+W.W. Jacobs,W. W. Jacobs,"Jacobs, W. W.",1,1863,1943,1863–1943,GB,United Kingdom,1900s,The Monkey's Paw,false,false,false,rename,Normalise initials spacing
+Yevgeny Zamyatin,Yevgeny Zamyatin,"Zamyatin, Yevgeny",1,1884,1937,1884–1937,RU,Russia,1900s,We,false,false,false,keep,

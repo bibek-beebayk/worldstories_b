@@ -4,7 +4,7 @@ from django.utils.html import strip_tags
 from django.utils import timezone
 from django.utils.text import slugify
 from solo.admin import SingletonModelAdmin
-from .models import BlogTopic, HeroTemplate, Audio, AudioTranscriptCue, Video, Blog, Story, DailyStory, Genre, Category, Mood, StoryJourney, StoryJourneyItem, StoryMood, StoryType, VideoType, Tag, Theme, Author, Chapter, PromptSettings, Review, Submission, StoryView
+from .models import BlogTopic, HeroTemplate, Audio, AudioTranscriptCue, Video, VideoSeries, Blog, Story, DailyStory, Genre, Category, Mood, StoryJourney, StoryJourneyItem, StoryMood, StoryType, VideoType, Tag, Theme, Author, Chapter, PromptSettings, Review, Submission, StoryView
 
 admin.site.register(PromptSettings, SingletonModelAdmin)
 
@@ -110,14 +110,17 @@ class VideoInline(admin.StackedInline):
     classes = ("collapse",)
     fields = (
         "title",
+        "display_title",
         "slug",
         "order",
         "video_type",
+        "series",
         "youtube_url",
         "youtube_id",
         "duration_seconds",
         "aspect_ratio",
         "cover_image_file",
+        "featured_rank",
     )
     readonly_fields = ("youtube_id",)
 
@@ -434,6 +437,14 @@ class VideoTypeAdmin(admin.ModelAdmin):
     search_fields = ("name",)
 
 
+@admin.register(VideoSeries)
+class VideoSeriesAdmin(admin.ModelAdmin):
+    list_display = ("name", "layout", "order", "is_story_content", "is_active")
+    list_filter = ("layout", "is_story_content", "is_active")
+    prepopulated_fields = {"slug": ("name",)}
+    search_fields = ("name", "description")
+
+
 @admin.register(Tag)
 class TagAdmin(admin.ModelAdmin):
     prepopulated_fields = {"slug": ("name",)}
@@ -522,15 +533,17 @@ class VideoAdmin(admin.ModelAdmin):
     """Top-level so videos with no story (standalone) can be managed too;
     story-bound videos are still editable via VideoInline on StoryAdmin."""
 
-    list_display = ("title", "story", "order", "slug", "youtube_id", "aspect_ratio")
-    search_fields = ("title", "slug", "youtube_id", "story__title")
-    list_filter = (("story", admin.EmptyFieldListFilter), "video_type", "aspect_ratio")
-    list_select_related = ("story",)
+    list_display = ("display_title", "series", "story", "order", "slug", "youtube_id", "aspect_ratio")
+    search_fields = ("display_title", "title", "slug", "youtube_id", "story__title")
+    list_filter = (("story", admin.EmptyFieldListFilter), "series", "video_type", "aspect_ratio")
+    list_select_related = ("story", "series")
     autocomplete_fields = ("story",)
     ordering = ("story__title", "order")
     fields = (
         "story",
         "title",
+        "display_title",
+        "series",
         "slug",
         "order",
         "youtube_url",
@@ -538,6 +551,7 @@ class VideoAdmin(admin.ModelAdmin):
         "duration_seconds",
         "aspect_ratio",
         "cover_image_file",
+        "featured_rank",
     )
     readonly_fields = ("youtube_id",)
 

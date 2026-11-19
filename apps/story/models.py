@@ -1311,6 +1311,27 @@ class VideoType(models.Model):
         return self.name
 
 
+class VideoSeries(models.Model):
+    LAYOUT_WIDE = "wide"
+    LAYOUT_TALL = "tall"
+    LAYOUT_CHOICES = ((LAYOUT_WIDE, "Wide"), (LAYOUT_TALL, "Tall"))
+
+    name = models.CharField(max_length=120, unique=True)
+    slug = models.SlugField(max_length=140, unique=True)
+    description = models.TextField(blank=True, default="")
+    order = models.PositiveSmallIntegerField(default=0)
+    layout = models.CharField(max_length=8, choices=LAYOUT_CHOICES, default=LAYOUT_WIDE)
+    is_story_content = models.BooleanField(default=True)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ["order", "name"]
+        verbose_name_plural = "video series"
+
+    def __str__(self):
+        return self.name
+
+
 class Video(models.Model):
     """A YouTube-hosted video. Usually a narration of a story — one story can
     have many videos (ordered), mirroring Audio — but `story` is optional so a
@@ -1331,7 +1352,15 @@ class Video(models.Model):
         blank=True,
         related_name="videos",
     )
+    series = models.ForeignKey(
+        VideoSeries,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="videos",
+    )
     title = models.CharField(max_length=256)
+    display_title = models.CharField(max_length=256, blank=True, default="")
     slug = models.SlugField(max_length=256, null=True)
     # Canonical 11-char YouTube id, stored bare (derived from youtube_url).
     youtube_id = models.CharField(max_length=32)

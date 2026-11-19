@@ -7,6 +7,7 @@ from django.db.models import Case, Count, IntegerField, Max, Q, Value, When
 from django.http import QueryDict
 from django.utils import timezone
 from django.utils.text import slugify
+from django.utils.html import strip_tags
 from django.urls import reverse
 from datetime import date
 from core.libs.images import get_cover_image_url
@@ -38,6 +39,7 @@ from .models import (
     StoryQueue,
     StoryType,
     VideoType,
+    VideoSeries,
     DailyStory,
     HeroTemplate,
     published_story_q,
@@ -833,6 +835,10 @@ class ReadAlongSerializer(serializers.BaseSerializer):
 
 class VideoSerializer(serializers.ModelSerializer):
     cover_image = serializers.SerializerMethodField()
+    display_title = serializers.SerializerMethodField()
+
+    def get_display_title(self, obj):
+        return (obj.display_title or "").strip() or obj.title
 
     def get_cover_image(self, obj):
         request = self.context.get("request")
@@ -843,6 +849,7 @@ class VideoSerializer(serializers.ModelSerializer):
         fields = [
             "id",
             "title",
+            "display_title",
             "slug",
             "youtube_id",
             "order",
@@ -860,6 +867,18 @@ class PublicVideoSerializer(serializers.ModelSerializer):
     cover_image = serializers.SerializerMethodField()
     story = serializers.SerializerMethodField()
     video_type = serializers.SerializerMethodField()
+    display_title = serializers.SerializerMethodField()
+    series = serializers.SerializerMethodField()
+    other_versions = serializers.SerializerMethodField()
+    description = serializers.SerializerMethodField()
+
+    def get_display_title(self, obj):
+        return (obj.display_title or "").strip() or obj.title
+
+    def get_series(self, obj):
+        if obj.series_id is None:
+            return None
+        return {"slug": obj.series.slug, "name": obj.series.name, "layout": obj.series.layout}
 
     def get_video_type(self, obj):
         if obj.video_type is None:
@@ -876,13 +895,46 @@ class PublicVideoSerializer(serializers.ModelSerializer):
     def get_story(self, obj):
         if obj.story_id is None:
             return None
-        return {"id": obj.story.id, "title": obj.story.title, "slug": obj.story.slug}
+        audios = list(obj.story.audios.all())
+        return {
+            "id": obj.story.id,
+            "title": obj.story.title,
+            "slug": obj.story.slug,
+            "author": obj.story.author.name if obj.story.author_id else "",
+            "formats": {
+                "read": bool(obj.story.chapters.exists() or obj.story.pdf_file or obj.story.epub_file),
+                "listen": bool(audios),
+                "read_along": any(audio.audio_file and rich_text_has_content(audio.transcript) for audio in audios),
+            },
+        }
+
+    def get_description(self, obj):
+        if obj.story_id is None:
+            return ""
+        value = obj.story.about or obj.story.summary or ""
+        return strip_tags(value).strip()
+
+    def get_other_versions(self, obj):
+        if obj.story_id is None:
+            return []
+        versions = obj.story.videos.exclude(pk=obj.pk).select_related("series").order_by("order", "id")
+        return [
+            {
+                "id": video.id,
+                "slug": video.slug,
+                "display_title": (video.display_title or "").strip() or video.title,
+                "duration_seconds": video.duration_seconds,
+                "series_name": video.series.name if video.series_id else "",
+            }
+            for video in versions
+        ]
 
     class Meta:
         model = Video
         fields = [
             "id",
             "title",
+            "display_title",
             "slug",
             "youtube_id",
             "duration_seconds",
@@ -891,8 +943,17 @@ class PublicVideoSerializer(serializers.ModelSerializer):
             "thumbnail",
             "story",
             "video_type",
+            "series",
+            "description",
+            "other_versions",
             "created_at",
         ]
+
+
+class VideoSeriesSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = VideoSeries
+        fields = ["id", "name", "slug", "description", "order", "layout", "is_story_content", "is_active"]
 
 
 def similar_stories_candidates(story):
@@ -2190,6 +2251,7 @@ class VideoAdminSerializer(serializers.ModelSerializer):
     cover_image_url = serializers.SerializerMethodField(read_only=True)
     story_detail = serializers.SerializerMethodField(read_only=True)
     video_type_detail = serializers.SerializerMethodField(read_only=True)
+    series_detail = VideoSeriesSerializer(source="series", read_only=True)
 
     def get_video_type_detail(self, obj):
         if obj.video_type is None:
@@ -2276,7 +2338,10 @@ class VideoAdminSerializer(serializers.ModelSerializer):
             "story",
             "video_type",
             "video_type_detail",
+            "series",
+            "series_detail",
             "title",
+            "display_title",
             "slug",
             "youtube_url",
             "youtube_id",
@@ -2287,6 +2352,7 @@ class VideoAdminSerializer(serializers.ModelSerializer):
             "remove_cover_image_file",
             "cover_image_url",
             "story_detail",
+            "featured_rank",
             "created_at",
         ]
         read_only_fields = ["youtube_id", "created_at"]
