@@ -8,7 +8,7 @@ from rest_framework.viewsets import ReadOnlyModelViewSet, ModelViewSet
 from rest_framework.views import APIView
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db.models import Sum, Avg, Count, Exists, F, IntegerField, OuterRef, Prefetch, Subquery
-from django.db.models import Max, Q
+from django.db.models import BooleanField, ExpressionWrapper, Max, Q
 from django.db.models.functions import Coalesce
 from django.http import FileResponse, Http404, HttpResponse, StreamingHttpResponse
 from django.db import transaction
@@ -157,6 +157,7 @@ from .serializers import (
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from django_filters.rest_framework import DjangoFilterBackend
+from rest_framework.negotiation import DefaultContentNegotiation
 from rest_framework.permissions import IsAuthenticated
 from rest_framework import status
 from rest_framework.exceptions import ValidationError
@@ -536,7 +537,25 @@ class CategoryViewSet(ReadOnlyModelViewSet):
         return CategorySerializer
 
 
+class _NoFormatOverrideSettings:
+    """api_settings, except DRF's `?format=` renderer override is off."""
+
+    def __getattr__(self, name):
+        from rest_framework.settings import api_settings
+
+        return None if name == "URL_FORMAT_OVERRIDE" else getattr(api_settings, name)
+
+
+class StoryContentNegotiation(DefaultContentNegotiation):
+    """The story endpoints answer JSON only, and `format` is a real filter here
+    (`?format=listen`). DRF would otherwise read it as a renderer name and 404."""
+
+    settings = _NoFormatOverrideSettings()
+
+
 class StoryViewSet(ReadOnlyModelViewSet):
+    content_negotiation_class = StoryContentNegotiation
+
     # Keep an ungated base queryset for DRF's model introspection. The public
     # visibility predicate contains the current time and must be constructed
     # per request so scheduled stories become visible without a process restart.
@@ -641,6 +660,14 @@ class StoryViewSet(ReadOnlyModelViewSet):
             annotations = {
                 "_reviews_count": Count("reviews", distinct=True),
                 "_favorites_count": Count("favorites", distinct=True),
+                # "Read" format badge: there is text to read here (chapters or
+                # an uploaded EPUB/PDF) — the same rule as ?format=read.
+                "_has_text": ExpressionWrapper(
+                    Q(Exists(Chapter.objects.filter(story=OuterRef("pk"))))
+                    | Q(pdf_file__gt="")
+                    | Q(epub_file__gt=""),
+                    output_field=BooleanField(),
+                ),
             }
             if self.request.user.is_authenticated:
                 annotations["_is_favorite"] = Exists(
@@ -786,6 +813,35 @@ class StoryViewSet(ReadOnlyModelViewSet):
             "total": sum(counts.values()),
             "my_reaction": mine,
         }
+
+    @action(detail=False, methods=["get"], url_path="facets")
+    def facets(self, request):
+        """Counts per filter value for the Library sidebar. Takes the list
+        endpoint's filter params; each facet is counted under every *other*
+        active filter, so its options keep showing what picking them would
+        return. Cached 5 minutes per param set."""
+        from .library_api import get_facets
+
+        return Response(get_facets(dict(request.query_params.items()), nepali_only=wants_nepali_site(request)))
+
+    @action(detail=False, methods=["get"], url_path="collections")
+    def collections(self, request):
+        """Curated tiles for the Library's collections strip: each carries the
+        filter params that reproduce it in the list, its size and three covers.
+        Cached an hour."""
+        from .library_api import get_collections
+
+        return Response({"results": get_collections(request, nepali_only=wants_nepali_site(request))})
+
+    @action(detail=False, methods=["get"], url_path="progress", permission_classes=[IsAuthenticated])
+    def progress(self, request):
+        """The signed-in reader's progress (0-1) for many stories in one request,
+        so a card grid shows progress bars without a request per card."""
+        from .library_api import story_progress
+
+        raw = request.query_params.get("ids", "")
+        ids = [int(token) for token in raw.split(",") if token.strip().isdigit()]
+        return Response({"progress": {str(pk): value for pk, value in story_progress(request.user, ids).items()}})
 
     @action(detail=False, methods=["get"], url_path="surprise")
     def surprise(self, request):

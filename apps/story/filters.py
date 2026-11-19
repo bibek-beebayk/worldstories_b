@@ -1,6 +1,65 @@
 from django_filters import rest_framework as filters
-from django.db.models import F, OuterRef, Q, Subquery
-from .models import Story, StoryMood, Video
+from django.db.models import Exists, F, IntegerField, OuterRef, Q, Subquery
+from django.db.models.functions import Coalesce, Lower, NullIf
+from django.utils.text import slugify
+from .models import Author, Chapter, Story, StoryMood, Video
+
+# Length buckets on the whole-story reading estimate (minutes). Lower bound
+# inclusive, upper exclusive; matches the Library's "Length" facet.
+LENGTH_BUCKETS = {
+    "under_10": (None, 10),
+    "10_60": (10, 60),
+    "1_5h": (60, 300),
+    "5h_plus": (300, None),
+}
+FORMATS = ("read", "listen", "read_along", "watch", "quick_read")
+
+
+def with_reading_minutes(queryset):
+    """Annotates `_minutes`: the same whole-story estimate StoryListSerializer
+    shows (chapter total, else the EPUB/PDF estimate), read from the
+    denormalized columns. NULL when the length is unknown."""
+    if "_minutes" in queryset.query.annotations:
+        return queryset
+    return queryset.annotate(
+        _minutes=Coalesce(
+            NullIf(F("cached_chapter_reading_minutes"), 0),
+            F("cached_file_reading_minutes"),
+            output_field=IntegerField(),
+        )
+    )
+
+
+def _tokens(value):
+    return [token.strip() for token in (value or "").split(",") if token.strip()]
+
+
+def apply_format(queryset, fmt):
+    """Narrow to stories available in one format. Mirrors the card's format
+    badges: audio / video / read-along / summary exist, and "read" means there
+    is text to read here (chapters, or an uploaded EPUB or PDF)."""
+    fmt = (fmt or "").strip().lower().replace("-", "_")
+    if fmt == "listen":
+        return queryset.filter(audios__isnull=False).distinct()
+    if fmt == "watch":
+        return queryset.filter(videos__isnull=False).distinct()
+    if fmt == "read_along":
+        return queryset.filter(
+            Q(audios__audio_file__isnull=False)
+            & ~Q(audios__audio_file__exact="")
+            & Q(audios__transcript__isnull=False)
+            & ~Q(audios__transcript__exact="")
+        ).distinct()
+    if fmt == "quick_read":
+        return queryset.exclude(Q(summary__isnull=True) | Q(summary__exact=""))
+    if fmt == "read":
+        has_text = (
+            Q(Exists(Chapter.objects.filter(story=OuterRef("pk"))))
+            | (Q(pdf_file__isnull=False) & ~Q(pdf_file=""))
+            | (Q(epub_file__isnull=False) & ~Q(epub_file=""))
+        )
+        return queryset.filter(has_text)
+    return queryset
 
 def public_story_mood_q():
     """Mood assignments a reader may see: an administrator's choice, or a
@@ -25,6 +84,14 @@ class StoryFilter(filters.FilterSet):
         method="filter_show_in_nepali_site", label="On the Nepali site"
     )
     moods = filters.CharFilter(method="filter_moods", label="Moods")
+    # Library vocabulary: taxonomy by slug *or* id, one `format`, a length
+    # bucket, an author, and `original` as the short form of `is_original`.
+    genre = filters.CharFilter(method="filter_genre", label="Genre (slug or id)")
+    category = filters.CharFilter(method="filter_category", label="Category (slug or id)")
+    length = filters.CharFilter(method="filter_length", label="Length bucket")
+    author = filters.CharFilter(method="filter_author", label="Author (id or slug)")
+    format = filters.CharFilter(method="filter_format", label="Format")
+    original = filters.CharFilter(method="filter_is_original", label="WorldStories Original")
     sort = filters.CharFilter(method="filter_sort", label="Sort")
     q = filters.CharFilter(method="filter_q", label="Query")
 
@@ -42,6 +109,47 @@ class StoryFilter(filters.FilterSet):
     def filter_categories(self, queryset, name, value):
         category_ids = [category.strip() for category in value.split(",")]
         return queryset.filter(categories__id__in=category_ids).distinct()
+
+    def _taxonomy(self, queryset, field, value):
+        tokens = _tokens(value)
+        ids = [token for token in tokens if token.isdigit()]
+        slugs = [token for token in tokens if not token.isdigit()]
+        if not ids and not slugs:
+            return queryset
+        return queryset.filter(
+            Q(**{f"{field}__id__in": ids}) | Q(**{f"{field}__slug__in": slugs})
+        ).distinct()
+
+    def filter_genre(self, queryset, name, value):
+        return self._taxonomy(queryset, "genres", value)
+
+    def filter_category(self, queryset, name, value):
+        return self._taxonomy(queryset, "categories", value)
+
+    def filter_length(self, queryset, name, value):
+        bounds = LENGTH_BUCKETS.get((value or "").strip().lower())
+        if bounds is None:
+            return queryset
+        queryset = with_reading_minutes(queryset)
+        low, high = bounds
+        if low is not None:
+            queryset = queryset.filter(_minutes__gte=low)
+        if high is not None:
+            queryset = queryset.filter(_minutes__lt=high)
+        return queryset
+
+    def filter_author(self, queryset, name, value):
+        value = (value or "").strip()
+        if not value:
+            return queryset
+        if value.isdigit():
+            return queryset.filter(author_id=int(value))
+        # Authors have no slug column, so a slug is matched against the slugified name.
+        ids = [pk for pk, author_name in Author.objects.values_list("id", "name") if slugify(author_name) == value.lower()]
+        return queryset.filter(author_id__in=ids)
+
+    def filter_format(self, queryset, name, value):
+        return apply_format(queryset, value)
 
     def filter_show_in_nepali_site(self, queryset, name, value):
         """Curated opt-in for the Nepali companion site.
@@ -146,8 +254,13 @@ class StoryFilter(filters.FilterSet):
         return queryset
 
     def filter_sort(self, queryset, name, value):
-        if value.lower() == "recent":
+        if value.lower() in ("recent", "newest"):
             return queryset.order_by("-site_published_date")
+        elif value.lower() == "title":
+            return queryset.order_by(Lower("title"), "id")
+        elif value.lower() == "shortest":
+            # Unknown lengths last: "no estimate" is not "shortest".
+            return with_reading_minutes(queryset).order_by(F("_minutes").asc(nulls_last=True), "id")
         # Watch page: newest video first, regardless of when the story itself
         # was published. A subquery rather than Max("videos__created_at") so it
         # doesn't interact with joins added by other filters (has_video, genres…).
@@ -160,11 +273,12 @@ class StoryFilter(filters.FilterSet):
             return queryset.annotate(latest_video_at=Subquery(latest_video_at)).order_by(
                 F("latest_video_at").desc(nulls_last=True), "-id"
             )
-        # TODO: Fix sorting logic
+        # Was ordering oldest-first (a leftover TODO), so "Popular" showed the
+        # oldest stories. Most-viewed first, ties by rating then newest.
         elif value.lower() == "popular":
-            return queryset.order_by("site_published_date")
-        elif value.lower() == "rating":
-            return queryset.order_by("-rating")
+            return queryset.order_by("-views", "-rating", "-id")
+        elif value.lower() in ("rating", "top_rated"):
+            return queryset.order_by("-rating", "-views", "-id")
         elif value.lower() == "views":
             return queryset.order_by("-views")
         return queryset

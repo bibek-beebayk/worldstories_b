@@ -433,6 +433,12 @@ class StoryListSerializer(serializers.ModelSerializer):
     has_video = serializers.SerializerMethodField()
     has_read_along = serializers.SerializerMethodField()
     reading_time_minutes = serializers.SerializerMethodField()
+    # True/False where the queryset annotates `_has_text` (the Library list);
+    # null elsewhere, meaning "not computed" rather than "no text".
+    has_text = serializers.SerializerMethodField()
+
+    def get_has_text(self, obj):
+        return getattr(obj, "_has_text", None)
 
     @staticmethod
     def _prefetched(obj, relation):
@@ -540,6 +546,8 @@ class StoryListSerializer(serializers.ModelSerializer):
             "is_favorite",
             "favorites_count",
             "is_original",
+            "country",
+            "has_text",
         ]
 
 
@@ -547,7 +555,7 @@ class FeaturedStorySerializer(StoryListSerializer):
     cover_image_size = LARGE_COVER_SIZE
 
     class Meta(StoryListSerializer.Meta):
-        fields = StoryListSerializer.Meta.fields + ["about", "country"]
+        fields = StoryListSerializer.Meta.fields + ["about"]
 
 
 class DailyStorySerializer(serializers.ModelSerializer):

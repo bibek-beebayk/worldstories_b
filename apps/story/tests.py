@@ -6711,3 +6711,238 @@ class HomepageImprovementsTests(APITestCase):
         call_command("seed_home_sections", stdout=io.StringIO())
         self.assertEqual(self.HomeSection.objects.count(), count)
         self.assertEqual(self.HomeSection.objects.get(pk=mine.pk).title, "Custom")
+
+
+class LibraryFilterTests(APITestCase):
+    """The Library's list filters, sorts, facets, collections and bulk progress."""
+
+    def setUp(self):
+        from apps.story.models import Author, Category, Genre, StoryType
+
+        cache.clear()
+        self.client.defaults["HTTP_USER_AGENT"] = "Mozilla/5.0 Chrome"
+        self.fantasy = Genre.objects.get_or_create(slug="fantasy", defaults={"name": "Fantasy"})[0]
+        self.mystery = Genre.objects.get_or_create(slug="mystery", defaults={"name": "Mystery"})[0]
+        self.folk = Category.objects.get_or_create(slug="folk-tales", defaults={"name": "Folk Tales"})[0]
+        self.novel = StoryType.objects.get_or_create(name="Novel")[0]
+        self.short = StoryType.objects.get_or_create(name="Short Story")[0]
+        self.doyle = Author.objects.create(name="Arthur Conan Doyle")
+        self.rai = Author.objects.create(name="Asha Rai")
+        self.reader = User.objects.create_user(email="lib@example.com", username="libreader", password="x", is_active=True)
+
+        def make(slug, **kw):
+            genres = kw.pop("genres", [])
+            categories = kw.pop("categories", [])
+            story = Story.objects.create(
+                title=kw.pop("title", slug.replace("-", " ").title()), slug=slug, is_published=True, **kw
+            )
+            story.genres.set(genres)
+            story.categories.set(categories)
+            return story
+
+        self.a = make("alpha", genres=[self.fantasy], categories=[self.folk], language="en", country="NP", author=self.rai,
+                      story_type=self.short, cached_chapter_reading_minutes=5, is_original=True, views=50, rating=4.0)
+        self.b = make("bravo", genres=[self.fantasy, self.mystery], language="ne", country="NP", author=self.rai,
+                      story_type=self.novel, cached_chapter_reading_minutes=45, views=10, rating=5.0, is_completed=True)
+        self.c = make("charlie", genres=[self.mystery], language="en", country="GB", author=self.doyle,
+                      story_type=self.novel, cached_chapter_reading_minutes=120, views=30, rating=3.0, is_completed=True)
+        self.d = make("delta", genres=[], language="en", country="", author=self.doyle,
+                      story_type=self.novel, cached_chapter_reading_minutes=400, views=5, rating=1.0)
+        self.e = make("echo", language="en", views=1)  # unknown length
+        Audio.objects.create(story=self.a, title="A", slug="a-audio", audio_file="story_audios/a.mp3", order=1,
+                             transcript="<p>words</p>")
+        Audio.objects.create(story=self.b, title="B", slug="b-audio", audio_file="story_audios/b.mp3", order=1)
+        Video.objects.create(story=self.c, title="C", slug="c-video", youtube_url="https://youtu.be/dQw4w9WgXcQ", youtube_id="dQw4w9WgXcQ")
+        Story.objects.filter(pk=self.d.pk).update(summary="<p>Short summary</p>")
+        Chapter.objects.create(story=self.a, title="Ch", slug="a-ch1", content="<p>x</p>", order=1)
+        # The chapter signal recomputes the cache; pin the value the tests rely on.
+        Story.objects.filter(pk=self.a.pk).update(cached_chapter_reading_minutes=5)
+
+    def _slugs(self, **params):
+        response = self.client.get(reverse("story-list"), params)
+        self.assertEqual(response.status_code, 200, response.content)
+        return [row["slug"] for row in response.json()["results"]]
+
+    def _set(self, **params):
+        return set(self._slugs(**params))
+
+    # --- filters ---------------------------------------------------------------
+
+    def test_genre_and_category_filter_by_slug_or_id(self):
+        self.assertEqual(self._set(genre="fantasy"), {"alpha", "bravo"})
+        self.assertEqual(self._set(genre=str(self.fantasy.pk)), {"alpha", "bravo"})
+        self.assertEqual(self._set(genre="fantasy,mystery"), {"alpha", "bravo", "charlie"})
+        self.assertEqual(self._set(category="folk-tales"), {"alpha"})
+        self.assertEqual(self._set(genres=str(self.mystery.pk)), {"bravo", "charlie"})  # legacy id param still works
+
+    def test_length_buckets_use_the_reading_estimate(self):
+        self.assertEqual(self._set(length="under_10"), {"alpha"})
+        self.assertEqual(self._set(length="10_60"), {"bravo"})
+        self.assertEqual(self._set(length="1_5h"), {"charlie"})
+        self.assertEqual(self._set(length="5h_plus"), {"delta"})  # unknown length (echo) is in no bucket
+        self.assertEqual(self._set(length="bogus"), {"alpha", "bravo", "charlie", "delta", "echo"})
+
+    def test_country_author_original_and_status(self):
+        self.assertEqual(self._set(country="NP"), {"alpha", "bravo"})
+        self.assertEqual(self._set(author=str(self.doyle.pk)), {"charlie", "delta"})
+        self.assertEqual(self._set(author="arthur-conan-doyle"), {"charlie", "delta"})
+        self.assertEqual(self._set(author="nobody"), set())
+        self.assertEqual(self._set(original="true"), {"alpha"})
+        self.assertEqual(self._set(is_original="true"), {"alpha"})
+        self.assertEqual(self._set(status="completed"), {"bravo", "charlie"})
+
+    def test_format_filter_maps_to_the_availability_flags(self):
+        self.assertEqual(self._set(format="listen"), {"alpha", "bravo"})
+        self.assertEqual(self._set(format="watch"), {"charlie"})
+        self.assertEqual(self._set(format="read_along"), {"alpha"})
+        self.assertEqual(self._set(format="read-along"), {"alpha"})
+        self.assertEqual(self._set(format="quick_read"), {"delta"})
+        self.assertEqual(self._set(format="read"), {"alpha"})  # only story with chapters/files
+
+    def test_filters_combine(self):
+        self.assertEqual(self._set(genre="fantasy", language="ne"), {"bravo"})
+        self.assertEqual(self._set(genre="fantasy", length="under_10", format="listen"), {"alpha"})
+        self.assertEqual(self._set(country="NP", original="true", status="ongoing"), {"alpha"})
+        self.assertEqual(self._set(genre="mystery", author=str(self.rai.pk)), {"bravo"})
+        self.assertEqual(self._set(genre="fantasy", length="5h_plus"), set())
+
+    def test_new_sorts(self):
+        self.assertEqual(self._slugs(sort="title")[:3], ["alpha", "bravo", "charlie"])
+        self.assertEqual(self._slugs(sort="shortest"), ["alpha", "bravo", "charlie", "delta", "echo"])  # unknown last
+        self.assertEqual(self._slugs(sort="popular")[:3], ["alpha", "charlie", "bravo"])  # most viewed first
+        self.assertEqual(self._slugs(sort="rating")[:2], ["bravo", "alpha"])
+
+    def test_list_serializer_carries_what_the_card_needs_without_n_plus_one(self):
+        response = self.client.get(reverse("story-list"), {"sort": "title"})
+        row = response.json()["results"][0]
+        for key in ("author", "reading_time_minutes", "language", "has_audio", "has_video", "has_read_along",
+                    "is_original", "site_published_date", "country", "has_text"):
+            self.assertIn(key, row)
+        self.assertEqual((row["author"], row["reading_time_minutes"], row["country"]), ("Asha Rai", 5, "NP"))
+        by_slug = {r["slug"]: r["has_text"] for r in response.json()["results"]}
+        self.assertTrue(by_slug["alpha"])  # has a chapter
+        self.assertFalse(by_slug["bravo"])
+        counts = []
+        for _ in range(2):
+            from django.db import connection
+            from django.test.utils import CaptureQueriesContext
+
+            with CaptureQueriesContext(connection) as ctx:
+                self.client.get(reverse("story-list"), {"sort": "title"})
+            counts.append(len(ctx))
+        for n in range(6):
+            extra = Story.objects.create(title=f"Extra {n}", slug=f"extra-{n}", is_published=True, author=self.rai)
+            extra.genres.set([self.fantasy])
+        with CaptureQueriesContext(connection) as ctx:
+            self.client.get(reverse("story-list"), {"sort": "title"})
+        self.assertEqual(len(ctx), counts[0])
+
+    # --- facets ------------------------------------------------------------------
+
+    def _facets(self, **params):
+        cache.clear()
+        response = self.client.get(reverse("story-facets"), params)
+        self.assertEqual(response.status_code, 200, response.content)
+        return response.json()
+
+    @staticmethod
+    def _by(rows, key):
+        return {row[key]: row["count"] for row in rows}
+
+    def test_facets_count_the_whole_catalogue_with_no_filters(self):
+        data = self._facets()
+        self.assertEqual(data["total"], 5)
+        self.assertEqual(self._by(data["genres"], "slug"), {"fantasy": 2, "mystery": 2})
+        self.assertEqual(self._by(data["languages"], "value"), {"en": 4, "ne": 1})
+        self.assertEqual(self._by(data["countries"], "value"), {"NP": 2, "GB": 1})
+        self.assertEqual(self._by(data["lengths"], "value"), {"under_10": 1, "10_60": 1, "1_5h": 1, "5h_plus": 1})
+        self.assertEqual(self._by(data["statuses"], "value"), {"completed": 2, "ongoing": 3})
+        self.assertEqual(self._by(data["formats"], "value"),
+                         {"all": 5, "read": 1, "listen": 2, "read_along": 1, "watch": 1, "quick_read": 1})
+        self.assertEqual(data["originals"]["count"], 1)
+        self.assertEqual(self._by(data["types"], "name"), {"Novel": 3, "Short Story": 2})  # echo has the default type
+
+    def test_each_facet_is_counted_under_the_other_active_filters(self):
+        data = self._facets(language="en")
+        # genres under language=en: bravo (ne) drops out
+        self.assertEqual(self._by(data["genres"], "slug"), {"fantasy": 1, "mystery": 1})
+        self.assertEqual(data["total"], 4)
+        # the language facet ignores its own filter, so "ne" is still offered
+        self.assertEqual(self._by(data["languages"], "value"), {"en": 4, "ne": 1})
+        self.assertEqual(self._by(data["countries"], "value"), {"NP": 1, "GB": 1})
+
+    def test_multi_select_facet_keeps_sibling_options(self):
+        data = self._facets(genre="fantasy", length="10_60")
+        # genre facet ignores `genre`, applies `length`: only bravo is 10-60 min
+        self.assertEqual(self._by(data["genres"], "slug"), {"fantasy": 1, "mystery": 1})
+        # length facet ignores `length`, applies `genre=fantasy`
+        self.assertEqual(self._by(data["lengths"], "value"), {"under_10": 1, "10_60": 1, "1_5h": 0, "5h_plus": 0})
+        self.assertEqual(data["total"], 1)
+
+    def test_format_facet_counts_other_filters_but_not_format(self):
+        data = self._facets(format="listen", genre="mystery")
+        self.assertEqual(self._by(data["formats"], "value")["all"], 2)  # bravo + charlie
+        self.assertEqual(self._by(data["formats"], "value")["watch"], 1)
+        self.assertEqual(data["total"], 1)  # only bravo is mystery AND listenable
+
+    def test_facets_are_cached(self):
+        self._facets()
+        Story.objects.create(title="Late", slug="late", is_published=True, language="fr")
+        response = self.client.get(reverse("story-facets"))
+        self.assertEqual(response.json()["total"], 5)  # served from cache
+        cache.clear()
+        self.assertEqual(self.client.get(reverse("story-facets")).json()["total"], 6)
+
+    # --- collections ---------------------------------------------------------------
+
+    def test_collections_shape_and_params_reproduce_the_list(self):
+        cache.clear()
+        for story in Story.objects.all():
+            Story.objects.filter(pk=story.pk).update(cover_image=f"https://example.com/{story.slug}.jpg")
+        for n in range(3):  # enough Nepali stories to earn a tile
+            Story.objects.create(title=f"Nepali {n}", slug=f"nep-{n}", is_published=True, language="ne",
+                                 cover_image=f"https://example.com/n{n}.jpg")
+        response = self.client.get(reverse("story-collections"))
+        self.assertEqual(response.status_code, 200)
+        tiles = response.json()["results"]
+        keys = [tile["key"] for tile in tiles]
+        self.assertIn("nepali", keys)
+        self.assertNotIn("originals", keys)  # one original is below the minimum
+        for tile in tiles:
+            self.assertEqual(set(tile), {"key", "label", "params", "count", "covers"})
+            self.assertLessEqual(len(tile["covers"]), 3)
+            self.assertGreaterEqual(tile["count"], 3)
+            listed = self.client.get(reverse("story-list"), tile["params"]).json()["pagination"]["count"]
+            self.assertEqual(listed, tile["count"], tile["key"])
+        nepali = next(tile for tile in tiles if tile["key"] == "nepali")
+        self.assertEqual(nepali["params"], {"language": "ne"})
+        self.assertEqual(len(nepali["covers"]), 3)
+
+    def test_collections_are_cached_for_an_hour(self):
+        from apps.story import library_api
+
+        cache.clear()
+        for n in range(3):
+            Story.objects.create(title=f"N{n}", slug=f"n{n}", is_published=True, language="ne")
+        self.client.get(reverse("story-collections"))
+        Story.objects.create(title="N9", slug="n9", is_published=True, language="ne")
+        again = self.client.get(reverse("story-collections")).json()["results"]
+        self.assertEqual(next(t for t in again if t["key"] == "nepali")["count"], 4)  # bravo + the three, not the fifth
+        self.assertEqual(library_api.COLLECTIONS_CACHE_SECONDS, 3600)
+
+    # --- bulk progress ---------------------------------------------------------------
+
+    def test_progress_requires_sign_in_and_returns_many_stories_at_once(self):
+        from apps.stats.models import AudioReadingProgress, ChapterReadingProgress, StoryCompletion
+
+        ids = f"{self.a.pk},{self.b.pk},{self.c.pk},{self.d.pk}"
+        self.assertEqual(self.client.get(reverse("story-progress"), {"ids": ids}).status_code, 401)
+
+        chapter = Chapter.objects.get(slug="a-ch1")
+        ChapterReadingProgress.objects.create(user=self.reader, story=self.a, chapter=chapter, progress=0.4)
+        AudioReadingProgress.objects.create(user=self.reader, story=self.b, audio=Audio.objects.get(slug="b-audio"), progress=0.75)
+        StoryCompletion.objects.create(user=self.reader, story=self.c, source="chapters")
+        self.client.force_authenticate(self.reader)
+        data = self.client.get(reverse("story-progress"), {"ids": ids}).json()["progress"]
+        self.assertEqual(data, {str(self.a.pk): 0.4, str(self.b.pk): 0.75, str(self.c.pk): 1.0})
+        self.assertEqual(self.client.get(reverse("story-progress")).json(), {"progress": {}})
