@@ -2879,131 +2879,84 @@ class HomeDataAPIView(APIView):
         )
 
 
-@method_decorator(cache_page(DISCOVERY_CACHE_SECONDS), name="get")
-@method_decorator(vary_on_headers("Authorization"), name="get")
-class TrendingDataAPIView(APIView):
-    def get(self, request):
-        # for_card_list() already annotates _favorites_count / _reviews_count —
-        # reuse them for the "most X" orderings instead of a second pair.
-        base_qs = Story.objects.published().for_card_list()
-        return Response(
-            {
-                "most_viewed": StoryListSerializer(
-                    base_qs.order_by("-views", "-id")[:10],
-                    many=True,
-                    context={"request": request},
-                ).data,
-                "highest_rated": StoryListSerializer(
-                    base_qs.order_by("-rating", "-views", "-id")[:10],
-                    many=True,
-                    context={"request": request},
-                ).data,
-                "most_favorited": StoryListSerializer(
-                    base_qs.order_by("-_favorites_count", "-id")[:10],
-                    many=True,
-                    context={"request": request},
-                ).data,
-                "most_discussed": StoryListSerializer(
-                    base_qs.order_by("-_reviews_count", "-id")[:10],
-                    many=True,
-                    context={"request": request},
-                ).data,
-            }
-        )
+def _story_cards(story_ids, request):
+    """Card-list serializations for `story_ids`, in that order (missing ones skipped)."""
+    stories = {s.pk: s for s in Story.objects.published().for_card_list().filter(pk__in=story_ids)}
+    ordered = [stories[pk] for pk in story_ids if pk in stories]
+    return ordered, StoryListSerializer(ordered, many=True, context={"request": request}).data
 
 
 @method_decorator(cache_page(DISCOVERY_CACHE_SECONDS), name="get")
 @method_decorator(vary_on_headers("Authorization"), name="get")
 class DiscoverDataAPIView(APIView):
-    def get(self, request):
-        base_qs = Story.objects.published().for_card_list()
-        trending_qs = base_qs
+    """The Discover page: what is trending this week, hidden gems, what was just
+    added, where the stories come from, and the biggest genres. See
+    apps/story/discover_api.py for the rules behind each list."""
 
-        story_types = (
-            StoryType.objects.filter(published_story_q("stories"))
-            .annotate(
-                published_stories_count=Count(
-                    "stories",
-                    filter=published_story_q("stories"),
-                    distinct=True,
-                )
-            )
-            .order_by("name")
-        )
-        language_counts = {
-            item["language"]: item["stories_count"]
-            for item in Story.objects.published()
-            .values("language")
-            .annotate(stories_count=Count("id"))
-        }
-        languages = [
+    def get(self, request):
+        from . import discover_api
+
+        trending_rows = discover_api.get_trending()
+        _, trending_cards = _story_cards([row["story_id"] for row in trending_rows], request)
+        card_by_id = {card["id"]: card for card in trending_cards}
+        trending = [
             {
-                "value": value,
-                "label": label,
-                "stories_count": language_counts[value],
+                "story": card_by_id[row["story_id"]],
+                "readers": row["readers"],
+                "window_days": row["window_days"],
+                "rank_change": row["rank_change"],
             }
-            for value, label in LANGUAGE_CHOICES
-            if value in language_counts
+            for row in trending_rows
+            if row["story_id"] in card_by_id
         ]
-        genres = (
-            Genre.objects.filter(published_story_q("stories"))
-            .annotate(
-                published_stories_count=Count(
-                    "stories",
-                    filter=published_story_q("stories"),
-                    distinct=True,
-                )
-            )
-            .order_by("name")
-        )
-        categories = (
-            Category.objects.filter(published_story_q("stories"))
-            .annotate(
-                published_stories_count=Count(
-                    "stories",
-                    filter=published_story_q("stories"),
-                    distinct=True,
-                )
-            )
-            .order_by("name")
-        )
+
+        gem_rows = discover_api.get_hidden_gems()
+        _, gem_cards = _story_cards([row["story_id"] for row in gem_rows], request)
+        gem_by_id = {card["id"]: card for card in gem_cards}
+        hidden_gems = [
+            {"story": gem_by_id[row["story_id"]], "reason": row["reason"]}
+            for row in gem_rows
+            if row["story_id"] in gem_by_id
+        ]
+
+        added = discover_api.compute_just_added()
+        _, added_cards = _story_cards([story_id for story_id, _fmt in added], request)
+        added_by_id = {card["id"]: card for card in added_cards}
+        just_added = [
+            {"story": added_by_id[story_id], "format": fmt} for story_id, fmt in added if story_id in added_by_id
+        ]
+
         return Response(
             {
-                "genres": GenreSerializer(genres, many=True).data,
-                "categories": CategorySerializer(categories, many=True).data,
-                "story_types": StoryTypeSerializer(story_types, many=True).data,
-                "languages": languages,
-                "most_viewed": StoryListSerializer(
-                    trending_qs.order_by("-views", "-id")[:10],
-                    many=True,
-                    context={"request": request},
-                ).data,
-                "highest_rated": StoryListSerializer(
-                    trending_qs.order_by("-rating", "-views", "-id")[:10],
-                    many=True,
-                    context={"request": request},
-                ).data,
-                "most_favorited": StoryListSerializer(
-                    trending_qs.order_by("-_favorites_count", "-id")[:10],
-                    many=True,
-                    context={"request": request},
-                ).data,
-                "most_discussed": StoryListSerializer(
-                    trending_qs.order_by("-_reviews_count", "-id")[:10],
-                    many=True,
-                    context={"request": request},
-                ).data,
-                "new_releases": StoryListSerializer(
-                    base_qs.order_by("-site_published_date", "-id")[:20],
-                    many=True,
-                    context={"request": request},
-                ).data,
-                "hidden_gems": StoryListSerializer(
-                    base_qs.order_by("-rating", "views", "-id")[:20],
-                    many=True,
-                    context={"request": request},
-                ).data,
+                "trending": trending,
+                "hidden_gems": hidden_gems,
+                "just_added": just_added,
+                "countries": discover_api.compute_countries(request),
+                "popular_genres": discover_api.compute_popular_genres(),
             }
+        )
+
+
+class DiscoverSurpriseAPIView(APIView):
+    """One random story worth opening: published, with a real cover and a
+    description. `?exclude=1,2,3` (ids) keeps the ones already shown out; when
+    everything has been shown the pool is reused and `recycled` is true."""
+
+    def get(self, request):
+        from . import discover_api
+
+        exclude = [int(token) for token in request.query_params.get("exclude", "").split(",") if token.strip().isdigit()]
+        pool = discover_api.surprise_pool(exclude)
+        recycled = False
+        if not pool.exists():
+            recycled = bool(exclude)
+            pool = discover_api.surprise_pool()
+        story = pool.order_by("?").values_list("pk", flat=True).first()
+        if story is None:
+            return Response({"story": None, "blurb": "", "recycled": False})
+        stories, cards = _story_cards([story], request)
+        return Response(
+            {"story": cards[0] if cards else None, "blurb": discover_api.blurb_for(stories[0]) if stories else "", "recycled": recycled}
         )
 
 
@@ -3026,6 +2979,8 @@ class StoryJourneyListAPIView(APIView):
                         "description": row["journey"].description,
                         "type": row["journey"].type,
                         "cover_image": _journey_cover(row["journey"], request),
+                        # Up to two story covers, for the Discover card's collage.
+                        "covers": _journey_covers(row["journey"], request),
                         "completed": row["completed"],
                         "total": row["total"],
                         "is_complete": row["is_complete"],
@@ -3034,6 +2989,13 @@ class StoryJourneyListAPIView(APIView):
                 ]
             }
         )
+
+
+def _journey_covers(journey, request, limit=2):
+    return [
+        get_cover_image_url(item.story.cover_image_file, item.story.cover_image, request, size=CARD_COVER_SIZE)
+        for item in list(journey.items.all())[:limit]
+    ]
 
 
 def _journey_cover(journey, request):

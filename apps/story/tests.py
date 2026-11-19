@@ -2078,52 +2078,6 @@ class PublicAuthorApiTests(APITestCase):
 
         self.assertEqual(response.data["chapters"]["results"], [])
 
-    def test_discover_only_returns_genres_with_public_titles(self):
-        public_genre = Genre.objects.create(name="Public Genre")
-        empty_genre = Genre.objects.create(name="Draft Only Genre")
-        Story.objects.get(slug="published-book").genres.add(public_genre)
-        Story.objects.get(slug="draft-book").genres.add(empty_genre)
-
-        response = self.client.get(reverse("discover-data"))
-
-        self.assertEqual(response.status_code, 200)
-        genres = {genre["name"]: genre["stories_count"] for genre in response.data["genres"]}
-        self.assertEqual(genres, {"Public Genre": 1})
-
-    def test_discover_returns_only_story_types_and_languages_with_public_titles(self):
-        Story.objects.create(
-            title="Published Spanish Novel",
-            slug="published-spanish-novel",
-            story_type=StoryType.objects.get(name="Novel"),
-            language="es",
-            is_published=True,
-        )
-        Story.objects.create(
-            title="Draft French Poetry",
-            slug="draft-french-poetry",
-            story_type=StoryType.objects.get(name="Poetry"),
-            language="fr",
-            is_published=False,
-        )
-
-        response = self.client.get(reverse("discover-data"))
-
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(
-            {item["name"]: item["stories_count"] for item in response.data["story_types"]},
-            {"Novel": 1, "Short Story": 1},
-        )
-        self.assertEqual(
-            {item["value"]: item["stories_count"] for item in response.data["languages"]},
-            {"en": 1, "es": 1},
-        )
-        self.assertEqual(
-            {"most_viewed", "highest_rated", "most_favorited", "most_discussed"},
-            set(response.data).intersection(
-                {"most_viewed", "highest_rated", "most_favorited", "most_discussed"}
-            ),
-        )
-
     def test_story_list_can_filter_by_story_type(self):
         novel_type = StoryType.objects.get(name="Novel")
         Story.objects.create(
@@ -6946,3 +6900,267 @@ class LibraryFilterTests(APITestCase):
         data = self.client.get(reverse("story-progress"), {"ids": ids}).json()["progress"]
         self.assertEqual(data, {str(self.a.pk): 0.4, str(self.b.pk): 0.75, str(self.c.pk): 1.0})
         self.assertEqual(self.client.get(reverse("story-progress")).json(), {"progress": {}})
+
+
+class DiscoverDataTests(APITestCase):
+    """Discover: trending on recent audience events, hidden gems, just added,
+    countries, popular genres and the surprise pick."""
+
+    def setUp(self):
+        cache.clear()
+        self.client.defaults["HTTP_USER_AGENT"] = "Mozilla/5.0 Chrome"
+        self.now = timezone.now()
+        self.staff = User.objects.create_user(email="dstaff@example.com", username="dstaff", password="x", is_staff=True, is_active=True)
+        self.member = User.objects.create_user(email="dmember@example.com", username="dmember", password="x", is_active=True)
+        self.n = 0
+
+    def _story(self, slug, **kw):
+        kw.setdefault("cover_image", "https://example.com/c.jpg")
+        return Story.objects.create(title=slug.replace("-", " ").title(), slug=slug, is_published=True, **kw)
+
+    def _event(self, story, visitor, event_type="reading_session", days_ago=1, **kw):
+        event = AnalyticsEvent.objects.create(event_type=event_type, visitor_id=visitor, story=story, **kw)
+        AnalyticsEvent.objects.filter(pk=event.pk).update(created_at=self.now - timedelta(days=days_ago, hours=1))
+        return event
+
+    def _readers(self, story, count, *, prefix=None, days_ago=1, event_type="reading_session"):
+        for i in range(count):
+            self._event(story, f"{prefix or story.slug}-{i}", event_type, days_ago)
+
+    def _get(self):
+        cache.clear()
+        response = self.client.get(reverse("discover-data"))
+        self.assertEqual(response.status_code, 200, response.content)
+        return response.json()
+
+    # --- trending ---------------------------------------------------------------
+
+    def test_trending_uses_recent_unique_audience_readers_not_lifetime_views(self):
+        famous = self._story("famous", views=999_999)  # lifetime views must not matter
+        rising = self._story("rising", views=1)
+        quiet = self._story("quiet")
+        self._readers(famous, 8, days_ago=20)  # old activity, outside 7 days
+        self._readers(rising, 6)
+        self._readers(quiet, 5)
+        # the same person reading twice is one reader
+        self._event(rising, "rising-0")
+        self._event(rising, "rising-0", "listening_session")
+        # staff, a suspected bot and a draft never count
+        self._event(quiet, "staff", user=self.staff)
+        for i in range(20):
+            self._event(quiet, f"bot-{i}", is_suspected_bot=True)
+
+        rows = self._get()["trending"]
+        self.assertEqual([r["story"]["slug"] for r in rows], ["rising", "quiet"])
+        self.assertEqual([r["readers"] for r in rows], [6, 5])
+        self.assertEqual({r["window_days"] for r in rows}, {7})
+        self.assertNotIn("famous", [r["story"]["slug"] for r in rows])
+
+    def test_trending_falls_back_to_30_days_when_the_week_is_too_quiet(self):
+        a, b = self._story("older-hit"), self._story("older-second")
+        self._readers(a, 7, days_ago=15)
+        self._readers(b, 3, days_ago=20)
+        self._readers(self._story("tiny"), 2, days_ago=2)  # top of the 7-day window, but only 2 readers
+        rows = self._get()["trending"]
+        self.assertEqual({r["window_days"] for r in rows}, {30})
+        self.assertEqual(rows[0]["story"]["slug"], "older-hit")
+
+    def test_trending_rank_change_compares_with_the_window_before(self):
+        climbing, falling, fresh = self._story("climbing"), self._story("falling"), self._story("fresh")
+        # previous week (8-14 days ago): falling 9 readers, climbing 5
+        self._readers(falling, 9, days_ago=10)
+        self._readers(climbing, 5, days_ago=10)
+        # this week: climbing 8, falling 6, fresh 5 (not ranked before)
+        self._readers(climbing, 8, prefix="c-now")
+        self._readers(falling, 6, prefix="f-now")
+        self._readers(fresh, 5, prefix="n-now")
+        rows = {r["story"]["slug"]: r for r in self._get()["trending"]}
+        self.assertEqual(rows["climbing"]["rank_change"], 1)   # second -> first
+        self.assertEqual(rows["falling"]["rank_change"], -1)   # first -> second
+        self.assertIsNone(rows["fresh"]["rank_change"])
+
+    def test_trending_ranking_is_cached(self):
+        a = self._story("cached-a")
+        self._readers(a, 5)
+        self._get()
+        self._readers(self._story("cached-b"), 9)
+        response = self.client.get(reverse("discover-data")).json()  # cache_page + ranking cache still warm
+        self.assertEqual([r["story"]["slug"] for r in response["trending"]], ["cached-a"])
+
+    # --- hidden gems --------------------------------------------------------------
+
+    def _gem_activity(self, story, starters, finishers, *, extra_viewers=0, days_ago=10):
+        for i in range(starters):
+            self._event(story, f"{story.slug}-s{i}", "story_started", days_ago)
+        for i in range(finishers):
+            user = User.objects.create_user(email=f"{story.slug}-{i}@example.com", username=f"{story.slug}{i}", password="x", is_active=True)
+            self._event(story, "server", "story_completed", days_ago, user=user)
+        for i in range(extra_viewers):
+            self._event(story, f"{story.slug}-v{i}", "visit", days_ago)
+
+    def test_hidden_gem_needs_five_starters_and_below_median_viewers(self):
+        gem = self._story("quiet-gem")
+        popular = self._story("popular-one")
+        popular_two = self._story("popular-two")
+        few = self._story("too-few-starters")
+        self._gem_activity(gem, starters=6, finishers=5)               # 6 viewers
+        self._gem_activity(popular, starters=30, finishers=2, extra_viewers=10)  # 40 viewers
+        self._gem_activity(popular_two, starters=25, finishers=20)       # 25 viewers
+        self._gem_activity(few, starters=4, finishers=4)                 # under the starter bar
+        rows = self._get()["hidden_gems"]
+        self.assertEqual([r["story"]["slug"] for r in rows], ["quiet-gem"])
+        self.assertEqual(rows[0]["reason"], "83% of readers finish it")
+
+    def test_hidden_gems_rank_by_completion_rate(self):
+        low, high = self._story("gem-low"), self._story("gem-high")
+        big = self._story("crowd")
+        self._gem_activity(low, starters=10, finishers=3)
+        self._gem_activity(high, starters=5, finishers=5)
+        self._gem_activity(big, starters=100, finishers=50, extra_viewers=50)
+        self._gem_activity(self._story("crowd-two"), starters=60, finishers=1, extra_viewers=40)
+        rows = self._get()["hidden_gems"]
+        self.assertEqual([r["story"]["slug"] for r in rows], ["gem-high", "gem-low"])
+        self.assertEqual([r["reason"] for r in rows], ["100% of readers finish it", "30% of readers finish it"])
+
+    def test_well_reviewed_story_qualifies_with_a_review_reason(self):
+        loved = self._story("well-loved")
+        meh = self._story("so-so")
+        for i, rating in enumerate([5, 5, 4]):
+            user = User.objects.create_user(email=f"rev{i}@example.com", username=f"rev{i}", password="x", is_active=True)
+            Review.objects.create(story=loved, user=user, rating=rating)
+        for i, rating in enumerate([5, 4, 4]):
+            user = User.objects.create_user(email=f"mrev{i}@example.com", username=f"mrev{i}", password="x", is_active=True)
+            Review.objects.create(story=meh, user=user, rating=rating)  # 4.33 average
+        Review.objects.create(story=self._story("one-review"), user=self.member, rating=5)  # below 3 reviews
+        rows = self._get()["hidden_gems"]
+        self.assertEqual([(r["story"]["slug"], r["reason"]) for r in rows], [("well-loved", "4.7★ from 3 readers")])
+
+    def test_hidden_gems_is_empty_when_nothing_qualifies(self):
+        self._readers(self._story("lonely"), 3)
+        self.assertEqual(self._get()["hidden_gems"], [])
+
+    # --- just added ----------------------------------------------------------------
+
+    def test_just_added_lists_each_story_once_under_its_newest_format(self):
+        from datetime import date
+
+        today = date.today()
+        text_only = self._story("text-only", site_published_date=today - timedelta(days=5))
+        Chapter.objects.create(story=text_only, title="C", slug="to-c1", content="<p>x</p>", order=1)
+        audio_only = self._story("audio-only", site_published_date=today - timedelta(days=3))
+        Audio.objects.create(story=audio_only, title="A", slug="ao-a", audio_file="story_audios/a.mp3", order=1)
+        both = self._story("text-and-video", site_published_date=today - timedelta(days=30))
+        Chapter.objects.create(story=both, title="C", slug="tv-c1", content="<p>x</p>", order=1)
+        Video.objects.create(story=both, title="V", slug="tv-v", youtube_url="https://youtu.be/dQw4w9WgXcQ", youtube_id="dQw4w9WgXcQ")  # added today
+        summary = self._story("summary-only", site_published_date=today - timedelta(days=8), summary="<p>Short.</p>")
+        draft = Story.objects.create(title="Draft", slug="draft-added", is_published=False, site_published_date=today)
+
+        rows = self._get()["just_added"]
+        slugs = [r["story"]["slug"] for r in rows]
+        self.assertEqual(len(slugs), len(set(slugs)))  # nobody twice
+        self.assertNotIn("draft-added", slugs)
+        self.assertEqual(
+            {r["story"]["slug"]: r["format"] for r in rows},
+            {"text-and-video": "watch", "audio-only": "listen", "text-only": "read", "summary-only": "quick_read"},
+        )
+        self.assertEqual(slugs, ["text-and-video", "audio-only", "text-only", "summary-only"])  # newest first
+        self.assertIsNotNone(draft.pk)
+
+    def test_just_added_prefers_the_richer_format_on_a_tie(self):
+        from datetime import date
+
+        story = self._story("tie", site_published_date=date.today(), summary="<p>S</p>")
+        Chapter.objects.create(story=story, title="C", slug="tie-c1", content="<p>x</p>", order=1)
+        Audio.objects.create(story=story, title="A", slug="tie-a", audio_file="story_audios/t.mp3", order=1)
+        rows = self._get()["just_added"]
+        self.assertEqual([(r["story"]["slug"], r["format"]) for r in rows], [("tie", "listen")])
+
+    def test_just_added_is_capped_at_24(self):
+        from datetime import date
+
+        for i in range(30):
+            s = self._story(f"bulk-{i}", site_published_date=date.today() - timedelta(days=i))
+            Chapter.objects.create(story=s, title="C", slug=f"bulk-c-{i}", content="<p>x</p>", order=1)
+        self.assertEqual(len(self._get()["just_added"]), 24)
+
+    # --- countries / genres -----------------------------------------------------------
+
+    def test_countries_are_the_top_eight_by_published_story_count(self):
+        counts = {"NP": 5, "IN": 4, "US": 3, "GB": 2, "DE": 2, "JP": 1, "FR": 1, "BR": 1, "RU": 1, "KR": 1}
+        for code, n in counts.items():
+            for i in range(n):
+                self._story(f"{code.lower()}-{i}", country=code)
+        Story.objects.create(title="Hidden NP", slug="hidden-np", is_published=False, country="NP")
+        self._story("no-country")
+        rows = self._get()["countries"]
+        self.assertEqual(len(rows), 8)
+        self.assertEqual([(r["code"], r["name"], r["count"]) for r in rows[:3]], [("NP", "Nepal", 5), ("IN", "India", 4), ("US", "United States", 3)])
+        self.assertTrue(all(len(r["covers"]) <= 3 for r in rows))
+        self.assertEqual(len(rows[0]["covers"]), 3)
+
+    def test_popular_genres_are_the_twelve_biggest_with_published_counts(self):
+        from apps.story.models import Genre
+
+        for g in range(14):
+            genre = Genre.objects.create(name=f"Genre {g:02d}", slug=f"genre-{g:02d}")
+            for i in range(14 - g):
+                self._story(f"g{g}-{i}").genres.add(genre)
+        solo = Genre.objects.create(name="Draft Only", slug="draft-only")
+        Story.objects.create(title="D", slug="d-only", is_published=False).genres.add(solo)
+        rows = self._get()["popular_genres"]
+        self.assertEqual(len(rows), 12)
+        self.assertEqual((rows[0]["name"], rows[0]["count"], rows[0]["slug"]), ("Genre 00", 14, "genre-00"))
+        self.assertNotIn("Draft Only", [r["name"] for r in rows])
+
+    def test_old_leaderboard_keys_are_gone(self):
+        data = self._get()
+        for key in ("most_viewed", "highest_rated", "most_favorited", "most_discussed", "new_releases", "genres", "categories", "languages"):
+            self.assertNotIn(key, data)
+
+    # --- surprise -------------------------------------------------------------------
+
+    def test_surprise_picks_only_stories_with_a_cover_and_a_description(self):
+        ok = self._story("surprise-ok", about="<p>A <b>haunted</b> lantern.</p>")
+        self._story("no-cover", cover_image="", about="Has text")
+        self._story("no-blurb")
+        Story.objects.create(title="Draft", slug="draft-s", is_published=False, cover_image="https://x/y.jpg", about="d")
+        for _ in range(5):
+            data = self.client.get(reverse("discover-surprise")).json()
+            self.assertEqual(data["story"]["slug"], "surprise-ok")
+        self.assertEqual(data["blurb"], "A haunted lantern.")
+        self.assertEqual(data["story"]["id"], ok.pk)
+
+    def test_surprise_honours_exclude_and_recycles_when_everything_was_shown(self):
+        a = self._story("sa", about="one")
+        b = self._story("sb", about="two")
+        for _ in range(6):
+            data = self.client.get(reverse("discover-surprise"), {"exclude": str(a.pk)}).json()
+            self.assertEqual(data["story"]["id"], b.pk)
+            self.assertFalse(data["recycled"])
+        both = self.client.get(reverse("discover-surprise"), {"exclude": f"{a.pk},{b.pk}"}).json()
+        self.assertTrue(both["recycled"])
+        self.assertIn(both["story"]["id"], {a.pk, b.pk})
+
+    def test_surprise_with_no_qualifying_story_returns_null(self):
+        self._story("bare")
+        self.assertEqual(self.client.get(reverse("discover-surprise")).json()["story"], None)
+
+    # --- journeys and the length filter ---------------------------------------------------
+
+    def test_journeys_list_carries_two_covers_for_the_collage(self):
+        from apps.story.models import StoryJourney, StoryJourneyItem
+
+        journey = StoryJourney.objects.create(title="J", slug="j", active=True)
+        for i in range(3):
+            StoryJourneyItem.objects.create(journey=journey, story=self._story(f"j-{i}"), position=i)
+        row = self.client.get(reverse("journey-list")).json()["journeys"][0]
+        self.assertEqual(len(row["covers"]), 2)
+        self.assertEqual((row["completed"], row["total"]), (0, 3))
+
+    def test_story_list_filters_by_max_minutes(self):
+        short = self._story("max-short", cached_chapter_reading_minutes=15)
+        self._story("max-long", cached_chapter_reading_minutes=90)
+        self._story("max-unknown")
+        slugs = [s["slug"] for s in self.client.get(reverse("story-list"), {"max_minutes": "20"}).json()["results"]]
+        self.assertEqual(slugs, ["max-short"])
+        self.assertIsNotNone(short.pk)

@@ -91,6 +91,7 @@ class StoryFilter(filters.FilterSet):
     length = filters.CharFilter(method="filter_length", label="Length bucket")
     author = filters.CharFilter(method="filter_author", label="Author (id or slug)")
     format = filters.CharFilter(method="filter_format", label="Format")
+    max_minutes = filters.CharFilter(method="filter_max_minutes", label="At most this many minutes")
     original = filters.CharFilter(method="filter_is_original", label="WorldStories Original")
     sort = filters.CharFilter(method="filter_sort", label="Sort")
     q = filters.CharFilter(method="filter_q", label="Query")
@@ -137,6 +138,13 @@ class StoryFilter(filters.FilterSet):
         if high is not None:
             queryset = queryset.filter(_minutes__lt=high)
         return queryset
+
+    def filter_max_minutes(self, queryset, name, value):
+        """At most N minutes. Stories with no length estimate are left out: an
+        unknown length cannot be promised to fit."""
+        if not (value or "").strip().isdigit():
+            return queryset
+        return with_reading_minutes(queryset).filter(_minutes__lte=int(value))
 
     def filter_author(self, queryset, name, value):
         value = (value or "").strip()

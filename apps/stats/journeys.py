@@ -48,7 +48,7 @@ def journeys_for_reader(user, journeys=None):
     if journeys is None:
         journeys = (
             StoryJourney.objects.filter(active=True)
-            .prefetch_related("items")
+            .prefetch_related("items__story")
             .order_by("order", "title")
         )
     completed_ids = _completed_story_ids(user)
