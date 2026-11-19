@@ -7,7 +7,7 @@ import uuid
 from rest_framework.viewsets import ReadOnlyModelViewSet, ModelViewSet
 from rest_framework.views import APIView
 from django.core.exceptions import ValidationError as DjangoValidationError
-from django.db.models import Case, Sum, Avg, Count, Exists, F, IntegerField, OuterRef, Prefetch, Subquery, When
+from django.db.models import Case, Sum, Avg, Count, Exists, F, IntegerField, OuterRef, Prefetch, Subquery, When, Value, CharField
 from django.db.models import BooleanField, ExpressionWrapper, Max, Q
 from django.db.models.functions import Coalesce
 from django.http import FileResponse, Http404, HttpResponse, StreamingHttpResponse
@@ -41,6 +41,7 @@ from apps.users.recommendations import (
     recommend_stories_for,
 )
 from .home_metrics import get_home_stats
+from .author_merge import merge_authors
 from .home_sections import resolve_home_sections
 from .models import (
     HomeSection,
@@ -294,6 +295,11 @@ class LibraryShelfPagination(PageNumberPagination):
 class AuthorPagination(PageNumberPagination):
     page_size = 24
 
+    def get_page_size(self, request):
+        if request.query_params.get("page_size") == "all":
+            return 500
+        return super().get_page_size(request)
+
 
 class SearchAuthorPagination(PageNumberPagination):
     page_size = 12
@@ -342,17 +348,106 @@ class AuthorViewSet(ReadOnlyModelViewSet):
     serializer_class = AuthorSerializer
     pagination_class = AuthorPagination
 
-    def get_queryset(self):
-        return (
-            Author.objects.annotate(
-                published_stories_count=Count(
-                    "stories",
-                    filter=published_story_q("stories"),
-                    distinct=True,
+    def _base_queryset(self):
+        from .analytics_api import audience_events
+
+        audio_exists = Audio.objects.filter(story__author_id=OuterRef("pk")).filter(
+            published_story_q("story"), audio_file__isnull=False
+        ).exclude(audio_file="")
+        video_exists = Video.objects.filter(story__author_id=OuterRef("pk")).filter(published_story_q("story"))
+        read_along_exists = audio_exists.exclude(transcript="")
+        cutoff = timezone.now() - timedelta(days=30)
+        popular = (
+            audience_events(
+                AnalyticsEvent.objects.filter(
+                    story__author_id=OuterRef("pk"),
+                    created_at__gte=cutoff,
+                    event_type__in=[
+                        AnalyticsEvent.EVENT_READING_SESSION,
+                        AnalyticsEvent.EVENT_LISTENING_SESSION,
+                        AnalyticsEvent.EVENT_WATCHING_SESSION,
+                    ],
                 )
             )
-            .order_by("name", "id")
+            .order_by()
+            .values("story__author_id")
+            .annotate(total=Count("visitor_id", distinct=True))
+            .values("total")[:1]
         )
+        return Author.objects.annotate(
+            published_stories_count=Count("stories", filter=published_story_q("stories"), distinct=True),
+            directory_name=Case(When(sort_name="", then=F("name")), default=F("sort_name"), output_field=CharField()),
+            popular_readers=Coalesce(Subquery(popular), 0),
+            has_audio_format=Exists(audio_exists),
+            has_video_format=Exists(video_exists),
+            has_read_along_format=Exists(read_along_exists),
+        )
+
+    def get_queryset(self):
+        queryset = self._base_queryset()
+        if self.request.query_params.get("include_empty") != "1":
+            queryset = queryset.filter(published_stories_count__gt=0, is_house=False)
+        query = (self.request.query_params.get("q") or "").strip()
+        if query:
+            queryset = queryset.filter(Q(name__icontains=query) | Q(known_for__icontains=query))
+        letter = (self.request.query_params.get("letter") or "").strip()[:1]
+        if letter:
+            queryset = queryset.filter(
+                Q(sort_name__istartswith=letter) | Q(sort_name="", name__istartswith=letter)
+            )
+        country = self.request.query_params.get("country")
+        if country:
+            queryset = queryset.filter(country=country)
+        era = self.request.query_params.get("era")
+        if era:
+            queryset = queryset.filter(era=era)
+        genre = self.request.query_params.get("genre")
+        if genre:
+            queryset = queryset.filter(stories__genres__slug=genre, stories__is_published=True).distinct()
+        sort = self.request.query_params.get("sort", "az")
+        if sort == "titles":
+            return queryset.order_by("-published_stories_count", "directory_name", "id")
+        if sort == "popular":
+            return queryset.order_by("-popular_readers", "-published_stories_count", "directory_name", "id")
+        return queryset.order_by("directory_name", "id")
+
+    def get_object(self):
+        value = self.kwargs.get(self.lookup_field or "pk")
+        queryset = self.filter_queryset(self.get_queryset())
+        lookup = Q(pk=int(value)) if str(value).isdigit() else Q(slug=value)
+        return get_object_or_404(queryset, lookup)
+
+    @action(detail=False, methods=["get"])
+    def overview(self, request):
+        cache_key = "authors-overview-v1"
+        payload = cache.get(cache_key)
+        if payload is not None:
+            return Response(payload)
+        listed = self._base_queryset().filter(published_stories_count__gt=0, is_house=False)
+        featured_qs = listed.order_by("-popular_readers", "-published_stories_count", "directory_name", "id")
+        if not listed.filter(popular_readers__gt=0).exists():
+            featured_qs = listed.order_by("-published_stories_count", "directory_name", "id")
+        featured = list(featured_qs[:5])
+        letters = sorted({((item.sort_name or item.name).strip()[:1].upper()) for item in listed if (item.sort_name or item.name).strip()})
+        countries = list(
+            listed.exclude(country="").values("country").annotate(count=Count("id")).order_by("country")
+        )
+        country_labels = dict(COUNTRY_CHOICES)
+        for item in countries:
+            item["label"] = country_labels.get(item["country"], item["country"])
+        eras = list(listed.exclude(era="").values("era").annotate(count=Count("id")).order_by("era"))
+        traditional_count = Story.objects.filter(published_story_q()).filter(
+            Q(author__is_traditional=True) | Q(author__isnull=True)
+        ).count()
+        payload = {
+            "featured": AuthorSerializer(featured, many=True, context=self.get_serializer_context()).data,
+            "letters": letters,
+            "countries": countries,
+            "eras": eras,
+            "traditional_count": traditional_count,
+        }
+        cache.set(cache_key, payload, 60 * 15)
+        return Response(payload)
 
     def get_serializer_class(self):
         if self.action == "retrieve":
@@ -2420,6 +2515,32 @@ class AuthorAdminViewSet(ModelViewSet):
     pagination_class = None
     filter_backends = [SearchFilter]
     search_fields = ["name", "bio"]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        if self.request.query_params.get("missing_portrait") == "1":
+            queryset = queryset.filter(Q(image__isnull=True) | Q(image=""))
+        return queryset
+
+    def perform_create(self, serializer):
+        name = serializer.validated_data["name"]
+        base = slugify(name) or "author"
+        slug = base
+        suffix = 2
+        while Author.objects.filter(slug=slug).exists():
+            slug = f"{base}-{suffix}"
+            suffix += 1
+        serializer.save(slug=slug)
+
+    @action(detail=True, methods=["post"])
+    def merge(self, request, pk=None):
+        source = self.get_object()
+        target_id = request.data.get("target")
+        target = get_object_or_404(Author, pk=target_id)
+        if source.pk == target.pk:
+            raise ValidationError({"target": "Choose a different target author."})
+        moved = merge_authors(source, target)
+        return Response({"target": AdminAuthorSerializer(target, context=self.get_serializer_context()).data, "moved": [{"relation": label, "count": count} for label, count in moved]})
 
     def destroy(self, request, *args, **kwargs):
         author = self.get_object()

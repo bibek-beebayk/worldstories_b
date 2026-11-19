@@ -458,12 +458,47 @@ class StoryReaction(models.Model):
 
 
 class Author(models.Model):
+    ERA_CHOICES = (
+        ("ancient", "Ancient"),
+        ("pre_1800", "Before 1800"),
+        ("1800s", "1800s"),
+        ("1900s", "1900s"),
+        ("contemporary", "Contemporary"),
+    )
+
     name = models.CharField(max_length=100)
+    slug = models.SlugField(max_length=140, unique=True)
+    sort_name = models.CharField(max_length=140, blank=True, default="")
     bio = models.TextField(blank=True, null=True)
     image = models.URLField(blank=True, null=True)
+    birth_year = models.SmallIntegerField(blank=True, null=True)
+    death_year = models.SmallIntegerField(blank=True, null=True)
+    years_label = models.CharField(max_length=80, blank=True, default="")
+    country = models.CharField(max_length=2, choices=COUNTRY_CHOICES, blank=True, default="")
+    country_label = models.CharField(max_length=100, blank=True, default="")
+    era = models.CharField(max_length=16, choices=ERA_CHOICES, blank=True, default="")
+    known_for = models.CharField(max_length=180, blank=True, default="")
+    is_traditional = models.BooleanField(default=False)
+    is_house = models.BooleanField(default=False)
 
     def stories_count(self):
         return self.stories.count()
+
+    def save(self, *args, **kwargs):
+        if not self.slug:
+            from django.utils.text import slugify
+
+            base = slugify(self.name) or "author"
+            slug = base
+            suffix = 2
+            while Author.objects.exclude(pk=self.pk).filter(slug=slug).exists():
+                slug = f"{base}-{suffix}"
+                suffix += 1
+            self.slug = slug
+            update_fields = kwargs.get("update_fields")
+            if update_fields is not None:
+                kwargs["update_fields"] = set(update_fields) | {"slug"}
+        return super().save(*args, **kwargs)
 
     def __str__(self):
         return self.name

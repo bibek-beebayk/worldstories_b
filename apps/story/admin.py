@@ -482,7 +482,18 @@ class ThemeAdmin(admin.ModelAdmin):
 
 @admin.register(Author)
 class AuthorAdmin(admin.ModelAdmin):
-    search_fields = ("name", "bio")
+    search_fields = ("name", "sort_name", "bio", "known_for")
+    list_display = ("name", "sort_name", "country", "era", "is_traditional", "is_house", "has_portrait")
+    list_filter = ("country", "era", "is_traditional", "is_house")
+    prepopulated_fields = {"slug": ("name",)}
+    fields = (
+        "name", "slug", "sort_name", "image", "bio", "birth_year", "death_year", "years_label",
+        "country", "country_label", "era", "known_for", "is_traditional", "is_house",
+    )
+
+    @admin.display(boolean=True, description="Portrait")
+    def has_portrait(self, obj):
+        return bool(obj.image)
 
 
 @admin.register(Chapter)

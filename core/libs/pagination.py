@@ -20,7 +20,9 @@ class PageNumberPagination(BasePageNumberPagination):
 
     def get_response_data(self, data):
         count = self.page.paginator.count
-        size = self.page_size
+        # Reflect the size resolved for this request, including safe overrides
+        # such as the author directory's ``page_size=all`` cap.
+        size = self.page.paginator.per_page
         pagination = {
             'count': count,
             'page': self.page.number,

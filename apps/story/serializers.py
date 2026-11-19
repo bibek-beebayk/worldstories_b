@@ -181,6 +181,10 @@ class StoryTypeSerializer(serializers.ModelSerializer):
 
 class AuthorSerializer(serializers.ModelSerializer):
     stories_count = serializers.SerializerMethodField()
+    titles_count = serializers.SerializerMethodField()
+    years_label = serializers.SerializerMethodField()
+    country_label = serializers.SerializerMethodField()
+    formats = serializers.SerializerMethodField()
 
     def get_stories_count(self, obj):
         annotated_count = getattr(obj, "published_stories_count", None)
@@ -188,9 +192,40 @@ class AuthorSerializer(serializers.ModelSerializer):
             return annotated_count
         return obj.stories.filter(published_story_q()).count()
 
+    def get_titles_count(self, obj):
+        return self.get_stories_count(obj)
+
+    def get_years_label(self, obj):
+        if (obj.years_label or "").strip():
+            return obj.years_label.strip()
+        birth, death = obj.birth_year, obj.death_year
+        def year(value):
+            return f"{abs(value)} BC" if value is not None and value < 0 else str(value) if value is not None else ""
+        if birth is not None and death is not None:
+            return f"{year(birth)}–{year(death)}"
+        if birth is not None:
+            return f"b. {year(birth)}"
+        if death is not None:
+            return f"d. {year(death)}"
+        return ""
+
+    def get_country_label(self, obj):
+        return (obj.country_label or "").strip() or (obj.get_country_display() if obj.country else "")
+
+    def get_formats(self, obj):
+        return {
+            "audio": bool(getattr(obj, "has_audio_format", False)),
+            "video": bool(getattr(obj, "has_video_format", False)),
+            "read_along": bool(getattr(obj, "has_read_along_format", False)),
+        }
+
     class Meta:
         model = Author
-        fields = ["id", "name", "bio", "image", "stories_count"]
+        fields = [
+            "id", "slug", "name", "sort_name", "bio", "image", "birth_year", "death_year",
+            "years_label", "country", "country_label", "era", "known_for", "is_traditional",
+            "titles_count", "stories_count", "formats",
+        ]
 
 
 class StoryUserSerializer(serializers.Serializer):
@@ -208,7 +243,12 @@ class AdminAuthorSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Author
-        fields = ["id", "name", "bio", "image", "stories_count"]
+        fields = [
+            "id", "slug", "name", "sort_name", "bio", "image", "birth_year", "death_year",
+            "years_label", "country", "country_label", "era", "known_for", "is_traditional",
+            "is_house", "stories_count",
+        ]
+        extra_kwargs = {"slug": {"required": False}}
 
 
 class AdminGenreSerializer(serializers.ModelSerializer):

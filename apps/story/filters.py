@@ -90,6 +90,7 @@ class StoryFilter(filters.FilterSet):
     category = filters.CharFilter(method="filter_category", label="Category (slug or id)")
     length = filters.CharFilter(method="filter_length", label="Length bucket")
     author = filters.CharFilter(method="filter_author", label="Author (id or slug)")
+    traditional = filters.CharFilter(method="filter_traditional", label="Anonymous or traditional")
     format = filters.CharFilter(method="filter_format", label="Format")
     max_minutes = filters.CharFilter(method="filter_max_minutes", label="At most this many minutes")
     original = filters.CharFilter(method="filter_is_original", label="WorldStories Original")
@@ -155,6 +156,11 @@ class StoryFilter(filters.FilterSet):
         # Authors have no slug column, so a slug is matched against the slugified name.
         ids = [pk for pk, author_name in Author.objects.values_list("id", "name") if slugify(author_name) == value.lower()]
         return queryset.filter(author_id__in=ids)
+
+    def filter_traditional(self, queryset, name, value):
+        if (value or "").strip().lower() in {"1", "true"}:
+            return queryset.filter(Q(author__is_traditional=True) | Q(author__isnull=True))
+        return queryset
 
     def filter_format(self, queryset, name, value):
         return apply_format(queryset, value)
