@@ -1531,6 +1531,35 @@ class BlogQuerySet(models.QuerySet):
         return self.filter(published_blog_q())
 
 
+# Reading speed behind Blog.reading_time_minutes.
+BLOG_WORDS_PER_MINUTE = 230
+
+
+def blog_reading_minutes(html_content):
+    """Whole minutes to read a post: its words (tags stripped) at ~230 wpm,
+    rounded, never below 1."""
+    from django.utils.html import strip_tags
+
+    words = len(strip_tags(html_content or "").split())
+    return max(1, int(words / BLOG_WORDS_PER_MINUTE + 0.5))
+
+
+class BlogTopic(models.Model):
+    """What a blog post is about, for the blog list's topic chips. A small,
+    editor-curated vocabulary (seeded by migration), not free tagging."""
+
+    name = models.CharField(max_length=60, unique=True)
+    slug = models.SlugField(max_length=70, unique=True)
+    order = models.PositiveSmallIntegerField(default=0)
+    description = models.CharField(max_length=200, blank=True)
+
+    class Meta:
+        ordering = ["order", "name"]
+
+    def __str__(self):
+        return self.name
+
+
 class Blog(TimeStampModel):
     # Status/source tracking for Claude-generated excerpt text — same
     # transparency-flag meaning as Story's summary/retrospective fields (see
@@ -1565,6 +1594,21 @@ class Blog(TimeStampModel):
     excerpt_error = models.TextField(blank=True, null=True)
     content = CKEditor5Field('Text', config_name='extends')
     cover_image_file = VersatileImageField(upload_to="blog_covers/", blank=True, null=True)
+
+    topics = models.ManyToManyField(BlogTopic, blank=True, related_name="blogs")
+    # Same transparency flags as the excerpt's: how the topics were chosen
+    # (suggest_blog_topics / the admin "suggest topics" action) and with what confidence.
+    topics_status = models.CharField(max_length=16, choices=GEN_STATUS_CHOICES, blank=True, null=True)
+    topics_source = models.CharField(max_length=16, choices=GEN_SOURCE_CHOICES, blank=True, null=True)
+    topics_confident = models.BooleanField(blank=True, null=True)
+    topics_confidence_note = models.TextField(blank=True, null=True)
+    topics_error = models.TextField(blank=True, null=True)
+
+    # Computed from the content on every save (blog_reading_minutes).
+    reading_time_minutes = models.PositiveSmallIntegerField(blank=True, null=True, editable=False)
+    # Pins this post as the blog page's featured one. At most one at a time:
+    # saving a featured post unsets the others.
+    is_featured = models.BooleanField(default=False)
 
     # Keep in sync with BLOG_COVER_SIZE in apps/story/serializers.py — see the
     # matching comment on Story.SIZES for why this exists.
@@ -1604,6 +1648,16 @@ class Blog(TimeStampModel):
         ordering = ["-created_at"]
         verbose_name = "Blog Post"
         verbose_name_plural = "Blog Posts"
+
+    def save(self, *args, **kwargs):
+        update_fields = kwargs.get("update_fields")
+        if update_fields is None or "content" in update_fields:
+            self.reading_time_minutes = blog_reading_minutes(self.content)
+            if update_fields is not None and "reading_time_minutes" not in update_fields:
+                kwargs["update_fields"] = [*update_fields, "reading_time_minutes"]
+        super().save(*args, **kwargs)
+        if self.is_featured:
+            Blog.objects.exclude(pk=self.pk).filter(is_featured=True).update(is_featured=False)
 
     def __str__(self):
         return self.title

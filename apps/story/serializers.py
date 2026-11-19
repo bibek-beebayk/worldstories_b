@@ -13,6 +13,7 @@ from core.libs.images import get_cover_image_url
 from apps.pages.models import SiteTheme
 from .models import (
     HOME_SECTION_ICON_NAMES,
+    BlogTopic,
     HomeSection,
     Audio,
     AudioTranscriptCue,
@@ -1855,7 +1856,33 @@ class LinkedBlogSummarySerializer(serializers.ModelSerializer):
         fields = ["id", "slug", "title", "excerpt", "cover_image", "author_name", "published_at"]
 
 
-class BlogSerializer(serializers.ModelSerializer):
+class BlogCardExtrasMixin(serializers.Serializer):
+    """The fields a blog card shows beyond the post itself: its topics, how long
+    it takes to read, the first book it links to, and recent readers."""
+
+    topics = serializers.SerializerMethodField()
+    linked_story = serializers.SerializerMethodField()
+    reads_30d = serializers.SerializerMethodField()
+
+    def get_topics(self, obj):
+        prefetched = getattr(obj, "_prefetched_objects_cache", {}).get("topics")
+        rows = prefetched if prefetched is not None else obj.topics.all()
+        return [{"name": topic.name, "slug": topic.slug} for topic in rows]
+
+    def get_linked_story(self, obj):
+        stories = getattr(obj, "published_linked_stories", None)
+        if stories is None:
+            stories = obj.linked_stories.published().order_by("id")[:1]
+        first = next(iter(stories), None)
+        return {"title": first.title, "slug": first.slug} if first else None
+
+    def get_reads_30d(self, obj):
+        # Only where the view supplies the counts (the blog list, overview).
+        counts = self.context.get("reads_30d")
+        return None if counts is None else counts.get(obj.pk, 0)
+
+
+class BlogSerializer(BlogCardExtrasMixin, serializers.ModelSerializer):
     cover_image = serializers.SerializerMethodField()
     linked_stories = serializers.SerializerMethodField()
     linked_blogs = serializers.SerializerMethodField()
@@ -1882,7 +1909,25 @@ class BlogSerializer(serializers.ModelSerializer):
         fields = [
             "id", "title", "slug", "excerpt", "content", "cover_image",
             "author_name", "linked_stories", "linked_blogs", "published_at", "updated_at",
+            "topics", "reading_time_minutes", "linked_story", "reads_30d",
         ]
+
+
+class BlogTopicSerializer(serializers.ModelSerializer):
+    """Topics as the admin edits them (CRUD) and as the blog form lists them."""
+
+    post_count = serializers.IntegerField(read_only=True, required=False)
+
+    class Meta:
+        model = BlogTopic
+        fields = ["id", "name", "slug", "order", "description", "post_count"]
+
+
+class BlogListSerializer(BlogSerializer):
+    """The blog list: a post without its body, so a page of twelve stays light."""
+
+    class Meta(BlogSerializer.Meta):
+        fields = [name for name in BlogSerializer.Meta.fields if name != "content"]
 
 
 class BlogAdminSerializer(serializers.ModelSerializer):
@@ -1892,6 +1937,8 @@ class BlogAdminSerializer(serializers.ModelSerializer):
     linked_blogs = serializers.PrimaryKeyRelatedField(
         queryset=Blog.objects.all(), many=True, required=False
     )
+    topics = serializers.PrimaryKeyRelatedField(queryset=BlogTopic.objects.all(), many=True, required=False)
+    topic_details = serializers.SerializerMethodField(read_only=True)
     linked_story_details = serializers.SerializerMethodField(read_only=True)
     linked_blog_details = serializers.SerializerMethodField(read_only=True)
     remove_cover_image_file = serializers.BooleanField(required=False, write_only=True)
@@ -1905,7 +1952,7 @@ class BlogAdminSerializer(serializers.ModelSerializer):
     )
 
     CLEARABLE_DATE_FIELDS = ("publish_at",)
-    CLEARABLE_MANY_FIELDS = ("linked_stories", "linked_blogs")
+    CLEARABLE_MANY_FIELDS = ("linked_stories", "linked_blogs", "topics")
 
     def to_internal_value(self, data):
         # Same multipart-empty-string-means-"clear this field" handling as
@@ -1934,6 +1981,9 @@ class BlogAdminSerializer(serializers.ModelSerializer):
 
     def get_linked_blog_details(self, obj):
         return list(obj.linked_blogs.values("id", "title", "slug"))
+
+    def get_topic_details(self, obj):
+        return [{"id": topic.id, "name": topic.name, "slug": topic.slug} for topic in obj.topics.all()]
 
     def get_cover_image_url(self, obj):
         if obj.cover_image_file:
@@ -2005,8 +2055,15 @@ class BlogAdminSerializer(serializers.ModelSerializer):
             "content", "cover_image_file",
             "remove_cover_image_file", "copy_cover_from_story", "cover_image_url", "author_name",
             "linked_stories", "linked_story_details", "linked_blogs", "linked_blog_details",
+            "topics", "topic_details",
+            "topics_status", "topics_source", "topics_confident", "topics_confidence_note", "topics_error",
+            "reading_time_minutes", "is_featured",
             "is_published", "publish_at",
             "created_at", "updated_at",
+        ]
+        read_only_fields = [
+            "topics_status", "topics_source", "topics_confident", "topics_confidence_note", "topics_error",
+            "reading_time_minutes",
         ]
         read_only_fields = [
             "created_at", "updated_at",
@@ -2377,7 +2434,7 @@ class StoryQueueSerializer(serializers.ModelSerializer):
         return attrs
 
 
-class BlogCardSerializer(serializers.ModelSerializer):
+class BlogCardSerializer(BlogCardExtrasMixin, serializers.ModelSerializer):
     """Just what a blog card shows — no body text, so homepage sections stay
     light."""
 
@@ -2389,7 +2446,10 @@ class BlogCardSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Blog
-        fields = ["id", "title", "slug", "excerpt", "cover_image", "author_name", "published_at", "updated_at"]
+        fields = [
+            "id", "title", "slug", "excerpt", "cover_image", "author_name", "published_at", "updated_at",
+            "topics", "reading_time_minutes", "linked_story", "reads_30d",
+        ]
 
 
 class HomeSectionAdminSerializer(serializers.ModelSerializer):

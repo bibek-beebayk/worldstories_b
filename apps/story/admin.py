@@ -4,7 +4,7 @@ from django.utils.html import strip_tags
 from django.utils import timezone
 from django.utils.text import slugify
 from solo.admin import SingletonModelAdmin
-from .models import HeroTemplate, Audio, AudioTranscriptCue, Video, Blog, Story, DailyStory, Genre, Category, Mood, StoryJourney, StoryJourneyItem, StoryMood, StoryType, VideoType, Tag, Theme, Author, Chapter, PromptSettings, Review, Submission, StoryView
+from .models import BlogTopic, HeroTemplate, Audio, AudioTranscriptCue, Video, Blog, Story, DailyStory, Genre, Category, Mood, StoryJourney, StoryJourneyItem, StoryMood, StoryType, VideoType, Tag, Theme, Author, Chapter, PromptSettings, Review, Submission, StoryView
 
 admin.site.register(PromptSettings, SingletonModelAdmin)
 
@@ -356,6 +356,7 @@ class BlogAdmin(admin.ModelAdmin):
     prepopulated_fields = {"slug": ("title",)}
     fieldsets = (
         ("Core Details", {"fields": ("title", "slug", "excerpt", "author_name")}),
+        ("Topics", {"fields": ("topics", "is_featured")}),
         ("Content", {"fields": ("content",)}),
         ("Cover Image", {"fields": ("cover_image_file",)}),
         ("Linked Content", {"fields": ("linked_stories", "linked_blogs")}),
@@ -365,6 +366,7 @@ class BlogAdmin(admin.ModelAdmin):
     list_filter = ("is_published",)
     search_fields = ("title", "slug", "excerpt", "author_name")
     autocomplete_fields = ("linked_stories", "linked_blogs")
+    filter_horizontal = ("topics",)
     date_hierarchy = "created_at"
     ordering = ("-created_at",)
 
@@ -380,6 +382,14 @@ class BlogAdmin(admin.ModelAdmin):
     def content_preview(self, obj):
         text = strip_tags(str(obj.content)).strip()
         return f"{text[:80]}..." if len(text) > 80 else (text or "-")
+
+
+@admin.register(BlogTopic)
+class BlogTopicAdmin(admin.ModelAdmin):
+    prepopulated_fields = {"slug": ("name",)}
+    list_display = ("name", "slug", "order")
+    list_editable = ("order",)
+    search_fields = ("name", "slug")
 
 
 @admin.register(Genre)

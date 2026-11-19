@@ -7,7 +7,7 @@ import uuid
 from rest_framework.viewsets import ReadOnlyModelViewSet, ModelViewSet
 from rest_framework.views import APIView
 from django.core.exceptions import ValidationError as DjangoValidationError
-from django.db.models import Sum, Avg, Count, Exists, F, IntegerField, OuterRef, Prefetch, Subquery
+from django.db.models import Case, Sum, Avg, Count, Exists, F, IntegerField, OuterRef, Prefetch, Subquery, When
 from django.db.models import BooleanField, ExpressionWrapper, Max, Q
 from django.db.models.functions import Coalesce
 from django.http import FileResponse, Http404, HttpResponse, StreamingHttpResponse
@@ -60,6 +60,7 @@ from .models import (
     BookFetchJob,
     PromptSettings,
     Blog,
+    BlogTopic,
     StoryQueue,
     StoryType,
     VideoType,
@@ -94,6 +95,7 @@ from .ai_generation_jobs import (
     executor as ai_generation_executor,
     run_generate_blog_excerpt,
     run_generate_field,
+    run_suggest_blog_topics,
 )
 from .serializers import (
     GenreSerializer,
@@ -152,6 +154,8 @@ from .serializers import (
     PromptSettingsSerializer,
     BlogSerializer,
     BlogAdminSerializer,
+    BlogListSerializer,
+    BlogTopicSerializer,
     StoryQueueSerializer,
 )
 from rest_framework.decorators import action
@@ -1252,6 +1256,11 @@ class StoryViewSet(ReadOnlyModelViewSet):
 
 
 class BlogViewSet(ReadOnlyModelViewSet):
+    """The public blog. List params: `topic` (slug), `q` (title + excerpt),
+    `sort` = newest (default) | popular (unique readers, last 30 days) | oldest,
+    `page` (12 per page), plus the older `linked_to_story=true|false` and
+    `linked_story=<slug>` filters."""
+
     queryset = Blog.objects.all()
     lookup_field = "slug"
     serializer_class = BlogSerializer
@@ -1259,8 +1268,21 @@ class BlogViewSet(ReadOnlyModelViewSet):
     filter_backends = [SearchFilter]
     search_fields = ["title", "excerpt"]
 
+    def get_serializer_class(self):
+        return BlogListSerializer if self.action == "list" else BlogSerializer
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        if self.action in ("list", "overview"):
+            from .blog_api import blog_readers_30d
+
+            context["reads_30d"] = blog_readers_30d()
+        return context
+
     def get_queryset(self):
+        params = self.request.query_params
         queryset = Blog.objects.published().prefetch_related(
+            "topics",
             Prefetch(
                 "linked_stories",
                 queryset=Story.objects.published().select_related("author", "story_type"),
@@ -1272,17 +1294,91 @@ class BlogViewSet(ReadOnlyModelViewSet):
                 to_attr="published_linked_blogs",
             ),
         ).order_by("-created_at")
-        if self.request.query_params.get("sort") == "oldest":
-            queryset = queryset.order_by("created_at")
-        linked = self.request.query_params.get("linked_to_story")
+        topic = params.get("topic")
+        if topic:
+            queryset = queryset.filter(topics__slug=topic).distinct()
+        query = (params.get("q") or "").strip()
+        if query:
+            queryset = queryset.filter(Q(title__icontains=query) | Q(excerpt__icontains=query))
+        linked = params.get("linked_to_story")
         if linked == "true":
             queryset = queryset.filter(linked_stories__isnull=False).distinct()
         elif linked == "false":
             queryset = queryset.filter(linked_stories__isnull=True)
-        linked_story_slug = self.request.query_params.get("linked_story")
+        linked_story_slug = params.get("linked_story")
         if linked_story_slug:
             queryset = queryset.filter(linked_stories__slug=linked_story_slug).distinct()
+
+        sort = params.get("sort")
+        if sort == "oldest":
+            queryset = queryset.order_by("created_at")
+        elif sort == "popular" and self.action == "list":
+            from .blog_api import blog_readers_30d, popularity_order
+
+            ids = popularity_order(list(queryset.values_list("pk", "created_at")), blog_readers_30d())
+            if ids:
+                position = Case(
+                    *[When(pk=pk, then=index) for index, pk in enumerate(ids)],
+                    default=len(ids),
+                    output_field=IntegerField(),
+                )
+                queryset = queryset.order_by(position)
         return queryset
+
+    @method_decorator(cache_page(60 * 15))
+    @action(detail=False, methods=["get"], url_path="overview")
+    def overview(self, request):
+        """The top of the blog page: the featured post (the one pinned with
+        `is_featured`, else the newest), the most-read posts of the last 30 days,
+        each topic with its post count, and the books posts link to most.
+        Cached 15 minutes."""
+        from .blog_api import overview_parts
+
+        parts = overview_parts()
+        context = self.get_serializer_context()
+        featured = parts["featured"]
+        wanted = [*parts["most_read_ids"], *([featured.pk] if featured else [])]
+        cards = {
+            blog.pk: blog
+            for blog in Blog.objects.published()
+            .filter(pk__in=wanted)
+            .prefetch_related(
+                "topics",
+                Prefetch(
+                    "linked_stories",
+                    queryset=Story.objects.published().select_related("author", "story_type"),
+                    to_attr="published_linked_stories",
+                ),
+            )
+        }
+
+        def card(pk):
+            return BlogListSerializer(cards[pk], context=context).data
+
+        books = [
+            {
+                "id": story.pk,
+                "title": story.title,
+                "slug": story.slug,
+                "author": story.author.name if story.author_id else None,
+                "cover_image": get_cover_image_url(story.cover_image_file, story.cover_image, request, size=CARD_COVER_SIZE),
+                "post_count": story.post_count,
+            }
+            for story in parts["linked_books"]
+        ]
+        return Response(
+            {
+                "featured": card(featured.pk) if featured else None,
+                # True when an editor pinned it (is_featured); false when it is just the newest.
+                "featured_is_pinned": bool(featured and featured.is_featured),
+                "most_read": [card(pk) for pk in parts["most_read_ids"] if pk in cards],
+                "topics": [
+                    {"id": t.pk, "name": t.name, "slug": t.slug, "post_count": t.post_count} for t in parts["topics"]
+                ],
+                "total_posts": parts["total_posts"],
+                "linked_books": books,
+            }
+        )
 
 
 class SubmissionViewSet(ModelViewSet):
@@ -1814,7 +1910,7 @@ class StoryQueueViewSet(ModelViewSet):
 
 
 class BlogAdminViewSet(ModelViewSet):
-    queryset = Blog.objects.prefetch_related("linked_stories", "linked_blogs").all().order_by("-created_at")
+    queryset = Blog.objects.prefetch_related("linked_stories", "linked_blogs", "topics").all().order_by("-created_at")
     serializer_class = BlogAdminSerializer
     parser_classes = [MultiPartParser, FormParser, JSONParser]
     permission_classes = [IsSuperUser]
@@ -1829,6 +1925,29 @@ class BlogAdminViewSet(ModelViewSet):
         blog.refresh_from_db()
         transaction.on_commit(lambda: ai_generation_executor.submit(run_generate_blog_excerpt, blog.id))
         return Response(self.get_serializer(blog).data, status=status.HTTP_202_ACCEPTED)
+
+
+    @action(detail=True, methods=["post"], url_path="suggest-topics")
+    def suggest_topics(self, request, pk=None):
+        """Asks the model for 1-2 topics (from the seeded list) and applies them
+        when it answers. Runs in the background like generate-excerpt; the post's
+        topics_status says where it is."""
+        blog = self.get_object()
+        Blog.objects.filter(pk=blog.pk).update(topics_status=Blog.GEN_STATUS_PENDING)
+        blog.refresh_from_db()
+        transaction.on_commit(lambda: ai_generation_executor.submit(run_suggest_blog_topics, blog.id))
+        return Response(self.get_serializer(blog).data, status=status.HTTP_202_ACCEPTED)
+
+
+class BlogTopicAdminViewSet(ModelViewSet):
+    """The topic vocabulary: list, create, rename, reorder, delete."""
+
+    serializer_class = BlogTopicSerializer
+    permission_classes = [IsSuperUser]
+    pagination_class = None
+
+    def get_queryset(self):
+        return BlogTopic.objects.annotate(post_count=Count("blogs", distinct=True)).order_by("order", "name")
 
 
 class ChapterAdminViewSet(ModelViewSet):

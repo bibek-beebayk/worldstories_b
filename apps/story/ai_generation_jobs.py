@@ -142,3 +142,28 @@ def run_generate_blog_excerpt(blog_id: int) -> None:
         logger.exception("ai_generation job could not even be started/recorded: blog_id=%s action=excerpt", blog_id)
     finally:
         connections.close_all()
+
+
+def run_suggest_blog_topics(blog_id: int) -> None:
+    """Entry point submitted to the executor by the admin "suggest topics" action.
+    Same status trail as the excerpt job (topics_status / source / confident /
+    error); on success the suggested topics replace the post's current ones."""
+    from .blog_topics import apply_suggestion, suggest_topics_ai
+
+    try:
+        blog = Blog.objects.get(pk=blog_id)
+        Blog.objects.filter(pk=blog_id).update(topics_status=Blog.GEN_STATUS_PROCESSING)
+        try:
+            apply_suggestion(blog, suggest_topics_ai(blog))
+        except GenerationError as exc:
+            Blog.objects.filter(pk=blog_id).update(topics_status=Blog.GEN_STATUS_FAILED, topics_error=str(exc))
+            logger.warning("topic suggestion failed: blog_id=%s error=%s", blog_id, exc)
+        except Exception:
+            Blog.objects.filter(pk=blog_id).update(
+                topics_status=Blog.GEN_STATUS_FAILED, topics_error="Unexpected internal error."
+            )
+            logger.exception("topic suggestion failed unexpectedly: blog_id=%s", blog_id)
+    except Exception:
+        logger.exception("ai_generation job could not even be started/recorded: blog_id=%s action=topics", blog_id)
+    finally:
+        connections.close_all()

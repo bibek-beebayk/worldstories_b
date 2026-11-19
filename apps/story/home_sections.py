@@ -8,7 +8,7 @@ sections carry only their presentation settings.
 
 from urllib.parse import urlencode
 
-from django.db.models import Case, IntegerField, Q, When
+from django.db.models import Case, IntegerField, Prefetch, Q, When
 from django.utils import timezone
 
 from .filters import public_story_mood_q
@@ -292,7 +292,19 @@ def resolve_home_sections(request):
                 video_queryset(section)[: section.item_limit], many=True, context=context
             ).data
         elif kind == HomeSection.TYPE_BLOGS:
-            items = _blog_cards(Blog.objects.published().order_by("-created_at")[: section.item_limit], request)
+            blogs = (
+                Blog.objects.published()
+                .prefetch_related(
+                    "topics",
+                    Prefetch(
+                        "linked_stories",
+                        queryset=Story.objects.published(),
+                        to_attr="published_linked_stories",
+                    ),
+                )
+                .order_by("-created_at")[: section.item_limit]
+            )
+            items = _blog_cards(blogs, request)
         # A content section with nothing to show is left out entirely rather
         # than rendered as an empty heading.
         if kind in HomeSection.CONTENT_TYPES and not items:

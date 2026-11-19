@@ -7164,3 +7164,315 @@ class DiscoverDataTests(APITestCase):
         slugs = [s["slug"] for s in self.client.get(reverse("story-list"), {"max_minutes": "20"}).json()["results"]]
         self.assertEqual(slugs, ["max-short"])
         self.assertIsNotNone(short.pk)
+
+
+class BlogListAndOverviewTests(APITestCase):
+    """Blog topics, search, pagination, popular sort, reading time, overview and backfill commands."""
+
+    def setUp(self):
+        from apps.story.models import BlogTopic
+
+        cache.clear()
+        self.client.defaults["HTTP_USER_AGENT"] = "Mozilla/5.0 Chrome"
+        self.now = timezone.now()
+        self.staff = User.objects.create_user(email="bstaff@example.com", username="bstaff", password="x", is_staff=True, is_active=True)
+        self.admin = User.objects.create_user(
+            email="badmin@example.com", username="badmin", password="x", is_superuser=True, is_staff=True, is_active=True
+        )
+        self.guides = BlogTopic.objects.get(slug="reading-guides")
+        self.folk = BlogTopic.objects.get(slug="folklore-myth")
+        self.n = 0
+
+    def _blog(self, title, *, topics=(), days_old=0, **kw):
+        self.n += 1
+        blog = Blog.objects.create(title=title, slug=f"post-{self.n}", content=kw.pop("content", "<p>Some words here.</p>"), **kw)
+        blog.topics.set(topics)
+        Blog.objects.filter(pk=blog.pk).update(created_at=self.now - timedelta(days=days_old))
+        return blog
+
+    def _read(self, blog, visitor, event_type="visit", days_ago=1, **kw):
+        event = AnalyticsEvent.objects.create(event_type=event_type, visitor_id=visitor, blog=blog, **kw)
+        AnalyticsEvent.objects.filter(pk=event.pk).update(created_at=self.now - timedelta(days=days_ago))
+
+    def _list(self, **params):
+        cache.clear()
+        response = self.client.get(reverse("blog-list"), params)
+        self.assertEqual(response.status_code, 200, response.content)
+        return response.json()
+
+    def _titles(self, **params):
+        return [row["title"] for row in self._list(**params)["results"]]
+
+    # --- topics, search, pagination ----------------------------------------------
+
+    def test_topics_are_seeded(self):
+        from apps.story.models import BlogTopic
+
+        self.assertEqual(
+            list(BlogTopic.objects.values_list("name", flat=True)),
+            ["Reading guides", "Genre deep dives", "Book explainers", "Author spotlights", "Folklore & myth", "Women writers"],
+        )
+
+    def test_topic_filter_and_card_fields(self):
+        story = Story.objects.create(title="Linked Book", slug="linked-book", is_published=True)
+        a = self._blog("Guide post", topics=[self.guides], days_old=1)
+        a.linked_stories.add(story)
+        self._blog("Folk post", topics=[self.folk, self.guides], days_old=2)
+        self._blog("Untagged post", days_old=3)
+        self.assertEqual(self._titles(topic="reading-guides"), ["Guide post", "Folk post"])
+        self.assertEqual(self._titles(topic="folklore-myth"), ["Folk post"])
+        self.assertEqual(self._titles(topic="nope"), [])
+        row = self._list(topic="reading-guides")["results"][0]
+        self.assertEqual(row["topics"], [{"name": "Reading guides", "slug": "reading-guides"}])
+        self.assertEqual(row["linked_story"], {"title": "Linked Book", "slug": "linked-book"})
+        self.assertEqual(row["reading_time_minutes"], 1)
+        self.assertNotIn("content", row)
+
+    def test_search_covers_title_and_excerpt(self):
+        self._blog("Dragons of the East", excerpt="A tour", days_old=1)
+        self._blog("Plain title", excerpt="All about dragon lore", days_old=2)
+        self._blog("Unrelated", excerpt="Nothing", days_old=3)
+        self.assertEqual(self._titles(q="dragon"), ["Dragons of the East", "Plain title"])
+        self.assertEqual(self._titles(q="  UNRELATED "), ["Unrelated"])
+        self.assertEqual(self._titles(q="zzz"), [])
+
+    def test_pagination_is_twelve_per_page(self):
+        for i in range(13):
+            self._blog(f"Post {i:02d}", days_old=i)
+        first = self._list()
+        self.assertEqual((first["pagination"]["count"], len(first["results"])), (13, 12))
+        self.assertEqual(first["pagination"]["pages"], 2)
+        second = self._list(page=2)
+        self.assertEqual([r["title"] for r in second["results"]], ["Post 12"])
+
+    def test_drafts_and_scheduled_posts_are_not_listed(self):
+        self._blog("Live")
+        self._blog("Draft", is_published=False)
+        self._blog("Later", publish_at=self.now + timedelta(days=2))
+        self.assertEqual(self._titles(), ["Live"])
+
+    def test_old_linked_filter_still_works(self):
+        story = Story.objects.create(title="B", slug="b-book", is_published=True)
+        self._blog("With story").linked_stories.add(story)
+        self._blog("General")
+        self.assertEqual(self._titles(linked_to_story="true"), ["With story"])
+        self.assertEqual(self._titles(linked_to_story="false"), ["General"])
+        self.assertEqual(self._titles(sort="oldest"), ["With story", "General"])
+
+    def test_list_query_count_does_not_grow_with_posts(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        self._blog("One", topics=[self.guides])
+        cache.clear()
+        with CaptureQueriesContext(connection) as small:
+            self.client.get(reverse("blog-list"))
+        for i in range(8):
+            blog = self._blog(f"More {i}", topics=[self.guides, self.folk])
+            blog.linked_stories.add(Story.objects.create(title=f"S{i}", slug=f"s-{i}", is_published=True))
+        cache.clear()
+        with CaptureQueriesContext(connection) as big:
+            self.client.get(reverse("blog-list"))
+        self.assertEqual(len(big), len(small))
+
+    # --- popular ------------------------------------------------------------------------
+
+    def test_popular_sort_uses_recent_unique_audience_readers(self):
+        quiet = self._blog("Quiet but newest", days_old=0)
+        hit = self._blog("The hit", days_old=20)
+        steady = self._blog("Steady", days_old=10)
+        old_fame = self._blog("Old fame", days_old=40)
+        for i in range(5):
+            self._read(hit, f"h{i}")
+        self._read(hit, "h0", "reading_session")  # same person twice
+        for i in range(3):
+            self._read(steady, f"s{i}")
+        for i in range(30):
+            self._read(old_fame, f"o{i}", days_ago=45)  # outside the window
+        self._read(quiet, "staff", user=self.staff)
+        for i in range(20):
+            self._read(quiet, f"bot{i}", is_suspected_bot=True)
+        data = self._list(sort="popular")
+        self.assertEqual([r["title"] for r in data["results"]], ["The hit", "Steady", "Quiet but newest", "Old fame"])
+        self.assertEqual([r["reads_30d"] for r in data["results"]], [5, 3, 0, 0])
+
+    def test_popular_sort_breaks_ties_by_newest(self):
+        older, newer = self._blog("Older", days_old=5), self._blog("Newer", days_old=1)
+        self._read(older, "a")
+        self._read(newer, "b")
+        self.assertEqual(self._titles(sort="popular"), ["Newer", "Older"])
+
+    # --- reading time -------------------------------------------------------------------
+
+    def test_reading_time_is_words_at_230_wpm_minimum_one(self):
+        from apps.story.models import blog_reading_minutes
+
+        words = lambda n: "<p>" + " ".join(["word"] * n) + "</p>"  # noqa: E731
+        self.assertEqual(blog_reading_minutes(""), 1)
+        self.assertEqual(blog_reading_minutes(words(10)), 1)
+        self.assertEqual(blog_reading_minutes(words(230)), 1)
+        self.assertEqual(blog_reading_minutes(words(345)), 2)  # 1.5 rounds up
+        self.assertEqual(blog_reading_minutes(words(2300)), 10)
+        self.assertEqual(blog_reading_minutes("<p>" + "<b>x</b> " * 460 + "</p>"), 2)  # markup is not words
+
+    def test_saving_a_post_sets_and_refreshes_its_reading_time(self):
+        blog = self._blog("Timed", content="<p>" + " ".join(["w"] * 700) + "</p>")
+        blog.refresh_from_db()
+        self.assertEqual(blog.reading_time_minutes, 3)
+        blog.content = "<p>" + " ".join(["w"] * 2300) + "</p>"
+        blog.save(update_fields=["content"])
+        blog.refresh_from_db()
+        self.assertEqual(blog.reading_time_minutes, 10)
+
+    # --- overview -------------------------------------------------------------------------
+
+    def _overview(self):
+        cache.clear()
+        response = self.client.get(reverse("blog-overview"))
+        self.assertEqual(response.status_code, 200, response.content)
+        return response.json()
+
+    def test_overview_payload_shape(self):
+        story = Story.objects.create(title="Book A", slug="book-a", is_published=True, cover_image="https://x/c.jpg")
+        posts = [self._blog(f"P{i}", topics=[self.guides], days_old=i) for i in range(6)]
+        for post in posts[:2]:
+            post.linked_stories.add(story)
+        for i, post in enumerate(posts):
+            for r in range(i + 1):
+                self._read(post, f"{post.slug}-{r}")
+        data = self._overview()
+        self.assertEqual(set(data), {"featured", "featured_is_pinned", "most_read", "topics", "total_posts", "linked_books"})
+        self.assertEqual(data["total_posts"], 6)
+        self.assertEqual(len(data["most_read"]), 4)
+        self.assertEqual([r["title"] for r in data["most_read"]], ["P5", "P4", "P3", "P2"])
+        self.assertEqual(data["most_read"][0]["reads_30d"], 6)
+        self.assertEqual({t["slug"]: t["post_count"] for t in data["topics"]}["reading-guides"], 6)
+        self.assertEqual(len(data["topics"]), 6)
+        self.assertEqual(
+            [(b["slug"], b["post_count"]) for b in data["linked_books"]], [("book-a", 2)]
+        )
+        self.assertEqual(data["linked_books"][0]["cover_image"], "https://x/c.jpg")
+
+    def test_featured_falls_back_to_the_newest_post_and_can_be_pinned(self):
+        self._blog("Old", days_old=9)
+        newest = self._blog("Newest", days_old=0)
+        pinned = self._blog("Pinned old one", days_old=30, is_featured=True)
+        self._blog("Draft newest", is_published=False)
+        pinned_view = self._overview()
+        self.assertEqual(pinned_view["featured"]["title"], "Pinned old one")
+        self.assertTrue(pinned_view["featured_is_pinned"])
+        Blog.objects.filter(pk=pinned.pk).update(is_featured=False)
+        fallback = self._overview()
+        self.assertEqual(fallback["featured"]["title"], "Newest")
+        self.assertFalse(fallback["featured_is_pinned"])
+        self.assertIsNotNone(newest.pk)
+
+    def test_featured_is_unique_and_unpublished_pin_is_ignored(self):
+        a = self._blog("A", is_featured=True)
+        b = self._blog("B", is_featured=True)
+        a.refresh_from_db()
+        self.assertFalse(a.is_featured)
+        self.assertTrue(b.is_featured)
+        Blog.objects.filter(pk=b.pk).update(is_published=False)
+        self.assertEqual(self._overview()["featured"]["title"], "A")
+
+    def test_overview_with_no_posts(self):
+        data = self._overview()
+        self.assertIsNone(data["featured"])
+        self.assertEqual((data["most_read"], data["linked_books"], data["total_posts"]), ([], [], 0))
+
+    def test_overview_is_cached_for_fifteen_minutes(self):
+        self._blog("First")
+        self._overview()
+        self._blog("Second newest")
+        again = self.client.get(reverse("blog-overview")).json()
+        self.assertEqual(again["total_posts"], 1)
+
+    # --- admin ----------------------------------------------------------------------------------
+
+    def test_admin_edits_topics_and_reading_time_is_read_only(self):
+        blog = self._blog("Editable", content="<p>" + " ".join(["w"] * 460) + "</p>")
+        self.client.force_authenticate(self.admin)
+        response = self.client.patch(
+            reverse("admin-blog-detail", args=[blog.pk]),
+            {"topics": [self.guides.pk, self.folk.pk], "reading_time_minutes": 99, "is_featured": True},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+        data = response.json()
+        self.assertEqual([t["slug"] for t in data["topic_details"]], ["reading-guides", "folklore-myth"])
+        self.assertEqual(data["reading_time_minutes"], 2)
+        self.assertTrue(data["is_featured"])
+        cleared = self.client.patch(reverse("admin-blog-detail", args=[blog.pk]), {"topics": []}, format="json")
+        self.assertEqual(cleared.json()["topic_details"], [])
+
+    def test_admin_topics_endpoint_lists_counts_and_needs_superuser(self):
+        self._blog("Tagged", topics=[self.guides])
+        self.assertEqual(self.client.get(reverse("admin-blog-topic-list")).status_code, 401)
+        self.client.force_authenticate(self.admin)
+        rows = self.client.get(reverse("admin-blog-topic-list")).json()
+        self.assertEqual({r["slug"]: r["post_count"] for r in rows}["reading-guides"], 1)
+
+    def test_suggest_topics_action_queues_a_job(self):
+        blog = self._blog("To label")
+        self.client.force_authenticate(self.admin)
+        with patch("apps.story.api.ai_generation_executor") as executor:
+            response = self.client.post(reverse("admin-blog-suggest-topics", args=[blog.pk]))
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.json()["topics_status"], "pending")
+
+    # --- backfill commands ----------------------------------------------------------------------
+
+    def test_suggest_blog_topics_is_a_dry_run_by_default(self):
+        from django.core.management import call_command
+
+        blog = self._blog("Five Folktales to Read This Monsoon", excerpt="Rain, rivers and folk tales, a reading list.")
+        out = io.StringIO()
+        call_command("suggest_blog_topics", "--heuristic", stdout=out)
+        self.assertEqual(blog.topics.count(), 0)
+        text = out.getvalue()
+        self.assertIn("DRY RUN", text)
+        self.assertIn("Five Folktales to Read This Monsoon", text)
+        self.assertIn("Folklore & myth", text)
+        self.assertIn("Nothing was written", text)
+
+        call_command("suggest_blog_topics", "--heuristic", "--apply", stdout=io.StringIO())
+        blog.refresh_from_db()
+        self.assertIn("folklore-myth", list(blog.topics.values_list("slug", flat=True)))
+        self.assertEqual(blog.topics_status, "completed")
+
+    def test_suggest_blog_topics_only_uses_the_seeded_list_and_skips_tagged_posts(self):
+        from django.core.management import call_command
+        from apps.story.blog_topics import parse_topic_slugs
+
+        self.assertEqual(parse_topic_slugs("Folklore-Myth, made-up, reading-guides, women-writers", {"folklore-myth", "reading-guides", "women-writers"}), ["folklore-myth", "reading-guides"])
+        tagged = self._blog("Already tagged", topics=[self.guides])
+        out = io.StringIO()
+        call_command("suggest_blog_topics", "--heuristic", stdout=out)
+        self.assertNotIn("Already tagged", out.getvalue())
+        self.assertEqual(list(tagged.topics.all()), [self.guides])
+
+    def test_suggest_blog_topics_without_a_key_refuses_ai_mode(self):
+        from django.core.management import CommandError, call_command
+
+        self._blog("Needs a key")
+        with self.settings(ANTHROPIC_API_KEY=""):
+            with self.assertRaises(CommandError):
+                call_command("suggest_blog_topics", stdout=io.StringIO())
+
+    def test_queue_missing_excerpts_is_a_dry_run_by_default_and_reports_the_count(self):
+        from django.core.management import call_command
+
+        self._blog("No excerpt")
+        self._blog("Blank excerpt", excerpt="")
+        self._blog("Has one", excerpt="Already written")
+        self._blog("Draft", is_published=False)
+        with patch("apps.story.management.commands.queue_missing_blog_excerpts.executor") as executor:
+            out = io.StringIO()
+            call_command("queue_missing_blog_excerpts", stdout=out)
+            executor.submit.assert_not_called()
+            self.assertIn("2 published post(s) have no excerpt", out.getvalue())
+            applied = io.StringIO()
+            call_command("queue_missing_blog_excerpts", "--apply", stdout=applied)
+            self.assertEqual(executor.submit.call_count, 2)
+            self.assertIn("Queued 2 excerpt generation job(s)", applied.getvalue())
