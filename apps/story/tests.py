@@ -1888,14 +1888,17 @@ class PublicAuthorApiTests(APITestCase):
             is_published=False,
         )
 
-    def test_list_includes_all_authors_and_only_counts_published_stories(self):
+    def test_list_excludes_authors_without_published_stories_by_default(self):
         response = self.client.get(reverse("author-list"))
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.data["pagination"]["count"], 2)
+        self.assertEqual(response.data["pagination"]["count"], 1)
         counts = {author["id"]: author["stories_count"] for author in response.data["results"]}
         self.assertEqual(counts[self.visible_author.id], 1)
-        self.assertEqual(counts[self.hidden_author.id], 0)
+
+        included = self.client.get(reverse("author-list"), {"include_empty": "1"})
+        included_counts = {author["id"]: author["stories_count"] for author in included.data["results"]}
+        self.assertEqual(included_counts[self.hidden_author.id], 0)
 
     def test_detail_only_includes_published_stories(self):
         response = self.client.get(reverse("author-detail", args=[self.visible_author.id]))
@@ -1903,12 +1906,18 @@ class PublicAuthorApiTests(APITestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual([story["slug"] for story in response.data["stories"]], ["published-book"])
 
-    def test_author_without_public_stories_has_an_empty_book_list(self):
+    def test_author_without_public_stories_requires_include_empty(self):
         response = self.client.get(reverse("author-detail", args=[self.hidden_author.id]))
 
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.data["stories_count"], 0)
-        self.assertEqual(response.data["stories"], [])
+        self.assertEqual(response.status_code, 404)
+
+        included = self.client.get(
+            reverse("author-detail", args=[self.hidden_author.id]),
+            {"include_empty": "1"},
+        )
+        self.assertEqual(included.status_code, 200)
+        self.assertEqual(included.data["stories_count"], 0)
+        self.assertEqual(included.data["stories"], [])
 
     def test_story_detail_recommends_public_similar_titles_only(self):
         genre = Genre.objects.create(name="Folklore")

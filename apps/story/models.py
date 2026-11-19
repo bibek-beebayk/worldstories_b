@@ -14,6 +14,7 @@ from versatileimagefield.fields import VersatileImageField
 
 from apps.pages.models import PAGE_FONT_CHOICES
 from core.libs.images import warm
+from core.libs.model_defaults import default_story_type_id
 from core.libs.models import TimeStampModel
 from core.libs.validators import FileSizeValidator
 
@@ -233,14 +234,6 @@ class StoryType(models.Model):
 
     def __str__(self):
         return self.name
-
-
-def default_story_type_id():
-    # Preserves the old CharField's default="Short Story" behavior for
-    # Story/Submission — "Short Story" is always present (seeded by the
-    # story_type migration). Returns None (leaving the FK unset, caught by
-    # the NOT NULL constraint) only if that row was somehow deleted.
-    return StoryType.objects.filter(name="Short Story").values_list("id", flat=True).first()
 
 
 class Tag(models.Model):
@@ -798,10 +791,6 @@ HERO_ICON_NAMES = [
 HERO_ICON_CHOICES = [(name, name) for name in HERO_ICON_NAMES]
 
 
-def default_hero_icons():
-    return []
-
-
 class HeroTemplateQuerySet(models.QuerySet):
     def scheduled_live(self, now=None):
         now = now or timezone.now()
@@ -926,7 +915,7 @@ class HeroTemplate(TimeStampModel):
     accent_color = hex_color_field("#ed405a")
     animation_preset = models.CharField(max_length=20, choices=ANIMATION_CHOICES, default=ANIMATION_CLASSIC)
     # Empty means "use the preset's own icons".
-    animation_icons = models.JSONField(default=default_hero_icons, blank=True)
+    animation_icons = models.JSONField(default=list, blank=True)
 
     objects = HeroTemplateQuerySet.as_manager()
 
