@@ -1097,7 +1097,7 @@ class StoryDetailSerializer(serializers.ModelSerializer):
         if original:
             return original
         if obj.site_published_date:
-            return obj.site_published_date.strftime("%B %-d, %Y")
+            return f"{obj.site_published_date:%B} {obj.site_published_date.day}, {obj.site_published_date.year}"
         return None
 
     def get_reading_time_minutes(self, obj):
@@ -1402,24 +1402,37 @@ class StoryAdminSerializer(serializers.ModelSerializer):
     audio_count = serializers.SerializerMethodField(read_only=True)
     video_count = serializers.SerializerMethodField(read_only=True)
 
+    # The admin list annotates these (StoryAdminViewSet.get_queryset) so a page of
+    # stories costs one query, not three per row; single-object paths fall back to a count.
     def get_chapter_count(self, obj):
-        return obj.chapters.count()
+        annotated = getattr(obj, "_chapter_count", None)
+        return annotated if annotated is not None else obj.chapters.count()
 
     def get_audio_count(self, obj):
-        return obj.audios.count()
+        annotated = getattr(obj, "_audio_count", None)
+        return annotated if annotated is not None else obj.audios.count()
 
     def get_video_count(self, obj):
-        return obj.videos.count()
+        annotated = getattr(obj, "_video_count", None)
+        return annotated if annotated is not None else obj.videos.count()
 
     def get_published_date_label(self, obj):
         original = obj.original_published_date_display()
         if original:
             return original
         if obj.site_published_date:
-            return obj.site_published_date.strftime("%B %-d, %Y")
+            return f"{obj.site_published_date:%B} {obj.site_published_date.day}, {obj.site_published_date.year}"
         return None
 
     def get_translations(self, obj):
+        batched = self.context.get("translations_by_group")
+        if batched is not None:
+            # The admin list fetches every page's siblings in one query.
+            return [
+                {"id": s.id, "slug": s.slug, "language": s.language, "title": s.title}
+                for s in batched.get(obj.translation_group, [])
+                if s.id != obj.id
+            ]
         siblings = (
             Story.objects.filter(translation_group=obj.translation_group)
             .exclude(pk=obj.pk)

@@ -10,6 +10,8 @@ add a bonus story without moving the finish line for readers already part-way
 through.
 """
 
+from django.utils import timezone
+
 from apps.story.models import StoryJourney
 
 
@@ -23,15 +25,24 @@ def _completed_story_ids(user):
     )
 
 
+def _is_live(story):
+    """Visible to readers right now (the same rule as published_story_q)."""
+    return bool(story.is_published and (story.publish_at is None or story.publish_at <= timezone.now()))
+
+
 def journey_progress(journey, completed_ids):
     """`(completed_required, total_required, is_complete)` for one journey.
+
+    Only required stories readers can actually open count. An unpublished (or
+    not-yet-scheduled) required story would otherwise sit in `total` with no way
+    to finish it, so the journey could never complete.
 
     A journey with no required items is never complete: an empty journey is
     unfinished, not finished — the same vacuous-truth trap the completion rule
     guards against, where `all()` over an empty set would award it to everyone.
     """
     required_ids = [
-        item.story_id for item in journey.items.all() if item.required
+        item.story_id for item in journey.items.all() if item.required and _is_live(item.story)
     ]
     if not required_ids:
         return 0, 0, False
@@ -81,7 +92,7 @@ def journeys_touched_by(story):
     """
     return list(
         StoryJourney.objects.filter(active=True, items__story=story)
-        .prefetch_related("items")
+        .prefetch_related("items__story")
         .distinct()
     )
 

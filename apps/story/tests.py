@@ -6167,6 +6167,28 @@ class StoryJourneyNextStoryApiTests(APITestCase):
             StoryCompletion.objects.create(user=self.reader, story=story, source=StoryCompletion.SOURCE_BACKFILL)
         self.assertIsNone(self.client.get(url).data["next_story"])
 
+    def test_unpublished_required_story_does_not_count_toward_the_journey(self):
+        live = self._story("live-stop")
+        hidden = self._story("unpublished-stop", published=False)
+        self._journey("count-path", [(live, True), (hidden, True)])
+        self.client.force_authenticate(self.reader)
+        row = self._list_row("count-path")
+        self.assertEqual((row["completed"], row["total"], row["is_complete"]), (0, 1, False))
+        StoryCompletion.objects.create(user=self.reader, story=live, source=StoryCompletion.SOURCE_BACKFILL)
+        row = self._list_row("count-path")
+        self.assertEqual((row["completed"], row["total"], row["is_complete"]), (1, 1, True))
+        self.assertIsNone(row["next_story"])
+        detail = self.client.get(reverse("journey-detail", kwargs={"slug": "count-path"})).data
+        self.assertEqual([item["story"]["slug"] for item in detail["items"]], ["live-stop"])
+        self.assertEqual((detail["total"], detail["is_complete"]), (1, True))
+
+    def test_scheduled_required_story_is_not_counted_until_it_is_live(self):
+        live = self._story("sched-live")
+        later = self._story("sched-later")
+        Story.objects.filter(pk=later.pk).update(publish_at=timezone.now() + timedelta(days=2))
+        self._journey("sched-path", [(live, True), (later, True)])
+        self.assertEqual(self._list_row("sched-path")["total"], 1)
+
     def test_next_story_carries_title_and_card_cover(self):
         story = self._story("cover-stop")
         self._journey("cover-path", [(story, True)])
@@ -7763,3 +7785,132 @@ class BlogListAndOverviewTests(APITestCase):
             call_command("queue_missing_blog_excerpts", "--apply", stdout=applied)
             self.assertEqual(executor.submit.call_count, 2)
             self.assertIn("Queued 2 excerpt generation job(s)", applied.getvalue())
+
+
+class StoryAdminOverviewApiTests(APITestCase):
+    """The admin Stories page: status / cover / chapter filters, sort, and the stats counts."""
+
+    def setUp(self):
+        self.admin = User.objects.create_user(
+            email="stories-admin@example.com", username="stories-admin",
+            password="test-password", is_superuser=True, is_staff=True,
+        )
+        self.client.force_authenticate(self.admin)
+        self.now = timezone.now()
+
+        def make(slug, **kw):
+            return Story.objects.create(title=slug.replace("-", " ").title(), slug=slug, **kw)
+
+        # live, complete: cover, summary, retrospective, chapter
+        self.full = make("full", is_published=True, cover_image="https://x/c.jpg", summary="<p>S</p>", retrospective="<p>R</p>")
+        Chapter.objects.create(story=self.full, title="C", slug="full-c", content="<p>x</p>", order=1)
+        # live, missing everything
+        self.bare = make("bare", is_published=True)
+        # live, missing only the cover
+        self.nocover = make("no-cover", is_published=True, summary="<p>S</p>", retrospective="<p>R</p>")
+        Chapter.objects.create(story=self.nocover, title="C", slug="nc-c", content="<p>x</p>", order=1)
+        self.draft = make("draft-one", is_published=False)
+        self.scheduled = make("scheduled-one", is_published=True, publish_at=self.now + timedelta(days=3))
+        self.passed = make("passed-one", is_published=True, publish_at=self.now - timedelta(days=3), summary="<p>S</p>")
+
+    def _slugs(self, **params):
+        # The viewset's own queryset (filters + ordering). Serializing the whole list is skipped
+        # here: the admin list serializer cannot render under this project's Python 3.15 test
+        # environment (the same reason StoryAdminListFilterTests errors), and the filters are what is under test.
+        from rest_framework.request import Request
+        from rest_framework.test import APIRequestFactory
+
+        from apps.story.api import StoryAdminViewSet
+
+        view = StoryAdminViewSet()
+        view.request = Request(APIRequestFactory().get("/api/admin/stories/", params))
+        view.action = "list"
+        view.format_kwarg = None
+        return [story.slug for story in view.filter_queryset(view.get_queryset())]
+
+    def test_status_filter_matches_the_badge_definitions(self):
+        self.assertEqual(set(self._slugs(status="draft")), {"draft-one"})
+        self.assertEqual(set(self._slugs(status="scheduled")), {"scheduled-one"})
+        self.assertEqual(set(self._slugs(status="published")), {"full", "bare", "no-cover", "passed-one"})
+        self.assertEqual(len(self._slugs()), 6)
+        self.assertEqual(len(self._slugs(status="bogus")), 6)
+
+    def test_has_cover_filter(self):
+        self.assertEqual(set(self._slugs(has_cover="true")), {"full"})
+        self.assertEqual(set(self._slugs(has_cover="false")), {"bare", "no-cover", "draft-one", "scheduled-one", "passed-one"})
+        self.assertEqual(len(self._slugs(has_cover="maybe")), 6)
+
+    def test_has_chapters_filter(self):
+        self.assertEqual(set(self._slugs(has_chapters="true")), {"full", "no-cover"})
+        self.assertEqual(set(self._slugs(has_chapters="false")), {"bare", "draft-one", "scheduled-one", "passed-one"})
+
+    def test_filters_combine_for_a_needs_attention_view(self):
+        self.assertEqual(set(self._slugs(status="published", has_cover="false")), {"bare", "no-cover", "passed-one"})
+        self.assertEqual(set(self._slugs(status="published", has_cover="false", has_chapters="false")), {"bare", "passed-one"})
+        self.assertEqual(set(self._slugs(status="published", has_summary="false")), {"bare"})
+
+    def test_sort_is_whitelisted_and_defaults_to_newest(self):
+        newest = self._slugs()
+        self.assertEqual(newest[0], "passed-one")  # highest id first, same as before
+        self.assertEqual(self._slugs(sort="newest"), newest)
+        self.assertEqual(self._slugs(sort="oldest"), list(reversed(newest)))
+        titles = self._slugs(sort="title_asc")
+        self.assertEqual(titles, sorted(titles))
+        self.assertEqual(self._slugs(sort="title_desc"), list(reversed(titles)))
+        self.assertEqual(self._slugs(sort="id; drop table"), newest)  # unknown values are ignored
+
+    def test_list_renders_and_its_query_count_does_not_grow_with_stories(self):
+        url = reverse("admin-story-list")
+        self.assertEqual(self.client.get(url, format="json").status_code, 200)
+        Story.objects.filter(pk=self.full.pk).update(site_published_date=timezone.now().date())
+        row = next(r for r in self.client.get(url, format="json").json()["results"] if r["slug"] == "full")
+        self.assertEqual((row["chapter_count"], row["audio_count"], row["video_count"]), (1, 0, 0))
+        self.assertRegex(row["published_date_label"], r"^[A-Z][a-z]+ \d{1,2}, \d{4}$")  # no zero-padding trick needed
+        with CaptureQueriesContext(connection) as before:
+            self.client.get(url, format="json")
+        for i in range(8):
+            extra = Story.objects.create(title=f"Bulk {i}", slug=f"bulk-{i}", is_published=True)
+            Chapter.objects.create(story=extra, title="C", slug=f"bulk-c-{i}", content="<p>x</p>", order=1)
+        with CaptureQueriesContext(connection) as after:
+            self.client.get(url, format="json")
+        self.assertEqual(len(after), len(before))
+
+    def test_stats_counts(self):
+        response = self.client.get(reverse("admin-story-stats"), format="json")
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(
+            response.json(),
+            {
+                "total": 6,
+                "published": 4,
+                "draft": 1,
+                "scheduled": 1,
+                # among published (live): bare, no-cover, passed-one lack a cover; bare lacks a summary
+                # and a chapter; passed-one lacks a chapter; bare lacks a retrospective, as does passed-one.
+                "missing_summary": 1,
+                "missing_retrospective": 2,
+                "missing_cover": 3,
+                "missing_chapters": 2,
+            },
+        )
+
+    def test_stats_agree_with_the_list_filters_and_need_a_superuser(self):
+        stats = self.client.get(reverse("admin-story-stats"), format="json").json()
+        self.assertEqual(stats["missing_cover"], len(self._slugs(status="published", has_cover="false")))
+        self.assertEqual(stats["missing_chapters"], len(self._slugs(status="published", has_chapters="false")))
+        self.assertEqual(stats["missing_summary"], len(self._slugs(status="published", has_summary="false")))
+        self.assertEqual(stats["missing_retrospective"], len(self._slugs(status="published", has_retrospective="false")))
+        self.client.force_authenticate(None)
+        self.assertEqual(self.client.get(reverse("admin-story-stats")).status_code, 401)
+        member = User.objects.create_user(email="m@example.com", username="m", password="x")
+        self.client.force_authenticate(member)
+        self.assertEqual(self.client.get(reverse("admin-story-stats")).status_code, 403)
+
+    def test_stats_query_count_does_not_grow_with_stories(self):
+        with CaptureQueriesContext(connection) as before:
+            self.client.get(reverse("admin-story-stats"))
+        for i in range(10):
+            Story.objects.create(title=f"Extra {i}", slug=f"extra-{i}", is_published=True)
+        with CaptureQueriesContext(connection) as after:
+            self.client.get(reverse("admin-story-stats"))
+        self.assertEqual(len(after), len(before))

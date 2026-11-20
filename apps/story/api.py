@@ -1635,6 +1635,20 @@ class StoryAdminViewSet(ModelViewSet):
 
     def get_queryset(self):
         queryset = super().get_queryset()
+        if self.action == "list":
+            # Subqueries, not joins: three joined Counts would multiply each other's rows.
+            def count_of(model):
+                return Coalesce(
+                    Subquery(
+                        model.objects.filter(story=OuterRef("pk")).order_by().values("story").annotate(n=Count("pk")).values("n"),
+                        output_field=IntegerField(),
+                    ),
+                    0,
+                )
+
+            queryset = queryset.annotate(
+                _chapter_count=count_of(Chapter), _audio_count=count_of(Audio), _video_count=count_of(Video)
+            ).prefetch_related("genres", "categories", "tags", "themes")
         params = self.request.query_params
 
         is_published = params.get("is_published")
@@ -1667,7 +1681,88 @@ class StoryAdminViewSet(ModelViewSet):
                 else queryset.exclude(no_retrospective)
             )
 
+        has_cover = params.get("has_cover")
+        if has_cover in {"true", "false"}:
+            # Same definition as the Analytics "no cover" gap: neither an uploaded file nor a URL.
+            from .home_sections import missing_cover_q
+
+            queryset = queryset.filter(missing_cover_q()) if has_cover == "false" else queryset.exclude(missing_cover_q())
+
+        has_chapters = params.get("has_chapters")
+        if has_chapters in {"true", "false"}:
+            chapters = Exists(Chapter.objects.filter(story=OuterRef("pk")))
+            queryset = queryset.filter(chapters) if has_chapters == "true" else queryset.filter(~chapters)
+
+        # Same three states the list badges show: a story is Scheduled when it is
+        # published but its publish_at is still in the future, Published once live, Draft otherwise.
+        status_filter = params.get("status")
+        if status_filter == "draft":
+            queryset = queryset.filter(is_published=False)
+        elif status_filter == "published":
+            queryset = queryset.filter(published_story_q())
+        elif status_filter == "scheduled":
+            queryset = queryset.filter(is_published=True, publish_at__gt=timezone.now())
+
+        sort = self.ADMIN_SORTS.get(params.get("sort", ""))
+        if sort:
+            queryset = queryset.order_by(*sort)
+
         return queryset
+
+    def paginate_queryset(self, queryset):
+        page = super().paginate_queryset(queryset)
+        if page is not None and self.action == "list":
+            groups = {story.translation_group for story in page if story.translation_group}
+            by_group = {}
+            for sibling in Story.objects.filter(translation_group__in=groups).only(
+                "id", "slug", "language", "title", "translation_group"
+            ).order_by("language"):
+                by_group.setdefault(sibling.translation_group, []).append(sibling)
+            self._translations_by_group = by_group
+        return page
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        batched = getattr(self, "_translations_by_group", None)
+        if batched is not None:
+            context["translations_by_group"] = batched
+        return context
+
+    # Whitelisted ?sort= values; anything else keeps the default (newest first).
+    ADMIN_SORTS = {
+        "newest": ("-id",),
+        "oldest": ("id",),
+        "title_asc": ("title", "id"),
+        "title_desc": ("-title", "-id"),
+    }
+
+    @action(detail=False, methods=["get"], url_path="stats")
+    def stats(self, request):
+        """Counts for the admin Stories overview, in one pass over the table.
+
+        published / draft / scheduled follow the list badges: Scheduled is
+        is_published with a future publish_at, Published is live now (the same
+        published_story_q the public site uses), Draft is not published. The
+        missing_* counts are among Published stories only."""
+        from .home_sections import missing_cover_q
+
+        live = published_story_q()
+        no_summary = Q(summary__isnull=True) | Q(summary__exact="")
+        no_retro = Q(retrospective__isnull=True) | Q(retrospective__exact="")
+        counts = (
+            Story.objects.annotate(_has_chapters=Exists(Chapter.objects.filter(story=OuterRef("pk"))))
+            .aggregate(
+                total=Count("id"),
+                published=Count("id", filter=live),
+                draft=Count("id", filter=Q(is_published=False)),
+                scheduled=Count("id", filter=Q(is_published=True, publish_at__gt=timezone.now())),
+                missing_summary=Count("id", filter=live & no_summary),
+                missing_retrospective=Count("id", filter=live & no_retro),
+                missing_cover=Count("id", filter=live & missing_cover_q()),
+                missing_chapters=Count("id", filter=live & Q(_has_chapters=False)),
+            )
+        )
+        return Response(counts)
 
     @action(detail=False, methods=["get"], url_path="export")
     def export(self, request):
@@ -3388,7 +3483,7 @@ class StoryJourneyDetailAPIView(APIView):
         items = list(journey.items.all())
         cards = {
             story.id: story
-            for story in Story.objects.filter(
+            for story in Story.objects.published().filter(
                 id__in=[item.story_id for item in items]
             ).for_card_list()
         }
@@ -3414,8 +3509,8 @@ class StoryJourneyDetailAPIView(APIView):
                         ).data,
                     }
                     for item in items
-                    # A story unpublished since the journey was built has no
-                    # card to show.
+                    # A story unpublished since the journey was built is not shown
+                    # (and does not count toward the journey: see journey_progress).
                     if item.story_id in cards
                 ],
             }
