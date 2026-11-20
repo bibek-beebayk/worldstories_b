@@ -63,6 +63,7 @@ from apps.story.models import (
     VideoSeries,
     Author,
     Blog,
+    BlogTopic,
     BookFetchJob,
     Category,
     Chapter,
@@ -1795,6 +1796,188 @@ class BlogAdminApiTests(APITestCase):
         response = self.client.get("/api/admin/blog/")
 
         self.assertEqual(response.status_code, 403)
+
+        stats_response = self.client.get("/api/admin/blog/stats/")
+        self.assertEqual(stats_response.status_code, 403)
+
+    def test_status_filter_matches_public_visibility(self):
+        self.client.force_authenticate(user=self._make_superuser())
+        now = timezone.now()
+        live_immediate = Blog.objects.create(title="Live Now", slug="live-now", content="<p>x</p>", is_published=True)
+        live_past = Blog.objects.create(
+            title="Live Past",
+            slug="live-past",
+            content="<p>x</p>",
+            is_published=True,
+            publish_at=now - timedelta(hours=2),
+        )
+        scheduled = Blog.objects.create(
+            title="Future Post",
+            slug="future-post",
+            content="<p>x</p>",
+            is_published=True,
+            publish_at=now + timedelta(days=2),
+        )
+        draft = Blog.objects.create(title="Draft Post", slug="draft-post", content="<p>x</p>", is_published=False)
+        draft_future = Blog.objects.create(
+            title="Draft Future",
+            slug="draft-future",
+            content="<p>x</p>",
+            is_published=False,
+            publish_at=now + timedelta(days=3),
+        )
+
+        pub = self.client.get("/api/admin/blog/?status=published")
+        self.assertEqual(pub.status_code, 200)
+        self.assertCountEqual([item["id"] for item in pub.data["results"]], [live_immediate.id, live_past.id])
+
+        sched = self.client.get("/api/admin/blog/?status=scheduled")
+        self.assertEqual(sched.status_code, 200)
+        self.assertEqual([item["id"] for item in sched.data["results"]], [scheduled.id])
+
+        drafts = self.client.get("/api/admin/blog/?status=draft")
+        self.assertEqual(drafts.status_code, 200)
+        self.assertCountEqual([item["id"] for item in drafts.data["results"]], [draft.id, draft_future.id])
+
+    def test_needs_and_topic_filters(self):
+        self.client.force_authenticate(user=self._make_superuser())
+        topic = BlogTopic.objects.create(name="Craft", slug="craft")
+        story = Story.objects.create(title="Linked Story", slug="linked-story-filter")
+        image = SimpleUploadedFile("cover.jpg", b"fake-image-bytes", content_type="image/jpeg")
+
+        complete = Blog.objects.create(
+            title="Complete",
+            slug="complete",
+            excerpt="Has excerpt",
+            content="<p>x</p>",
+            cover_image_file=image,
+        )
+        complete.topics.add(topic)
+        complete.linked_stories.add(story)
+
+        whitespace_excerpt = Blog.objects.create(
+            title="Whitespace Excerpt",
+            slug="whitespace-excerpt",
+            excerpt="   \t\n ",
+            content="<p>x</p>",
+        )
+        null_excerpt = Blog.objects.create(
+            title="Null Excerpt",
+            slug="null-excerpt",
+            excerpt=None,
+            content="<p>x</p>",
+        )
+
+        no_excerpt = self.client.get("/api/admin/blog/?has_excerpt=false")
+        self.assertEqual(no_excerpt.status_code, 200)
+        self.assertCountEqual([r["id"] for r in no_excerpt.data["results"]], [whitespace_excerpt.id, null_excerpt.id])
+
+        with_excerpt = self.client.get("/api/admin/blog/?has_excerpt=true")
+        self.assertEqual([r["id"] for r in with_excerpt.data["results"]], [complete.id])
+
+        no_topics = self.client.get("/api/admin/blog/?has_topics=false")
+        self.assertCountEqual([r["id"] for r in no_topics.data["results"]], [whitespace_excerpt.id, null_excerpt.id])
+
+        by_topic = self.client.get(f"/api/admin/blog/?topic={topic.id}")
+        self.assertEqual([r["id"] for r in by_topic.data["results"]], [complete.id])
+
+        no_cover = self.client.get("/api/admin/blog/?has_cover=false")
+        self.assertCountEqual([r["id"] for r in no_cover.data["results"]], [whitespace_excerpt.id, null_excerpt.id])
+
+        no_stories = self.client.get("/api/admin/blog/?has_linked_stories=false")
+        self.assertCountEqual([r["id"] for r in no_stories.data["results"]], [whitespace_excerpt.id, null_excerpt.id])
+
+    def test_sort_and_unknown_fallback(self):
+        self.client.force_authenticate(user=self._make_superuser())
+        now = timezone.now()
+        a = Blog.objects.create(title="Alpha", slug="alpha", content="<p>x</p>")
+        b = Blog.objects.create(title="Zulu", slug="zulu", content="<p>x</p>")
+        Blog.objects.filter(pk=a.pk).update(created_at=now - timedelta(days=2), updated_at=now)
+        Blog.objects.filter(pk=b.pk).update(created_at=now - timedelta(days=1), updated_at=now - timedelta(days=1))
+
+        newest = self.client.get("/api/admin/blog/?sort=newest")
+        self.assertEqual([r["id"] for r in newest.data["results"]], [b.id, a.id])
+
+        oldest = self.client.get("/api/admin/blog/?sort=oldest")
+        self.assertEqual([r["id"] for r in oldest.data["results"]], [a.id, b.id])
+
+        updated = self.client.get("/api/admin/blog/?sort=updated")
+        self.assertEqual([r["id"] for r in updated.data["results"]], [a.id, b.id])
+
+        title_asc = self.client.get("/api/admin/blog/?sort=title_asc")
+        self.assertEqual([r["id"] for r in title_asc.data["results"]], [a.id, b.id])
+
+        title_desc = self.client.get("/api/admin/blog/?sort=title_desc")
+        self.assertEqual([r["id"] for r in title_desc.data["results"]], [b.id, a.id])
+
+        unknown = self.client.get("/api/admin/blog/?sort=bogus")
+        self.assertEqual(unknown.status_code, 200)
+        self.assertEqual([r["id"] for r in unknown.data["results"]], [b.id, a.id])
+
+    def test_list_omits_content_and_retrieve_includes_it(self):
+        self.client.force_authenticate(user=self._make_superuser())
+        blog = Blog.objects.create(title="Heavy Post", slug="heavy-post", content="<p>Long body</p>")
+
+        list_resp = self.client.get("/api/admin/blog/")
+        self.assertEqual(list_resp.status_code, 200)
+        row = list_resp.data["results"][0]
+        self.assertNotIn("content", row)
+        self.assertIn("updated_at", row)
+        self.assertIn("topic_details", row)
+
+        detail_resp = self.client.get(f"/api/admin/blog/{blog.id}/")
+        self.assertEqual(detail_resp.status_code, 200)
+        self.assertEqual(detail_resp.data["content"], "<p>Long body</p>")
+
+    def test_stats_endpoint_counts(self):
+        self.client.force_authenticate(user=self._make_superuser())
+        now = timezone.now()
+        topic = BlogTopic.objects.create(name="Essays", slug="essays")
+        story = Story.objects.create(title="Stats Story", slug="stats-story")
+        image = SimpleUploadedFile("cover.jpg", b"fake-image-bytes", content_type="image/jpeg")
+
+        pub = Blog.objects.create(
+            title="Published Complete",
+            slug="pub-complete",
+            excerpt="Good excerpt",
+            content="<p>x</p>",
+            is_published=True,
+            cover_image_file=image,
+        )
+        pub.topics.add(topic)
+        pub.linked_stories.add(story)
+
+        Blog.objects.create(
+            title="Scheduled Missing",
+            slug="sched-missing",
+            excerpt="   ",
+            content="<p>x</p>",
+            is_published=True,
+            publish_at=now + timedelta(days=1),
+        )
+        Blog.objects.create(
+            title="Draft Missing",
+            slug="draft-missing",
+            excerpt="",
+            content="<p>x</p>",
+            is_published=False,
+        )
+
+        response = self.client.get("/api/admin/blog/stats/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.data,
+            {
+                "total": 3,
+                "published": 1,
+                "draft": 1,
+                "scheduled": 1,
+                "missing_excerpt": 2,
+                "missing_topics": 2,
+                "missing_cover": 2,
+                "no_linked_stories": 2,
+            },
+        )
 
 
 class BlogPublicApiTests(APITestCase):

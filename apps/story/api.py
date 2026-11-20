@@ -72,6 +72,7 @@ from .models import (
     Theme,
     with_preferred_translation_only,
     published_story_q,
+    published_blog_q,
     LANGUAGE_CHOICES,
     COUNTRY_CHOICES,
     Mood,
@@ -159,6 +160,7 @@ from .serializers import (
     PromptSettingsSerializer,
     BlogSerializer,
     BlogAdminSerializer,
+    BlogAdminListSerializer,
     BlogListSerializer,
     BlogTopicSerializer,
     StoryQueueSerializer,
@@ -2197,13 +2199,111 @@ class StoryQueueViewSet(ModelViewSet):
 
 
 class BlogAdminViewSet(ModelViewSet):
-    queryset = Blog.objects.prefetch_related("linked_stories", "linked_blogs", "topics").all().order_by("-created_at")
+    queryset = (
+        Blog.objects.prefetch_related(
+            Prefetch("linked_stories", queryset=Story.objects.only("id", "title", "slug")),
+            Prefetch("linked_blogs", queryset=Blog.objects.only("id", "title", "slug")),
+            "topics",
+        )
+        .all()
+        .order_by("-created_at", "-id")
+    )
     serializer_class = BlogAdminSerializer
     parser_classes = [MultiPartParser, FormParser, JSONParser]
     permission_classes = [IsSuperUser]
     pagination_class = BlogPagination
     filter_backends = [SearchFilter]
     search_fields = ["title", "slug", "excerpt"]
+
+    # Whitelisted ?sort= values; anything else falls back to default (newest first).
+    ADMIN_SORTS = {
+        "newest": ("-created_at", "-id"),
+        "oldest": ("created_at", "id"),
+        "updated": ("-updated_at", "-id"),
+        "title_asc": ("title", "id"),
+        "title_desc": ("-title", "-id"),
+    }
+
+    @staticmethod
+    def _missing_excerpt_q():
+        return Q(excerpt__isnull=True) | Q(excerpt="") | Q(excerpt__regex=r"^\s*$")
+
+    @staticmethod
+    def _missing_cover_q():
+        return Q(cover_image_file__isnull=True) | Q(cover_image_file="")
+
+    def get_serializer_class(self):
+        if self.action == "list":
+            return BlogAdminListSerializer
+        return BlogAdminSerializer
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        if self.action == "list":
+            queryset = queryset.defer("content")
+
+        params = self.request.query_params
+
+        status_filter = params.get("status")
+        if status_filter == "published":
+            queryset = queryset.filter(published_blog_q())
+        elif status_filter == "scheduled":
+            queryset = queryset.filter(is_published=True, publish_at__gt=timezone.now())
+        elif status_filter == "draft":
+            queryset = queryset.filter(is_published=False)
+
+        has_excerpt = params.get("has_excerpt")
+        if has_excerpt in {"true", "false"}:
+            no_excerpt = self._missing_excerpt_q()
+            queryset = queryset.filter(no_excerpt) if has_excerpt == "false" else queryset.exclude(no_excerpt)
+
+        has_topics = params.get("has_topics")
+        if has_topics in {"true", "false"}:
+            topics_exists = Exists(Blog.topics.through.objects.filter(blog_id=OuterRef("pk")))
+            queryset = queryset.filter(topics_exists) if has_topics == "true" else queryset.filter(~topics_exists)
+
+        has_cover = params.get("has_cover")
+        if has_cover in {"true", "false"}:
+            no_cover = self._missing_cover_q()
+            queryset = queryset.filter(no_cover) if has_cover == "false" else queryset.exclude(no_cover)
+
+        has_linked_stories = params.get("has_linked_stories")
+        if has_linked_stories in {"true", "false"}:
+            linked_stories_exists = Exists(Blog.linked_stories.through.objects.filter(blog_id=OuterRef("pk")))
+            queryset = (
+                queryset.filter(linked_stories_exists)
+                if has_linked_stories == "true"
+                else queryset.filter(~linked_stories_exists)
+            )
+
+        topic_id = params.get("topic")
+        if topic_id and topic_id.isdigit():
+            queryset = queryset.filter(
+                Exists(Blog.topics.through.objects.filter(blog_id=OuterRef("pk"), blogtopic_id=int(topic_id)))
+            )
+
+        sort = self.ADMIN_SORTS.get(params.get("sort", ""), self.ADMIN_SORTS["newest"])
+        queryset = queryset.order_by(*sort)
+
+        return queryset
+
+    @action(detail=False, methods=["get"], url_path="stats")
+    def stats(self, request):
+        """Counts for the admin Blog overview, in a single aggregate pass."""
+        counts = Blog.objects.annotate(
+            _has_topics=Exists(Blog.topics.through.objects.filter(blog_id=OuterRef("pk"))),
+            _has_linked_stories=Exists(Blog.linked_stories.through.objects.filter(blog_id=OuterRef("pk"))),
+        ).aggregate(
+            total=Count("id"),
+            published=Count("id", filter=published_blog_q()),
+            draft=Count("id", filter=Q(is_published=False)),
+            scheduled=Count("id", filter=Q(is_published=True, publish_at__gt=timezone.now())),
+            missing_excerpt=Count("id", filter=self._missing_excerpt_q()),
+            missing_topics=Count("id", filter=Q(_has_topics=False)),
+            missing_cover=Count("id", filter=self._missing_cover_q()),
+            no_linked_stories=Count("id", filter=Q(_has_linked_stories=False)),
+        )
+        return Response(counts)
 
     @action(detail=True, methods=["post"], url_path="generate-excerpt")
     def generate_excerpt(self, request, pk=None):

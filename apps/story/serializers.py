@@ -2091,10 +2091,10 @@ class BlogAdminSerializer(serializers.ModelSerializer):
         return super().to_internal_value(data)
 
     def get_linked_story_details(self, obj):
-        return list(obj.linked_stories.values("id", "title", "slug"))
+        return [{"id": story.id, "title": story.title, "slug": story.slug} for story in obj.linked_stories.all()]
 
     def get_linked_blog_details(self, obj):
-        return list(obj.linked_blogs.values("id", "title", "slug"))
+        return [{"id": blog.id, "title": blog.title, "slug": blog.slug} for blog in obj.linked_blogs.all()]
 
     def get_topic_details(self, obj):
         return [{"id": topic.id, "name": topic.name, "slug": topic.slug} for topic in obj.topics.all()]
@@ -2184,6 +2184,13 @@ class BlogAdminSerializer(serializers.ModelSerializer):
             "excerpt_status", "excerpt_source", "excerpt_confident", "excerpt_confidence_note", "excerpt_error",
         ]
         extra_kwargs = {"slug": {"required": False}}
+
+
+class BlogAdminListSerializer(BlogAdminSerializer):
+    """Admin blog list: omits the full HTML content body so list pages stay light."""
+
+    class Meta(BlogAdminSerializer.Meta):
+        fields = [name for name in BlogAdminSerializer.Meta.fields if name != "content"]
 
 
 class AudioAdminSerializer(serializers.ModelSerializer):
