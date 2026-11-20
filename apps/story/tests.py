@@ -1843,14 +1843,13 @@ class BlogAdminApiTests(APITestCase):
         self.client.force_authenticate(user=self._make_superuser())
         topic = BlogTopic.objects.create(name="Craft", slug="craft")
         story = Story.objects.create(title="Linked Story", slug="linked-story-filter")
-        image = SimpleUploadedFile("cover.jpg", b"fake-image-bytes", content_type="image/jpeg")
 
         complete = Blog.objects.create(
             title="Complete",
             slug="complete",
             excerpt="Has excerpt",
             content="<p>x</p>",
-            cover_image_file=image,
+            cover_image_file="blog_covers/cover.jpg",
         )
         complete.topics.add(topic)
         complete.linked_stories.add(story)
@@ -1934,7 +1933,6 @@ class BlogAdminApiTests(APITestCase):
         now = timezone.now()
         topic = BlogTopic.objects.create(name="Essays", slug="essays")
         story = Story.objects.create(title="Stats Story", slug="stats-story")
-        image = SimpleUploadedFile("cover.jpg", b"fake-image-bytes", content_type="image/jpeg")
 
         pub = Blog.objects.create(
             title="Published Complete",
@@ -1942,7 +1940,7 @@ class BlogAdminApiTests(APITestCase):
             excerpt="Good excerpt",
             content="<p>x</p>",
             is_published=True,
-            cover_image_file=image,
+            cover_image_file="blog_covers/stats-cover.jpg",
         )
         pub.topics.add(topic)
         pub.linked_stories.add(story)
