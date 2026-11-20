@@ -7,7 +7,7 @@ import uuid
 from rest_framework.viewsets import ReadOnlyModelViewSet, ModelViewSet
 from rest_framework.views import APIView
 from django.core.exceptions import ValidationError as DjangoValidationError
-from django.db.models import Case, Sum, Avg, Count, Exists, F, IntegerField, OuterRef, Prefetch, Subquery, When, Value, CharField
+from django.db.models import Case, Sum, Avg, Count, Exists, F, IntegerField, Min, OuterRef, Prefetch, Subquery, When, Value, CharField
 from django.db.models import BooleanField, ExpressionWrapper, Max, Q
 from django.db.models.functions import Coalesce
 from django.http import FileResponse, Http404, HttpResponse, StreamingHttpResponse
@@ -83,6 +83,7 @@ from .models import (
 )
 from .epub_import_jobs import executor as epub_import_executor, run_epub_import
 from .rich_text import rich_text_has_content
+from .story_map import REGION_ORDER, story_map_region
 from .transcripts import (
     SUPPORTED_FORMATS,
     TranscriptParseError,
@@ -3455,6 +3456,7 @@ class MoodListAPIView(APIView):
 class StoryMapAPIView(APIView):
     """Published story totals grouped by ISO 3166-1 alpha-2 country code."""
 
+    @method_decorator(cache_page(60 * 15))
     def get(self, request):
         country_names = dict(COUNTRY_CHOICES)
         grouped_counts = list(
@@ -3464,17 +3466,71 @@ class StoryMapAPIView(APIView):
             .annotate(stories_count=Count("id"))
             .order_by("-stories_count", "country")
         )
+        author_rows = (
+            Story.objects.published()
+            .exclude(country="")
+            .filter(author__isnull=False, author__is_traditional=False, author__is_house=False)
+            .exclude(author__name="")
+            .values("country", "author__name", "author__slug")
+            .annotate(stories_count=Count("id"))
+            .order_by("country", "-stories_count", "author__name", "author__id")
+        )
+        authors_by_country = {}
+        for row in author_rows:
+            authors = authors_by_country.setdefault(row["country"], [])
+            if len(authors) < 4:
+                authors.append({"name": row["author__name"], "slug": row["author__slug"]})
+
+        journey_rows = (
+            StoryJourney.objects.filter(
+                active=True,
+                type=StoryJourney.TYPE_COUNTRY,
+                items__required=True,
+            )
+            .values("id", "title", "slug", "order")
+            .annotate(
+                required_count=Count("items", filter=Q(items__required=True), distinct=True),
+                countries_count=Count(
+                    "items__story__country",
+                    filter=Q(items__required=True),
+                    distinct=True,
+                ),
+                country=Min("items__story__country", filter=Q(items__required=True)),
+            )
+            .filter(required_count__gt=0, countries_count=1)
+            .exclude(country="")
+            .order_by("order", "title", "id")
+        )
+        journeys_by_country = {}
+        for row in journey_rows:
+            journeys_by_country.setdefault(
+                row["country"],
+                {"title": row["title"], "slug": row["slug"]},
+            )
+
         countries = [
             {
                 "code": item["country"],
                 "name": country_names.get(item["country"], item["country"]),
                 "stories_count": item["stories_count"],
+                "region": story_map_region(item["country"]),
+                "top_authors": authors_by_country.get(item["country"], []),
+                "journey": journeys_by_country.get(item["country"]),
             }
             for item in grouped_counts
         ]
+        region_totals = {
+            name: {"name": name, "stories_count": 0, "countries_count": 0}
+            for name in REGION_ORDER
+        }
+        for country in countries:
+            region = region_totals[country["region"]]
+            region["stories_count"] += country["stories_count"]
+            region["countries_count"] += 1
         return Response(
             {
                 "countries": countries,
+                "regions": [region_totals[name] for name in REGION_ORDER if region_totals[name]["countries_count"]],
                 "total_stories": sum(item["stories_count"] for item in countries),
                 "countries_count": len(countries),
                 "max_stories_count": max(

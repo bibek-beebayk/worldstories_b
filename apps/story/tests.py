@@ -14,6 +14,7 @@ from django.http import QueryDict
 from django.test import RequestFactory, SimpleTestCase, TestCase, TransactionTestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
+from django.utils.text import slugify
 from ebooklib import epub
 from rest_framework.exceptions import ValidationError
 from rest_framework.test import APITestCase
@@ -70,6 +71,7 @@ from apps.story.models import (
     PromptSettings,
     Review,
     Story,
+    StoryJourneyItem,
     DailyStory,
     StoryQueue,
     StoryType,
@@ -1335,29 +1337,96 @@ class AudioStreamRangeTests(SimpleTestCase):
         audio_file.open.assert_not_called()
 
 
-class StoryMapDataTests(SimpleTestCase):
-    @patch("apps.story.api.Story.objects.published")
-    def test_story_map_groups_only_published_stories_with_countries(self, published):
-        grouped = [
-            {"country": "JP", "stories_count": 3},
-            {"country": "NP", "stories_count": 1},
-        ]
-        published.return_value.exclude.return_value.values.return_value.annotate.return_value.order_by.return_value = grouped
+class StoryMapDataTests(APITestCase):
+    def setUp(self):
+        cache.clear()
 
-        response = StoryMapAPIView().get(RequestFactory().get("/api/story-map/"))
+    def story(self, title, country, author=None, published=True):
+        return Story.objects.create(
+            title=title,
+            slug=slugify(title),
+            country=country,
+            author=author,
+            is_published=published,
+        )
 
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.data["total_stories"], 4)
-        self.assertEqual(response.data["countries_count"], 2)
-        self.assertEqual(response.data["max_stories_count"], 3)
+    def map_data(self):
+        return self.client.get("/api/story-map/").data
+
+    def test_regions_include_known_assignments_and_unknown_fallback(self):
+        self.story("Nepal tale", "NP")
+        self.story("Irish tale", "IE")
+        self.story("Unknown tale", "XX")
+        self.story("Draft tale", "JP", published=False)
+
+        countries = {row["code"]: row for row in self.map_data()["countries"]}
+
+        self.assertEqual(countries["NP"]["region"], "Asia")
+        self.assertEqual(countries["IE"]["region"], "Europe")
+        self.assertEqual(countries["XX"]["region"], "Other")
+        self.assertNotIn("JP", countries)
+
+    def test_top_authors_are_ordered_limited_and_exclude_special_bylines(self):
+        authors = [Author.objects.create(name=f"Writer {letter}") for letter in "ABCDE"]
+        for index, author in enumerate(authors):
+            for number in range(5 - index):
+                self.story(f"{author.name} {number}", "NP", author)
+        traditional = Author.objects.create(name="Traditional", is_traditional=True)
+        house = Author.objects.create(name="WorldStories", is_house=True)
+        for number in range(6):
+            self.story(f"Traditional {number}", "NP", traditional)
+            self.story(f"House {number}", "NP", house)
+
+        nepal = self.map_data()["countries"][0]
+
         self.assertEqual(
-            response.data["countries"],
+            nepal["top_authors"],
+            [{"name": author.name, "slug": author.slug} for author in authors[:4]],
+        )
+
+    def test_country_journey_matches_only_when_all_required_items_match(self):
+        first = self.story("Nepal one", "NP")
+        second = self.story("Nepal two", "NP")
+        japan = self.story("Japan one", "JP")
+        matching = StoryJourney.objects.create(
+            title="Nepal Path", slug="nepal-path", type=StoryJourney.TYPE_COUNTRY, active=True, order=2
+        )
+        mixed = StoryJourney.objects.create(
+            title="Mixed Path", slug="mixed-path", type=StoryJourney.TYPE_COUNTRY, active=True, order=1
+        )
+        StoryJourneyItem.objects.create(journey=matching, story=first, position=1)
+        StoryJourneyItem.objects.create(journey=matching, story=second, position=2)
+        StoryJourneyItem.objects.create(journey=mixed, story=first, position=1)
+        StoryJourneyItem.objects.create(journey=mixed, story=japan, position=2)
+
+        countries = {row["code"]: row for row in self.map_data()["countries"]}
+
+        self.assertEqual(countries["NP"]["journey"], {"title": "Nepal Path", "slug": "nepal-path"})
+        self.assertIsNone(countries["JP"]["journey"])
+
+    def test_region_totals_follow_the_declared_order(self):
+        self.story("Nepal one", "NP")
+        self.story("Nepal two", "NP")
+        self.story("Irish one", "IE")
+        self.story("Kenya one", "KE")
+
+        self.assertEqual(
+            self.map_data()["regions"],
             [
-                {"code": "JP", "name": "Japan", "stories_count": 3},
-                {"code": "NP", "name": "Nepal", "stories_count": 1},
+                {"name": "Europe", "stories_count": 1, "countries_count": 1},
+                {"name": "Asia", "stories_count": 2, "countries_count": 1},
+                {"name": "Africa", "stories_count": 1, "countries_count": 1},
             ],
         )
-        published.return_value.exclude.assert_called_once_with(country="")
+
+    def test_story_list_sort_title_is_case_insensitive(self):
+        self.story("zebra", "NP")
+        self.story("Apple", "NP")
+        self.story("banana", "NP")
+
+        response = self.client.get("/api/stories/", {"sort": "title", "country": "NP"})
+
+        self.assertEqual([row["title"] for row in response.data["results"]], ["Apple", "banana", "zebra"])
 
 
 class ScheduledPublishingTests(SimpleTestCase):
