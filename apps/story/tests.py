@@ -9,9 +9,10 @@ from unittest.mock import MagicMock, patch
 from django.core.cache import cache
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.files.uploadedfile import SimpleUploadedFile
-from django.db import IntegrityError, transaction
+from django.db import IntegrityError, connection, transaction
 from django.http import QueryDict
 from django.test import RequestFactory, SimpleTestCase, TestCase, TransactionTestCase, override_settings
+from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 from django.utils import timezone
 from django.utils.text import slugify
@@ -6079,6 +6080,114 @@ class StoryJourneyAdminApiTests(APITestCase):
         self.assertEqual(
             self.client.get(reverse("admin-journey-list"), format="json").status_code, 403
         )
+
+
+class StoryJourneyNextStoryApiTests(APITestCase):
+    def setUp(self):
+        cache.clear()
+        self.reader = User.objects.create_user(
+            email="pathreader@example.com", username="pathreader", password="test-password"
+        )
+
+    def _story(self, slug, *, published=True):
+        return Story.objects.create(
+            title=slug.replace("-", " ").title(),
+            slug=slug,
+            is_published=published,
+            cover_image=f"https://example.com/{slug}.jpg",
+        )
+
+    def _journey(self, slug, stories):
+        journey = StoryJourney.objects.create(title=slug.title(), slug=slug, active=True)
+        for position, (story, required) in enumerate(stories, start=1):
+            StoryJourneyItem.objects.create(
+                journey=journey, story=story, position=position, required=required
+            )
+        return journey
+
+    def _list_row(self, slug):
+        rows = self.client.get(reverse("journey-list"), format="json").data["journeys"]
+        return next(row for row in rows if row["slug"] == slug)
+
+    def test_anonymous_reader_gets_first_required_published_story(self):
+        first = self._story("first-stop")
+        self._journey("anonymous-path", [(first, True)])
+
+        row = self._list_row("anonymous-path")
+
+        self.assertEqual(row["next_story"]["slug"], first.slug)
+        detail = self.client.get(
+            reverse("journey-detail", kwargs={"slug": "anonymous-path"}), format="json"
+        )
+        self.assertEqual(detail.data["next_story"]["slug"], first.slug)
+
+    def test_reader_with_first_completed_gets_second(self):
+        first = self._story("finished-stop")
+        second = self._story("next-stop")
+        self._journey("reader-path", [(first, True), (second, True)])
+        StoryCompletion.objects.create(
+            user=self.reader, story=first, source=StoryCompletion.SOURCE_BACKFILL
+        )
+        self.client.force_authenticate(self.reader)
+
+        self.assertEqual(self._list_row("reader-path")["next_story"]["slug"], second.slug)
+
+    def test_unpublished_story_is_skipped(self):
+        hidden = self._story("hidden-stop", published=False)
+        visible = self._story("visible-stop")
+        self._journey("published-path", [(hidden, True), (visible, True)])
+
+        self.assertEqual(self._list_row("published-path")["next_story"]["slug"], visible.slug)
+
+    def test_optional_items_are_skipped(self):
+        optional = self._story("bonus-stop")
+        required = self._story("required-stop")
+        self._journey("required-path", [(optional, False), (required, True)])
+
+        self.assertEqual(self._list_row("required-path")["next_story"]["slug"], required.slug)
+
+    def test_complete_journey_returns_null(self):
+        story = self._story("last-stop")
+        self._journey("complete-path", [(story, True)])
+        StoryCompletion.objects.create(
+            user=self.reader, story=story, source=StoryCompletion.SOURCE_BACKFILL
+        )
+        self.client.force_authenticate(self.reader)
+
+        self.assertIsNone(self._list_row("complete-path")["next_story"])
+
+    def test_detail_next_story_follows_the_reader_and_is_null_when_complete(self):
+        first = self._story("detail-first")
+        second = self._story("detail-second")
+        self._journey("detail-path", [(first, True), (second, True)])
+        url = reverse("journey-detail", kwargs={"slug": "detail-path"})
+        self.client.force_authenticate(self.reader)
+        self.assertEqual(self.client.get(url).data["next_story"]["slug"], first.slug)
+        for story in (first, second):
+            StoryCompletion.objects.create(user=self.reader, story=story, source=StoryCompletion.SOURCE_BACKFILL)
+        self.assertIsNone(self.client.get(url).data["next_story"])
+
+    def test_next_story_carries_title_and_card_cover(self):
+        story = self._story("cover-stop")
+        self._journey("cover-path", [(story, True)])
+        row = self._list_row("cover-path")["next_story"]
+        self.assertEqual(set(row), {"slug", "title", "cover_image"})
+        self.assertEqual(row["title"], "Cover Stop")
+        self.assertEqual(row["cover_image"], "https://example.com/cover-stop.jpg")
+
+    def test_list_query_count_is_constant_as_journeys_grow(self):
+        first = self._story("query-base")
+        self._journey("query-path-0", [(first, True)])
+        self.client.force_authenticate(self.reader)
+        with CaptureQueriesContext(connection) as baseline:
+            self.client.get(reverse("journey-list"), format="json")
+
+        for index in range(1, 5):
+            story = self._story(f"query-story-{index}")
+            self._journey(f"query-path-{index}", [(story, True)])
+
+        with self.assertNumQueries(len(baseline.captured_queries)):
+            self.client.get(reverse("journey-list"), format="json")
 
 
 class StoryReactionApiTests(APITestCase):

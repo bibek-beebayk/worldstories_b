@@ -66,6 +66,7 @@ def journeys_for_reader(user, journeys=None):
                 "completed": done,
                 "total": total,
                 "is_complete": is_complete,
+                "completed_ids": completed_ids,
             }
         )
     return rows

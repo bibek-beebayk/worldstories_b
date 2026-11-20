@@ -3324,6 +3324,9 @@ class StoryJourneyListAPIView(APIView):
                         "completed": row["completed"],
                         "total": row["total"],
                         "is_complete": row["is_complete"],
+                        "next_story": _journey_next_story(
+                            row["journey"], row["completed_ids"], request
+                        ),
                     }
                     for row in rows
                 ]
@@ -3352,6 +3355,22 @@ def _journey_cover(journey, request):
     return get_cover_image_url(
         first.story.cover_image_file, first.story.cover_image, request, size=CARD_COVER_SIZE
     )
+
+
+def _journey_next_story(journey, completed_ids, request):
+    """First unfinished required published story, using prefetched items."""
+    for item in journey.items.all():
+        story = item.story
+        if not item.required or item.story_id in completed_ids or not story.is_published:
+            continue
+        return {
+            "slug": story.slug,
+            "title": story.title,
+            "cover_image": get_cover_image_url(
+                story.cover_image_file, story.cover_image, request, size=CARD_COVER_SIZE
+            ),
+        }
+    return None
 
 
 class StoryJourneyDetailAPIView(APIView):
@@ -3384,6 +3403,7 @@ class StoryJourneyDetailAPIView(APIView):
                 "completed": done,
                 "total": total,
                 "is_complete": is_complete,
+                "next_story": _journey_next_story(journey, completed_ids, request),
                 "items": [
                     {
                         "position": item.position,
