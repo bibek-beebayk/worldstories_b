@@ -97,6 +97,23 @@ from apps.users.models import User
 from core.urls import sitemap
 
 
+class StoryNumericSlugGuardTests(TestCase):
+    def test_new_all_digit_slug_gets_story_suffix(self):
+        story = Story.objects.create(title="1984", slug="1984", is_published=False)
+
+        self.assertEqual(story.slug, "1984-story")
+
+    def test_existing_numeric_slug_is_not_changed_on_update(self):
+        story = Story(title="Legacy", slug="123", is_published=False)
+        Story.objects.bulk_create([story])
+        story = Story.objects.get(title="Legacy")
+
+        story.title = "Legacy updated"
+        story.save(update_fields=["title"])
+
+        self.assertEqual(story.slug, "123")
+
+
 def _build_test_epub(guide=None, toc=None, spine_items=None, extra_items=None):
     """Builds a small real in-memory EPUB (via ebooklib) for exercising
     extract_chapters against actual EPUB container/spine/TOC structure,

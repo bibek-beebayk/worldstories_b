@@ -708,6 +708,17 @@ class Story(models.Model):
         return self.videos.exists()
 
     def save(self, *args, **kwargs):
+        # /watch/<segment> treats all digits as a video primary key. Protect
+        # newly-created stories from ever entering that ambiguous namespace,
+        # while deliberately leaving any legacy rows unchanged on updates.
+        if self._state.adding and self.slug and self.slug.isdigit():
+            base = f"{self.slug}-story"
+            candidate = base
+            suffix = 2
+            while Story.objects.filter(slug=candidate).exists():
+                candidate = f"{base}-{suffix}"
+                suffix += 1
+            self.slug = candidate
         if self.is_published and not self.site_published_date:
             self.site_published_date = (
                 timezone.localdate(self.publish_at)
