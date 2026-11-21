@@ -1,0 +1,6 @@
+Confirm your WorldStories weekly digest
+
+Open this link to confirm your subscription:
+{{ confirm_url }}
+
+If you did not request this, you can ignore this email.

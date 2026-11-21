@@ -1,0 +1,27 @@
+WorldStories — New this week
+
+Hello {{ greeting_name }},
+
+{% if continue_reading %}CONTINUE READING
+{{ continue_reading.title }} — chapter {{ continue_reading.chapter_number }} of {{ continue_reading.total_chapters }} ({{ continue_reading.percent }}%)
+{{ continue_reading.url }}
+
+{% endif %}{% if new_stories %}NEW THIS WEEK
+{% for story in new_stories %}- {{ story.title }}{% if story.read_time_minutes %} — {{ story.read_time_minutes }} min read{% endif %}
+  {{ story.description }}
+  {{ story.url }}
+{% endfor %}
+{% endif %}{% if story_of_the_week %}
+STORY OF THE WEEK
+{{ story_of_the_week.title }}
+{% if story_of_the_week.hook %}{{ story_of_the_week.hook }}
+{% endif %}{{ story_of_the_week.url }}
+{% endif %}{% if new_posts %}
+FROM THE BLOG
+{% for post in new_posts %}- {{ post.title }}{% if post.reading_time_minutes %} — {{ post.reading_time_minutes }} min read{% endif %}
+  {{ post.url }}
+{% endfor %}{% endif %}
+Manage settings: {{ manage_url }}
+Unsubscribe: {{ unsubscribe_url }}
+
+{{ postal_address }}

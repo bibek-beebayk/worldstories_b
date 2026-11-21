@@ -5,9 +5,6 @@ DEBUG = True
 
 ALLOWED_HOSTS = ["*"]
 
-# Email backend
-EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
-
 MEDIA_URL =  'media/'
 MEDIA_ROOT =  BASE_DIR / 'media'
 

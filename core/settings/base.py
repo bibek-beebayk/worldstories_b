@@ -37,12 +37,14 @@ INSTALLED_APPS = [
     "corsheaders",
     "solo",
     "storages",
+    "anymail",
 
     "apps.users",
     "apps.story",
     "apps.stats",
     "apps.pages",
     "apps.feedback",
+    "apps.newsletter",
     # "apps.blog"
 ]
 
@@ -203,6 +205,8 @@ REST_FRAMEWORK = {
         # Tighter, IP-keyed limit applied only to the login/admin-login
         # actions via ScopedRateThrottle — see apps/users/api.py.
         "login": "5/min",
+        "newsletter_subscribe": "5/hour",
+        "newsletter_public": "30/hour",
     },
 }
 
@@ -258,6 +262,18 @@ EMAIL_HOST = "smtp.gmail.com"
 EMAIL_PORT = "587"
 EMAIL_HOST_USER = os.environ.get("EMAIL_HOST_USER", "")
 EMAIL_HOST_PASSWORD = os.environ.get("EMAIL_HOST_PASSWORD", "")
+
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
+if RESEND_API_KEY:
+    EMAIL_BACKEND = "anymail.backends.resend.EmailBackend"
+    ANYMAIL = {"RESEND_API_KEY": RESEND_API_KEY}
+
+NEWSLETTER_FROM_EMAIL = os.environ.get("NEWSLETTER_FROM_EMAIL", "")
+NEWSLETTER_REPLY_TO = os.environ.get("NEWSLETTER_REPLY_TO", "")
+NEWSLETTER_SITE_URL = os.environ.get("NEWSLETTER_SITE_URL", "https://worldstories.net").rstrip("/")
+NEWSLETTER_API_URL = os.environ.get("NEWSLETTER_API_URL", "https://api.worldstories.net").rstrip("/")
+NEWSLETTER_POSTAL_ADDRESS = os.environ.get("NEWSLETTER_POSTAL_ADDRESS", "")
+NEWSLETTER_SEND_DELAY_SECONDS = float(os.environ.get("NEWSLETTER_SEND_DELAY_SECONDS", "0.6"))
 EMAIL_USE_TLS = True
 EMAIL_TIMEOUT = int(os.environ.get("EMAIL_TIMEOUT", "20"))
 DEFAULT_FROM_EMAIL = EMAIL_HOST_USER

@@ -20,3 +20,4 @@ nh3
 anthropic
 markdown
 openpyxl
+django-anymail[resend]

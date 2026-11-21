@@ -20,6 +20,7 @@ from django.utils import timezone
 from .geo import record_login
 from .models import OTP
 from .recommendations import recommend_stories_for
+from .continue_reading import continue_reading_items
 from apps.story.api import IsSuperUser
 from apps.story.models import Audio, Chapter, Favorite, Genre, Review, Story, Video
 from apps.story.serializers import StoryListSerializer
@@ -584,42 +585,19 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
 
     @action(detail=False, methods=["get"], url_path="library/continue-reading")
     def library_continue_reading(self, request):
-        progress_qs = (
-            ReadingProgress.objects.filter(user=request.user)
-            .select_related("story", "chapter")
-            .order_by("-updated_at")
-        )
-        story_ids = [item.story_id for item in progress_qs if item.story_id]
-        chapter_progress_qs = ChapterReadingProgress.objects.filter(
-            user=request.user, story_id__in=story_ids
-        ).select_related("chapter")
-
-        chapter_progress_by_story = {}
-        for item in chapter_progress_qs:
-            chapter_progress_by_story.setdefault(item.story_id, {})[
-                item.chapter.slug
-            ] = max(0.0, min(1.0, item.progress))
-
-        chapter_counts = related_counts_by_story(Chapter, story_ids)
+        selected = continue_reading_items(request.user)
+        story_ids = [item["progress"].story_id for item in selected]
         cards = card_stories_by_id(story_ids, request.user)
-
         payload = []
-        for item in progress_qs:
-            total_chapters = chapter_counts.get(item.story_id, 0)
-            chapter_progress_map = chapter_progress_by_story.get(item.story_id, {})
-            overall_progress = (
-                sum(chapter_progress_map.values()) / total_chapters if total_chapters > 0 else 0.0
-            )
-            # Continue-reading should only contain in-progress stories.
-            if overall_progress <= 0 or overall_progress >= 1:
-                continue
+        for selected_item in selected:
+            item = selected_item["progress"]
             payload.append(
                 {
                     "story": cards.get(item.story_id, item.story),
                     "chapter_slug": item.chapter.slug if item.chapter else None,
                     "chapter_title": item.chapter.title if item.chapter else None,
                     "chapter_progress": max(0.0, min(1.0, item.progress)),
-                    "overall_progress": round(overall_progress, 4),
+                    "overall_progress": selected_item["overall_progress"],
                     "updated_at": item.updated_at,
                     "excerpt": excerpt_at_progress(item.chapter, item.progress) if item.chapter else "",
                 }

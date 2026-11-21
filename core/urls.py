@@ -278,6 +278,7 @@ def nepali_sitemap(request):
 
 
 urlpatterns = [
+    path("api/newsletter/", include("apps.newsletter.urls")),
     path("api/nepalikatha/events/", nepalikatha_api.NepalikathaEventAPIView.as_view(), name="nepalikatha-events"),
     path("api/admin/analytics/nepalikatha/", nepalikatha_api.AdminNepalikathaAnalyticsAPIView.as_view(), name="admin-analytics-nepalikatha"),
     path("admin/", admin.site.urls),
