@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, timezone as dt_timezone
 from io import StringIO
+from unittest.mock import patch
 
 from django.core import mail
 from django.core.cache import cache
@@ -404,19 +405,25 @@ class NewsletterCohortDigestTests(TestCase):
 
         # First run on Monday sends to 2 of 3 (cap = 2)
         out1 = StringIO()
-        call_command("send_weekly_digest", now=self.monday, stdout=out1)
+        with patch("django.utils.timezone.now", return_value=self.monday):
+            call_command("send_weekly_digest", stdout=out1)
         self.assertEqual(len(mail.outbox), 2)
         self.assertIn("1 subscriber(s) remain", out1.getvalue())
 
         # Second run on Monday cannot exceed the daily cap
         out2 = StringIO()
-        call_command("send_weekly_digest", now=self.monday + timedelta(hours=2), stdout=out2)
+        with patch(
+            "django.utils.timezone.now",
+            return_value=self.monday + timedelta(hours=2),
+        ):
+            call_command("send_weekly_digest", stdout=out2)
         self.assertEqual(len(mail.outbox), 2)
         self.assertIn("Daily cap reached", out2.getvalue())
 
         # Next day (Tuesday): the left-over person is now 8 days since last send -> overdue -> sent!
         out3 = StringIO()
-        call_command("send_weekly_digest", now=self.tuesday, stdout=out3)
+        with patch("django.utils.timezone.now", return_value=self.tuesday):
+            call_command("send_weekly_digest", stdout=out3)
         self.assertEqual(len(mail.outbox), 3)
         sent_recipients = {msg.to[0] for msg in mail.outbox}
         self.assertEqual(sent_recipients, {s.email for s in subs})
@@ -446,8 +453,10 @@ class NewsletterCohortDigestTests(TestCase):
             confirmed_at=self.monday - timedelta(days=2),
         )
 
-        call_command("send_weekly_digest", now=self.monday, stdout=StringIO())
-        call_command("send_weekly_digest", now=self.tuesday, stdout=StringIO())
+        with patch("django.utils.timezone.now", return_value=self.monday):
+            call_command("send_weekly_digest", stdout=StringIO())
+        with patch("django.utils.timezone.now", return_value=self.tuesday):
+            call_command("send_weekly_digest", stdout=StringIO())
 
         mon_issue = DigestIssue.objects.get(issue_date=self.monday.date())
         tue_issue = DigestIssue.objects.get(issue_date=self.tuesday.date())
@@ -463,7 +472,8 @@ class NewsletterCohortDigestTests(TestCase):
             rating=1,
             views=5,
         )
-        call_command("send_weekly_digest", now=self.next_monday, stdout=StringIO())
+        with patch("django.utils.timezone.now", return_value=self.next_monday):
+            call_command("send_weekly_digest", stdout=StringIO())
         next_mon_issue = DigestIssue.objects.get(issue_date=self.next_monday.date())
         self.assertEqual(next_mon_issue.featured_story_id, second_story.id)
         self.assertNotEqual(next_mon_issue.featured_story_id, mon_issue.featured_story_id)
@@ -487,7 +497,8 @@ class NewsletterCohortDigestTests(TestCase):
         )
 
         dry_out = StringIO()
-        call_command("send_weekly_digest", "--dry-run", now=self.monday, stdout=dry_out)
+        with patch("django.utils.timezone.now", return_value=self.monday):
+            call_command("send_weekly_digest", "--dry-run", stdout=dry_out)
         text = dry_out.getvalue()
         self.assertEqual(len(mail.outbox), 0)
         self.assertEqual(DigestIssue.objects.count(), 0)
@@ -503,7 +514,8 @@ class NewsletterCohortDigestTests(TestCase):
         # Skip when empty creates no rows
         Story.objects.update(site_published_date=self.monday.date() - timedelta(days=30))
         empty_out = StringIO()
-        call_command("send_weekly_digest", now=self.monday, stdout=empty_out)
+        with patch("django.utils.timezone.now", return_value=self.monday):
+            call_command("send_weekly_digest", stdout=empty_out)
         self.assertEqual(len(mail.outbox), 0)
         self.assertEqual(DigestIssue.objects.count(), 0)
         self.assertEqual(DigestDelivery.objects.count(), 0)

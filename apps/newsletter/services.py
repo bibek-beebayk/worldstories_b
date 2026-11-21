@@ -275,3 +275,36 @@ def send_message_or_raise(message):
     if sent_count != 1:
         raise RuntimeError(f"Email backend reported {sent_count} messages submitted")
     return getattr(message, "anymail_status", None)
+
+
+def build_digest_subject(data: dict) -> str:
+    return (
+        f"New this week: {data['new_stories'][0]['title']}"
+        if data["new_stories"]
+        else "Your week in stories"
+    )
+
+
+def send_test_digest(recipient: str, story_slug: str | None = None, now: datetime | None = None):
+    """Build and send a single test digest without creating DigestIssue/DigestDelivery rows."""
+    from .digest import build_digest
+
+    if not settings.NEWSLETTER_FROM_EMAIL:
+        raise RuntimeError("NEWSLETTER_FROM_EMAIL is required")
+    now = now or timezone.now()
+    tz = ZoneInfo(settings.NEWSLETTER_SEND_TIMEZONE)
+    issue_date = now.astimezone(tz).date()
+    since = now - timedelta(days=7)
+    if not story_slug:
+        week_story = get_week_featured_story(issue_date)
+        if week_story:
+            story_slug = week_story.slug
+    subscription = (
+        NewsletterSubscription.objects.select_related("user")
+        .filter(email__iexact=recipient)
+        .first()
+    )
+    data = build_digest(since, subscription=subscription, story_slug=story_slug, now=now)
+    subject = build_digest_subject(data)
+    message = build_digest_message(subject, data, issue_date, recipient, subscription)
+    return send_message_or_raise(message)
