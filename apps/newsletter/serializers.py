@@ -33,7 +33,7 @@ class UnsubscribeByEmailSerializer(serializers.Serializer):
 class MeToggleSerializer(serializers.Serializer):
     subscribed = serializers.BooleanField()
     source = serializers.ChoiceField(
-        choices=("profile", "prompt", "completion", "blog"),
+        choices=NewsletterSubscription.SOURCE_CHOICES,
         required=False,
         default="profile",
     )

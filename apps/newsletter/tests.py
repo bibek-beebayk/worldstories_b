@@ -123,6 +123,23 @@ class NewsletterApiTests(APITestCase):
         self.assertEqual(disabled.data["status"], "unsubscribed")
         self.assertIsNotNone(subscription.unsubscribed_at)
 
+    def test_logged_in_toggle_accepts_every_model_source_choice(self):
+        user = User.objects.create_user(
+            email="reader@example.com", username="reader", password="password"
+        )
+        self.client.force_authenticate(user)
+
+        for source, _label in NewsletterSubscription.SOURCE_CHOICES:
+            with self.subTest(source=source):
+                response = self.client.post(
+                    reverse("newsletter:me"),
+                    {"subscribed": True, "source": source},
+                    format="json",
+                )
+                self.assertEqual(response.status_code, 200)
+                subscription = NewsletterSubscription.objects.get(email=user.email)
+                self.assertEqual(subscription.source, source)
+
     def test_one_click_unsubscribe_accepts_form_body_and_is_idempotent(self):
         subscription = NewsletterSubscription.objects.create(
             email="reader@example.com",
