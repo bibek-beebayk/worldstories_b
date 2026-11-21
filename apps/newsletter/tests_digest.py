@@ -3,6 +3,7 @@ from io import StringIO
 from unittest.mock import patch
 
 from django.core import mail
+from django.core.mail.backends.locmem import EmailBackend as LocMemEmailBackend
 from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.test import TestCase, override_settings
@@ -16,8 +17,13 @@ from .digest import build_digest
 from .models import DigestDelivery, DigestIssue, NewsletterSubscription
 from .services import build_digest_message, send_message_or_raise
 
+
+class RecordingEmailBackend(LocMemEmailBackend):
+    """Test-only backend that writes to mail.outbox without tripping the locmem guard."""
+
+
 SETTINGS = dict(
-    EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend",
+    EMAIL_BACKEND="apps.newsletter.tests_digest.RecordingEmailBackend",
     NEWSLETTER_FROM_EMAIL="WorldStories <digest@example.com>",
     NEWSLETTER_REPLY_TO="reply@example.com",
     NEWSLETTER_SITE_URL="https://worldstories.net",
@@ -167,6 +173,7 @@ class DigestContentTests(TestCase):
 @override_settings(**SETTINGS)
 class DigestCommandTests(TestCase):
     def setUp(self):
+        self.today_weekday = timezone.now().weekday()
         self.story = Story.objects.create(
             title="Fresh Story", slug="fresh-story", is_published=True
         )
@@ -174,6 +181,7 @@ class DigestCommandTests(TestCase):
             email="confirmed@example.com",
             status=NewsletterSubscription.STATUS_CONFIRMED,
             confirm_token=None,
+            send_weekday=self.today_weekday,
         )
         self.pending = NewsletterSubscription.objects.create(
             email="pending@example.com", status=NewsletterSubscription.STATUS_PENDING
@@ -199,6 +207,7 @@ class DigestCommandTests(TestCase):
             email="second@example.com",
             status=NewsletterSubscription.STATUS_CONFIRMED,
             confirm_token=None,
+            send_weekday=self.today_weekday,
         )
         with patch(
             "django.core.mail.EmailMultiAlternatives.send",
@@ -240,9 +249,31 @@ class DigestCommandTests(TestCase):
 
     def test_test_copy_leaves_delivery_state_untouched(self):
         before = self.confirmed.last_digest_sent_at
-        call_command("send_weekly_digest", "--to", self.confirmed.email)
+        output = StringIO()
+        call_command("send_weekly_digest", "--to", self.confirmed.email, stdout=output)
         self.confirmed.refresh_from_db()
         self.assertEqual(len(mail.outbox), 1)
         self.assertEqual(self.confirmed.last_digest_sent_at, before)
         self.assertEqual(DigestIssue.objects.count(), 0)
         self.assertEqual(DigestDelivery.objects.count(), 0)
+        text = output.getvalue()
+        self.assertIn("apps.newsletter.tests_digest.RecordingEmailBackend", text)
+        self.assertIn("WorldStories <digest@example.com>", text)
+        self.assertIn(self.confirmed.email, text)
+        self.assertIn("send() returned 1", text)
+
+    def test_non_delivering_email_backends_are_rejected(self):
+        for backend in (
+            "django.core.mail.backends.console.EmailBackend",
+            "django.core.mail.backends.locmem.EmailBackend",
+            "django.core.mail.backends.dummy.EmailBackend",
+        ):
+            with self.subTest(backend=backend):
+                with override_settings(EMAIL_BACKEND=backend):
+                    with self.assertRaises(CommandError):
+                        call_command("send_weekly_digest", "--to", self.confirmed.email)
+
+    @override_settings(NEWSLETTER_FROM_EMAIL="", DEFAULT_FROM_EMAIL="fallback@example.com")
+    def test_missing_newsletter_from_email_does_not_fall_back(self):
+        with self.assertRaises(CommandError):
+            call_command("send_weekly_digest", "--to", self.confirmed.email)

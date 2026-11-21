@@ -1,5 +1,6 @@
 from datetime import date, datetime, timedelta
 from urllib.parse import urljoin
+from zoneinfo import ZoneInfo
 
 from django.conf import settings
 from django.db.models.functions import Coalesce
@@ -57,11 +58,14 @@ def _as_datetime(since):
     raise TypeError("since must be a date or datetime")
 
 
-def build_digest(since, subscription=None, story_slug=None):
+def build_digest(since, subscription=None, story_slug=None, now=None):
+    now = now or timezone.now()
+    tz = ZoneInfo(settings.NEWSLETTER_SEND_TIMEZONE)
+    today_date = now.astimezone(tz).date()
     since = _as_datetime(since)
     stories = list(
         Story.objects.published()
-        .filter(site_published_date__gte=timezone.localdate(since))
+        .filter(site_published_date__gte=since.astimezone(tz).date())
         .select_related("story_type", "author")
         .prefetch_related("genres")
         .order_by("-site_published_date", "-id")[:5]
@@ -73,10 +77,12 @@ def build_digest(since, subscription=None, story_slug=None):
         .order_by("-first_published_at", "-id")[:2]
     )
 
-    recent_feature_ids = (
+    eight_weeks_ago = today_date - timedelta(days=56)
+    recent_feature_ids = list(
         DigestIssue.objects.exclude(featured_story_id=None)
-        .order_by("-issue_date")
-        .values_list("featured_story_id", flat=True)[:8]
+        .filter(issue_date__gte=eight_weeks_ago)
+        .values_list("featured_story_id", flat=True)
+        .distinct()
     )
     spotlight_qs = (
         Story.objects.published()
@@ -96,7 +102,7 @@ def build_digest(since, subscription=None, story_slug=None):
     if subscription and subscription.user_id:
         selected = continue_reading_items(
             subscription.user,
-            since=timezone.now() - timedelta(days=30),
+            since=now - timedelta(days=30),
             published_only=True,
         )
         if selected:

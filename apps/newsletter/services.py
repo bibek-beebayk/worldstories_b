@@ -1,7 +1,141 @@
+from datetime import datetime, time as date_time, timedelta
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from zoneinfo import ZoneInfo
+
 from django.conf import settings
 from django.core.mail import EmailMultiAlternatives
+from django.db.models import Count, F, Q
 from django.template import Context, Engine
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from django.utils import timezone
+
+from .models import DigestDelivery, DigestIssue, NewsletterSubscription
+
+WEEKDAY_NAMES = [
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+    "Sunday",
+]
+WEEKDAY_PRIORITY = [5, 6, 4, 3, 2, 1, 0]
+
+
+def _weekday_counts():
+    counts = {day: 0 for day in range(7)}
+    rows = (
+        NewsletterSubscription.objects.filter(
+            status=NewsletterSubscription.STATUS_CONFIRMED,
+            send_weekday__isnull=False,
+        )
+        .values("send_weekday")
+        .annotate(total=Count("id"))
+    )
+    for row in rows:
+        day = row["send_weekday"]
+        if day in counts:
+            counts[day] = row["total"]
+    return counts
+
+
+def assign_send_weekday():
+    counts = _weekday_counts()
+    return min(WEEKDAY_PRIORITY, key=lambda day: counts[day])
+
+
+def get_week_featured_story(today_date):
+    week_start = today_date - timedelta(days=today_date.weekday())
+    week_end = week_start + timedelta(days=6)
+    issue = (
+        DigestIssue.objects.select_related("featured_story")
+        .filter(
+            issue_date__gte=week_start,
+            issue_date__lte=week_end,
+            featured_story__isnull=False,
+        )
+        .order_by("issue_date")
+        .first()
+    )
+    return issue.featured_story if issue else None
+
+
+def select_digest_audience(now=None, limit=None, assign_missing=True):
+    tz = ZoneInfo(settings.NEWSLETTER_SEND_TIMEZONE)
+    now = now or timezone.now()
+    local_now = now.astimezone(tz)
+    today_date = local_now.date()
+    today_weekday = local_now.weekday()
+
+    confirmed = NewsletterSubscription.objects.filter(
+        status=NewsletterSubscription.STATUS_CONFIRMED, language="en"
+    ).select_related("user")
+
+    simulated_today_ids = []
+    if assign_missing:
+        for sub in confirmed.filter(send_weekday__isnull=True):
+            sub.send_weekday = assign_send_weekday()
+            sub.save(update_fields=["send_weekday"])
+    else:
+        counts = _weekday_counts()
+        for sub in confirmed.filter(send_weekday__isnull=True):
+            chosen = min(WEEKDAY_PRIORITY, key=lambda day: counts[day])
+            counts[chosen] += 1
+            if chosen == today_weekday:
+                simulated_today_ids.append(sub.pk)
+
+    six_days_ago = now - timedelta(days=6)
+    eight_days_ago = now - timedelta(days=8)
+    overdue = confirmed.filter(
+        Q(last_digest_sent_at__lte=eight_days_ago)
+        | Q(last_digest_sent_at__isnull=True, confirmed_at__lte=eight_days_ago)
+    ).order_by(F("last_digest_sent_at").asc(nulls_first=True))
+
+    weekday_q = Q(send_weekday=today_weekday)
+    if simulated_today_ids:
+        weekday_q |= Q(pk__in=simulated_today_ids)
+
+    due_today = (
+        confirmed.filter(weekday_q)
+        .filter(
+            Q(last_digest_sent_at__isnull=True)
+            | Q(last_digest_sent_at__lte=six_days_ago)
+        )
+        .exclude(pk__in=overdue.values("pk"))
+    )
+
+    overdue_list = list(overdue)
+    due_today_list = list(due_today)
+    audience = overdue_list + due_today_list
+
+    day_start = datetime.combine(today_date, date_time.min, tzinfo=tz)
+    day_end = day_start + timedelta(days=1)
+    already_sent_today = DigestDelivery.objects.filter(
+        status=DigestDelivery.STATUS_SENT,
+        sent_at__gte=day_start,
+        sent_at__lt=day_end,
+    ).count()
+    allowed = max(0, settings.NEWSLETTER_DAILY_SEND_LIMIT - already_sent_today)
+    if limit is not None:
+        allowed = min(allowed, max(0, limit))
+
+    to_send = audience[:allowed]
+    left_over = max(0, len(audience) - len(to_send))
+
+    return {
+        "now": now,
+        "tz": tz,
+        "today_date": today_date,
+        "today_weekday": today_weekday,
+        "weekday_name": WEEKDAY_NAMES[today_weekday],
+        "overdue": overdue_list,
+        "due_today": due_today_list,
+        "audience": audience,
+        "already_sent_today": already_sent_today,
+        "allowed": allowed,
+        "to_send": to_send,
+        "left_over": left_over,
+    }
 
 
 class EmailTemplateContext(Context):

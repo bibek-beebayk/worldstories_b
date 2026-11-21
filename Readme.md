@@ -13,6 +13,8 @@ The weekly digest uses double opt-in for anonymous addresses. Existing users are
 - `NEWSLETTER_API_URL`: public backend origin without a trailing slash, for example `https://api.worldstories.net`.
 - `NEWSLETTER_POSTAL_ADDRESS`: required physical postal address shown in every digest footer.
 - `NEWSLETTER_SEND_DELAY_SECONDS`: delay between recipients; defaults to `0.6`.
+- `NEWSLETTER_DAILY_SEND_LIMIT`: maximum digest emails sent per day across all runs; defaults to `80`.
+- `NEWSLETTER_SEND_TIMEZONE`: IANA timezone used for weekday cohort selection and daily caps; defaults to `UTC`.
 
 Send one test copy without creating an issue or delivery record:
 
@@ -34,7 +36,9 @@ Create a separate Railway cron service using the same application image and envi
 python manage.py send_weekly_digest
 ```
 
-For Saturday at 09:00 UTC, use `0 9 * * 6`. Railway cron expressions run in UTC. Do not run the command from the web service startup path.
+Run the cron **DAILY** (for example `0 9 * * *`, which runs at 09:00 UTC). Railway cron expressions run in UTC. Do not run the command from the web service startup path.
+
+Each confirmed subscriber is assigned a weekday cohort (`0` = Monday through `6` = Sunday, balanced across the week) so every subscriber still receives one digest per week while sends are spread evenly across the week. Each daily run sends to overdue subscribers first, then today's weekday cohort, up to `NEWSLETTER_DAILY_SEND_LIMIT`. Anyone left over is picked up on the next day's run.
 
 ### Sending-domain DNS
 

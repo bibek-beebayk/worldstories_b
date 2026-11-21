@@ -16,7 +16,7 @@ from .serializers import (
     UnsubscribeByEmailSerializer,
     UnsubscribeSerializer,
 )
-from .services import send_confirmation_email
+from .services import assign_send_weekday, send_confirmation_email
 
 SUBSCRIBE_RESPONSE = {
     "detail": "If this address can be subscribed, we sent a confirmation link."
@@ -105,8 +105,16 @@ class NewsletterConfirmAPIView(APIView):
             subscription.confirm_token = None
             subscription.unsubscribed_at = None
             subscription.unsubscribe_reason = ""
+            if subscription.send_weekday is None:
+                subscription.send_weekday = assign_send_weekday()
             subscription.save()
-            return Response({"status": "confirmed", "email": subscription.email})
+            return Response(
+                {
+                    "status": "confirmed",
+                    "email": subscription.email,
+                    "send_weekday": subscription.send_weekday,
+                }
+            )
 
         reused = NewsletterSubscription.objects.filter(
             status=NewsletterSubscription.STATUS_CONFIRMED,
@@ -114,7 +122,13 @@ class NewsletterConfirmAPIView(APIView):
             confirmed_at__gte=now - timedelta(days=7),
         ).first()
         if reused:
-            return Response({"status": "confirmed", "email": reused.email})
+            return Response(
+                {
+                    "status": "confirmed",
+                    "email": reused.email,
+                    "send_weekday": reused.send_weekday,
+                }
+            )
         return Response(
             {"code": "invalid_or_expired"}, status=status.HTTP_400_BAD_REQUEST
         )
@@ -160,8 +174,16 @@ class NewsletterResubscribeAPIView(APIView):
         subscription.confirm_token = None
         subscription.unsubscribed_at = None
         subscription.unsubscribe_reason = ""
+        if subscription.send_weekday is None:
+            subscription.send_weekday = assign_send_weekday()
         subscription.save()
-        return Response({"status": "confirmed", "email": subscription.email})
+        return Response(
+            {
+                "status": "confirmed",
+                "email": subscription.email,
+                "send_weekday": subscription.send_weekday,
+            }
+        )
 
 
 class NewsletterUnsubscribeByEmailAPIView(APIView):
@@ -202,6 +224,7 @@ class NewsletterMeAPIView(APIView):
             {
                 "status": subscription.status if subscription else "none",
                 "email": request.user.email,
+                "send_weekday": subscription.send_weekday if subscription else None,
             }
         )
 
@@ -217,15 +240,27 @@ class NewsletterMeAPIView(APIView):
             },
         )
         subscription.user = request.user
-        subscription.source = serializer.validated_data["source"]
-        if serializer.validated_data["subscribed"]:
-            subscription.status = NewsletterSubscription.STATUS_CONFIRMED
-            subscription.confirmed_at = timezone.now()
-            subscription.confirm_token = None
-            subscription.unsubscribed_at = None
-            subscription.unsubscribe_reason = ""
-        else:
-            subscription.status = NewsletterSubscription.STATUS_UNSUBSCRIBED
-            subscription.unsubscribed_at = timezone.now()
+        if "source" in request.data or "subscribed" in serializer.validated_data:
+            subscription.source = serializer.validated_data["source"]
+        if "send_weekday" in serializer.validated_data:
+            subscription.send_weekday = serializer.validated_data["send_weekday"]
+        if "subscribed" in serializer.validated_data:
+            if serializer.validated_data["subscribed"]:
+                subscription.status = NewsletterSubscription.STATUS_CONFIRMED
+                subscription.confirmed_at = timezone.now()
+                subscription.confirm_token = None
+                subscription.unsubscribed_at = None
+                subscription.unsubscribe_reason = ""
+                if subscription.send_weekday is None:
+                    subscription.send_weekday = assign_send_weekday()
+            else:
+                subscription.status = NewsletterSubscription.STATUS_UNSUBSCRIBED
+                subscription.unsubscribed_at = timezone.now()
         subscription.save()
-        return Response({"status": subscription.status, "email": subscription.email})
+        return Response(
+            {
+                "status": subscription.status,
+                "email": subscription.email,
+                "send_weekday": subscription.send_weekday,
+            }
+        )

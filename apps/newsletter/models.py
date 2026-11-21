@@ -2,6 +2,7 @@ import hashlib
 import secrets
 
 from django.conf import settings
+from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
 
 
@@ -52,6 +53,12 @@ class NewsletterSubscription(models.Model):
     unsubscribed_at = models.DateTimeField(null=True, blank=True)
     unsubscribe_reason = models.CharField(max_length=255, blank=True)
     last_digest_sent_at = models.DateTimeField(null=True, blank=True)
+    send_weekday = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+        db_index=True,
+        validators=[MinValueValidator(0), MaxValueValidator(6)],
+    )
 
     class Meta:
         ordering = ["-created_at"]
