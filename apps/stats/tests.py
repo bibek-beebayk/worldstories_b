@@ -4,7 +4,9 @@ from uuid import uuid4
 
 from django.core.cache import cache
 from django.core.management.base import CommandError
+from django.db import connection
 from django.test import SimpleTestCase
+from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 from django.utils import timezone
 from rest_framework.test import APIClient, APITestCase
@@ -30,6 +32,7 @@ from apps.pages.models import Page
 from apps.users.models import User, UserLoginLocation
 
 from .completion import COMPLETION_THRESHOLD
+from .passport import passport_summary
 from .models import (
     Achievement,
     AnalyticsEvent,
@@ -1688,6 +1691,59 @@ class StoryPassportTests(APITestCase):
 
         # Japan has fewer stories but is the one the reader has been to.
         self.assertEqual(codes[0], "JP")
+
+    def test_next_story_is_the_shortest_uncompleted_story(self):
+        completed = self._story("already-finished", country="JP")
+        shortest = self._story("shortest-unread", country="JP")
+        longest = self._story("longest-unread", country="JP")
+        Story.objects.filter(pk=completed.pk).update(cached_chapter_reading_minutes=1)
+        Story.objects.filter(pk=shortest.pk).update(cached_chapter_reading_minutes=5)
+        Story.objects.filter(pk=longest.pk).update(cached_chapter_reading_minutes=30)
+        self._finish(completed)
+
+        japan = next(row for row in self._passport()["countries"] if row["code"] == "JP")
+
+        self.assertEqual(
+            japan["next_story"],
+            {
+                "slug": shortest.slug,
+                "title": shortest.title,
+                "reading_time_minutes": 5,
+            },
+        )
+
+    def test_next_story_is_null_when_every_country_story_is_completed(self):
+        first = self._story("jp-first-complete", country="JP")
+        second = self._story("jp-second-complete", country="JP")
+        self._finish(first)
+        self._finish(second)
+
+        japan = next(row for row in self._passport()["countries"] if row["code"] == "JP")
+
+        self.assertIsNone(japan["next_story"])
+
+    def test_next_story_with_no_cached_minutes_sorts_last(self):
+        timed = self._story("timed-story", country="JP", chapters=0)
+        self._story("untimed-story", country="JP", chapters=0)
+        Story.objects.filter(pk=timed.pk).update(cached_file_reading_minutes=12)
+
+        japan = next(row for row in self._passport()["countries"] if row["code"] == "JP")
+
+        self.assertEqual(japan["next_story"]["slug"], timed.slug)
+        self.assertEqual(japan["next_story"]["reading_time_minutes"], 12)
+
+    def test_passport_summary_query_count_does_not_grow_with_countries(self):
+        self._story("jp-query-count", country="JP")
+        with CaptureQueriesContext(connection) as one_country_queries:
+            passport_summary(self.user)
+
+        self._story("fr-query-count", country="FR")
+        self._story("np-query-count", country="NP")
+        with CaptureQueriesContext(connection) as three_country_queries:
+            passport_summary(self.user)
+
+        self.assertEqual(len(one_country_queries), 3)
+        self.assertEqual(len(three_country_queries), len(one_country_queries))
 
     def test_country_detail_separates_what_is_read_from_what_is_left(self):
         finished = self._story("jp-finished", country="JP")

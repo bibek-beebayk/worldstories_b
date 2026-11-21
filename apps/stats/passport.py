@@ -67,10 +67,59 @@ def explored_countries(user):
     }
 
 
+def next_stories_by_country(user, country_codes):
+    """The shortest unfinished published story for every available country.
+
+    One values query supplies the whole passport. Selection happens in Python
+    so this stays one query regardless of country count. Chapter minutes take
+    precedence over file minutes because that is exactly what
+    ``story_reading_minutes_cached`` (and therefore StoryCard) displays; a
+    missing/zero chapter cache falls back to the file cache.
+    """
+    stories = Story.objects.published().filter(country__in=country_codes)
+    if user and user.is_authenticated:
+        stories = stories.exclude(completions__user=user)
+
+    candidates = []
+    for row in stories.values(
+        "country",
+        "slug",
+        "title",
+        "cached_chapter_reading_minutes",
+        "cached_file_reading_minutes",
+    ):
+        minutes = (
+            row["cached_chapter_reading_minutes"]
+            or row["cached_file_reading_minutes"]
+        )
+        candidates.append((row, minutes))
+
+    candidates.sort(
+        key=lambda candidate: (
+            candidate[1] is None,
+            candidate[1] if candidate[1] is not None else 0,
+            candidate[0]["title"],
+        )
+    )
+
+    next_by_country = {}
+    for row, minutes in candidates:
+        next_by_country.setdefault(
+            row["country"],
+            {
+                "slug": row["slug"],
+                "title": row["title"],
+                "reading_time_minutes": minutes,
+            },
+        )
+    return next_by_country
+
+
 def passport_summary(user):
-    """Everything the Passport page needs, in two queries."""
+    """Everything the Passport page needs, in three fixed queries."""
     available = available_countries()
     explored = explored_countries(user) if user and user.is_authenticated else {}
+    next_stories = next_stories_by_country(user, available.keys())
 
     countries = [
         {
@@ -80,6 +129,7 @@ def passport_summary(user):
             "stories_completed": explored.get(code, {}).get("completed", 0),
             "explored": code in explored,
             "unlocked_at": explored.get(code, {}).get("unlocked_at"),
+            "next_story": next_stories.get(code),
         }
         for code, total in available.items()
     ]

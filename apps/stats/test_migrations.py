@@ -22,8 +22,14 @@ class StoryCompletionBackfillMigrationTests(TransactionTestCase):
     def setUp(self):
         super().setUp()
         executor = MigrationExecutor(connection)
-        executor.migrate([self.migrate_from])
-        old_apps = executor.loader.project_state([self.migrate_from]).apps
+        # Keep the physical Story table at the same historical migration as
+        # the model state used by stats 0012. Leaving Story at the current leaf
+        # while asking project_state for its 0073 dependency makes later
+        # NOT NULL Story columns exist in SQLite but disappear from the
+        # historical model, so the fixture cannot provide their values.
+        historical_targets = [self.migrate_from, ("story", "0073_story_cached_chapter_reading_minutes")]
+        executor.migrate(historical_targets)
+        old_apps = executor.loader.project_state(historical_targets).apps
 
         StoryType = old_apps.get_model("story", "StoryType")
         Story = old_apps.get_model("story", "Story")
