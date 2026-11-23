@@ -1,4 +1,5 @@
 import json
+import math
 
 from rest_framework import serializers
 from django.core.exceptions import ValidationError as DjangoValidationError
@@ -475,6 +476,7 @@ class StoryListSerializer(serializers.ModelSerializer):
     has_audio = serializers.SerializerMethodField()
     has_video = serializers.SerializerMethodField()
     has_read_along = serializers.SerializerMethodField()
+    audio_minutes = serializers.SerializerMethodField()
     reading_time_minutes = serializers.SerializerMethodField()
     # True/False where the queryset annotates `_has_text` (the Library list);
     # null elsewhere, meaning "not computed" rather than "no text".
@@ -520,6 +522,24 @@ class StoryListSerializer(serializers.ModelSerializer):
         prefetched = self._prefetched(obj, "audios")
         rows = prefetched if prefetched is not None else obj.audios.all()
         return any(audio.audio_file and rich_text_has_content(audio.transcript) for audio in rows)
+
+    def get_audio_minutes(self, obj):
+        if hasattr(obj, "_audio_seconds"):
+            total_seconds = getattr(obj, "_audio_seconds")
+        else:
+            prefetched = self._prefetched(obj, "audios")
+            rows = prefetched if prefetched is not None else obj.audios.all()
+            durations = [
+                audio.duration_seconds
+                for audio in rows
+                if audio.audio_file
+                and audio.duration_seconds is not None
+                and audio.duration_seconds > 0
+            ]
+            total_seconds = sum(durations) if durations else None
+        if not total_seconds or total_seconds <= 0:
+            return None
+        return math.ceil(total_seconds / 60)
 
     # Name only (not the full nested author object list responses use
     # elsewhere) — just enough for cards/fallback covers to credit the
@@ -580,6 +600,7 @@ class StoryListSerializer(serializers.ModelSerializer):
             "has_audio",
             "has_video",
             "has_read_along",
+            "audio_minutes",
             "genres",
             "categories",
             "author",

@@ -1,8 +1,8 @@
 from django_filters import rest_framework as filters
-from django.db.models import Exists, F, IntegerField, OuterRef, Q, Subquery
+from django.db.models import Exists, F, FloatField, IntegerField, OuterRef, Q, Subquery, Sum
 from django.db.models.functions import Coalesce, Lower, NullIf
 from django.utils.text import slugify
-from .models import Author, Chapter, Story, StoryMood, Video
+from .models import Audio, Author, Chapter, Story, StoryMood, Video
 
 # Length buckets on the whole-story reading estimate (minutes). Lower bound
 # inclusive, upper exclusive; matches the Library's "Length" facet.
@@ -11,6 +11,13 @@ LENGTH_BUCKETS = {
     "10_60": (10, 60),
     "1_5h": (60, 300),
     "5h_plus": (300, None),
+}
+# Audio duration buckets (seconds). Lower bound inclusive, upper exclusive.
+AUDIO_LENGTH_BUCKETS = {
+    "short": (None, 1800),
+    "medium": (1800, 7200),
+    "long": (7200, 18000),
+    "epic": (18000, None),
 }
 FORMATS = ("read", "listen", "read_along", "watch", "quick_read")
 
@@ -27,6 +34,28 @@ def with_reading_minutes(queryset):
             F("cached_file_reading_minutes"),
             output_field=IntegerField(),
         )
+    )
+
+
+def with_audio_seconds(queryset):
+    """Annotates `_audio_seconds`: Sum of `audios.duration_seconds` per story,
+    counting only audio rows that have an audio_file. Uses a correlated Subquery
+    grouped by story so it does not interact with joins added by other filters."""
+    if "_audio_seconds" in queryset.query.annotations:
+        return queryset
+    audio_totals = (
+        Audio.objects.filter(
+            story=OuterRef("pk"),
+            audio_file__isnull=False,
+        )
+        .exclude(audio_file="")
+        .order_by()
+        .values("story")
+        .annotate(total=Sum("duration_seconds"))
+        .values("total")
+    )
+    return queryset.annotate(
+        _audio_seconds=Subquery(audio_totals, output_field=FloatField())
     )
 
 
@@ -89,6 +118,10 @@ class StoryFilter(filters.FilterSet):
     genre = filters.CharFilter(method="filter_genre", label="Genre (slug or id)")
     category = filters.CharFilter(method="filter_category", label="Category (slug or id)")
     length = filters.CharFilter(method="filter_length", label="Length bucket")
+    audio_length = filters.CharFilter(method="filter_audio_length", label="Audio length bucket")
+    max_audio_minutes = filters.CharFilter(
+        method="filter_max_audio_minutes", label="At most this many audio minutes"
+    )
     author = filters.CharFilter(method="filter_author", label="Author (id or slug)")
     traditional = filters.CharFilter(method="filter_traditional", label="Anonymous or traditional")
     format = filters.CharFilter(method="filter_format", label="Format")
@@ -146,6 +179,29 @@ class StoryFilter(filters.FilterSet):
         if not (value or "").strip().isdigit():
             return queryset
         return with_reading_minutes(queryset).filter(_minutes__lte=int(value))
+
+    def filter_audio_length(self, queryset, name, value):
+        token = (value or "").strip().lower()
+        if not token or token == "all":
+            return queryset
+        bounds = AUDIO_LENGTH_BUCKETS.get(token)
+        if bounds is None:
+            return queryset
+        queryset = with_audio_seconds(queryset).filter(_audio_seconds__gt=0)
+        low, high = bounds
+        if low is not None:
+            queryset = queryset.filter(_audio_seconds__gte=low)
+        if high is not None:
+            queryset = queryset.filter(_audio_seconds__lt=high)
+        return queryset
+
+    def filter_max_audio_minutes(self, queryset, name, value):
+        token = (value or "").strip()
+        if not token.isdigit():
+            return queryset
+        return with_audio_seconds(queryset).filter(
+            _audio_seconds__gt=0, _audio_seconds__lte=int(token) * 60
+        )
 
     def filter_author(self, queryset, name, value):
         value = (value or "").strip()
@@ -275,6 +331,10 @@ class StoryFilter(filters.FilterSet):
         elif value.lower() == "shortest":
             # Unknown lengths last: "no estimate" is not "shortest".
             return with_reading_minutes(queryset).order_by(F("_minutes").asc(nulls_last=True), "id")
+        elif value.lower() == "audio_shortest":
+            return with_audio_seconds(queryset).order_by(F("_audio_seconds").asc(nulls_last=True), "id")
+        elif value.lower() == "audio_longest":
+            return with_audio_seconds(queryset).order_by(F("_audio_seconds").desc(nulls_last=True), "id")
         # Watch page: newest video first, regardless of when the story itself
         # was published. A subquery rather than Max("videos__created_at") so it
         # doesn't interact with joins added by other filters (has_video, genres…).
@@ -312,4 +372,20 @@ class StoryFilter(filters.FilterSet):
 
     class Meta:
         model = Story
-        fields = ["status", "genres", "categories", "language", "story_type", "country", "has_audio", "has_video", "has_summary", "has_read_along", "is_original", "sort", "q"]
+        fields = [
+            "status",
+            "genres",
+            "categories",
+            "language",
+            "story_type",
+            "country",
+            "has_audio",
+            "has_video",
+            "has_summary",
+            "has_read_along",
+            "is_original",
+            "audio_length",
+            "max_audio_minutes",
+            "sort",
+            "q",
+        ]

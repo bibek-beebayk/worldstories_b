@@ -1024,6 +1024,38 @@ class StoryViewSet(ReadOnlyModelViewSet):
 
         return Response(get_facets(dict(request.query_params.items()), nepali_only=wants_nepali_site(request)))
 
+    @action(detail=False, methods=["get"], url_path="audiobook-stats", permission_classes=[AllowAny])
+    def audiobook_stats(self, request):
+        """Public summary for the Audiobooks hero: count of published stories
+        with at least one audio file, sum of their audio durations in seconds,
+        and how many have no known duration. Cached for 10 minutes."""
+        cache_key = "story:audiobook-stats:v1"
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return Response(cached)
+
+        has_file_q = Q(audio_file__isnull=False) & ~Q(audio_file="")
+        audio_stories = Story.objects.filter(published_story_q()).filter(
+            Exists(Audio.objects.filter(has_file_q, story=OuterRef("pk")))
+        )
+        count = audio_stories.count()
+        total_seconds = (
+            Audio.objects.filter(has_file_q, story__in=audio_stories).aggregate(
+                total=Coalesce(Sum("duration_seconds"), 0.0)
+            )["total"]
+            or 0.0
+        )
+        unknown_duration_count = audio_stories.exclude(
+            Exists(Audio.objects.filter(has_file_q, story=OuterRef("pk"), duration_seconds__gt=0))
+        ).count()
+        data = {
+            "count": count,
+            "total_seconds": int(round(total_seconds)),
+            "unknown_duration_count": unknown_duration_count,
+        }
+        cache.set(cache_key, data, 60 * 10)
+        return Response(data)
+
     @action(detail=False, methods=["get"], url_path="collections")
     def collections(self, request):
         """Curated tiles for the Library's collections strip: each carries the

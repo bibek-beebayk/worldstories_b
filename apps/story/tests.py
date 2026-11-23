@@ -8863,3 +8863,117 @@ class StoryAdminOverviewApiTests(APITestCase):
         with CaptureQueriesContext(connection) as after:
             self.client.get(reverse("admin-story-stats"))
         self.assertEqual(len(after), len(before))
+
+
+class AudiobooksApiTests(APITestCase):
+    def setUp(self):
+        cache.clear()
+        self.short_story = Story.objects.create(title="Short Audio", slug="short-audio", is_published=True)
+        Audio.objects.create(
+            story=self.short_story, title="Part 1", slug="short-p1", order=1,
+            audio_file="audios/short1.mp3", duration_seconds=610.0,
+        )
+        Audio.objects.create(
+            story=self.short_story, title="Part 2", slug="short-p2", order=2,
+            audio_file="audios/short2.mp3", duration_seconds=600.0,
+        )  # total = 1210s -> 21 min
+
+        self.medium_story = Story.objects.create(title="Medium Audio", slug="medium-audio", is_published=True)
+        Audio.objects.create(
+            story=self.medium_story, title="Part 1", slug="med-p1", order=1,
+            audio_file="audios/med1.mp3", duration_seconds=3600.0,
+        )  # 60 min
+
+        self.long_story = Story.objects.create(title="Long Audio", slug="long-audio", is_published=True)
+        Audio.objects.create(
+            story=self.long_story, title="Part 1", slug="long-p1", order=1,
+            audio_file="audios/long1.mp3", duration_seconds=9000.0,
+        )  # 150 min
+
+        self.epic_story = Story.objects.create(title="Epic Audio", slug="epic-audio", is_published=True)
+        Audio.objects.create(
+            story=self.epic_story, title="Part 1", slug="epic-p1", order=1,
+            audio_file="audios/epic1.mp3", duration_seconds=18600.0,
+        )  # 310 min
+
+        self.unknown_story = Story.objects.create(title="Unknown Audio", slug="unknown-audio", is_published=True)
+        Audio.objects.create(
+            story=self.unknown_story, title="Part 1", slug="unk-p1", order=1,
+            audio_file="audios/unk1.mp3", duration_seconds=None,
+        )
+
+        # Draft story and audio without file should not count in stats or public list
+        self.draft_story = Story.objects.create(title="Draft Audio", slug="draft-audio", is_published=False)
+        Audio.objects.create(
+            story=self.draft_story, title="Part 1", slug="draft-p1", order=1,
+            audio_file="audios/draft1.mp3", duration_seconds=500.0,
+        )
+        self.no_file_story = Story.objects.create(title="No File Audio", slug="no-file-audio", is_published=True)
+        Audio.objects.create(
+            story=self.no_file_story, title="Part 1", slug="nofile-p1", order=1,
+            audio_file="", duration_seconds=900.0,
+        )
+
+    def test_audio_length_buckets_and_max_audio_minutes(self):
+        short_resp = self.client.get("/api/stories/?has_audio=true&audio_length=short")
+        self.assertEqual(short_resp.status_code, 200)
+        self.assertEqual([r["slug"] for r in short_resp.data["results"]], ["short-audio"])
+
+        med_resp = self.client.get("/api/stories/?has_audio=true&audio_length=medium")
+        self.assertEqual([r["slug"] for r in med_resp.data["results"]], ["medium-audio"])
+
+        long_resp = self.client.get("/api/stories/?has_audio=true&audio_length=long")
+        self.assertEqual([r["slug"] for r in long_resp.data["results"]], ["long-audio"])
+
+        epic_resp = self.client.get("/api/stories/?has_audio=true&audio_length=epic")
+        self.assertEqual([r["slug"] for r in epic_resp.data["results"]], ["epic-audio"])
+
+        all_resp = self.client.get("/api/stories/?has_audio=true&audio_length=all")
+        self.assertIn("unknown-audio", [r["slug"] for r in all_resp.data["results"]])
+
+        max_resp = self.client.get("/api/stories/?has_audio=true&max_audio_minutes=60")
+        self.assertEqual(
+            {r["slug"] for r in max_resp.data["results"]},
+            {"short-audio", "medium-audio"},
+        )
+
+    def test_audio_shortest_and_audio_longest_sort_nulls_last(self):
+        shortest = self.client.get("/api/stories/?has_audio=true&sort=audio_shortest")
+        self.assertEqual(shortest.status_code, 200)
+        slugs_asc = [r["slug"] for r in shortest.data["results"]]
+        self.assertEqual(
+            slugs_asc[:4],
+            ["short-audio", "medium-audio", "long-audio", "epic-audio"],
+        )
+        self.assertIn("unknown-audio", slugs_asc[4:])
+
+        longest = self.client.get("/api/stories/?has_audio=true&sort=audio_longest")
+        self.assertEqual(longest.status_code, 200)
+        slugs_desc = [r["slug"] for r in longest.data["results"]]
+        self.assertEqual(
+            slugs_desc[:4],
+            ["epic-audio", "long-audio", "medium-audio", "short-audio"],
+        )
+        self.assertIn("unknown-audio", slugs_desc[4:])
+
+    def test_audio_minutes_field_values_and_null(self):
+        resp = self.client.get("/api/stories/?has_audio=true")
+        self.assertEqual(resp.status_code, 200)
+        by_slug = {r["slug"]: r["audio_minutes"] for r in resp.data["results"]}
+        self.assertEqual(by_slug["short-audio"], 21)
+        self.assertEqual(by_slug["medium-audio"], 60)
+        self.assertEqual(by_slug["long-audio"], 150)
+        self.assertEqual(by_slug["epic-audio"], 310)
+        self.assertIsNone(by_slug["unknown-audio"])
+
+    def test_audiobook_stats_endpoint(self):
+        resp = self.client.get("/api/stories/audiobook-stats/")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(
+            resp.data,
+            {
+                "count": 5,
+                "total_seconds": 1210 + 3600 + 9000 + 18600,
+                "unknown_duration_count": 1,
+            },
+        )
