@@ -2,6 +2,7 @@ from django_filters import rest_framework as filters
 from django.db.models import Exists, F, FloatField, IntegerField, OuterRef, Q, Subquery, Sum
 from django.db.models.functions import Coalesce, Lower, NullIf
 from django.utils.text import slugify
+from apps.stats.models import QuickReadProgress
 from .models import Audio, Author, Chapter, Story, StoryMood, Video
 
 # Length buckets on the whole-story reading estimate (minutes). Lower bound
@@ -122,6 +123,12 @@ class StoryFilter(filters.FilterSet):
     max_audio_minutes = filters.CharFilter(
         method="filter_max_audio_minutes", label="At most this many audio minutes"
     )
+    summary_length = filters.CharFilter(
+        method="filter_summary_length", label="Summary reading length bucket"
+    )
+    not_read_quick = filters.CharFilter(
+        method="filter_not_read_quick", label="Exclude finished quick reads"
+    )
     author = filters.CharFilter(method="filter_author", label="Author (id or slug)")
     traditional = filters.CharFilter(method="filter_traditional", label="Anonymous or traditional")
     format = filters.CharFilter(method="filter_format", label="Format")
@@ -202,6 +209,42 @@ class StoryFilter(filters.FilterSet):
         return with_audio_seconds(queryset).filter(
             _audio_seconds__gt=0, _audio_seconds__lte=int(token) * 60
         )
+
+    def filter_summary_length(self, queryset, name, value):
+        token = (value or "").strip().lower()
+        if not token or token == "all":
+            return queryset
+        if token == "under3":
+            return queryset.filter(
+                cached_summary_reading_minutes__isnull=False,
+                cached_summary_reading_minutes__lt=3,
+            )
+        if token == "mid":
+            return queryset.filter(
+                cached_summary_reading_minutes__isnull=False,
+                cached_summary_reading_minutes__gte=3,
+                cached_summary_reading_minutes__lte=5,
+            )
+        if token == "long":
+            return queryset.filter(
+                cached_summary_reading_minutes__isnull=False,
+                cached_summary_reading_minutes__gt=5,
+            )
+        return queryset
+
+    def filter_not_read_quick(self, queryset, name, value):
+        if (value or "").strip().lower() != "true":
+            return queryset
+        request = getattr(self, "request", None)
+        user = getattr(request, "user", None)
+        if not user or not user.is_authenticated:
+            return queryset
+        finished = QuickReadProgress.objects.filter(
+            user=user,
+            story=OuterRef("pk"),
+            progress__gte=0.9,
+        )
+        return queryset.exclude(Exists(finished))
 
     def filter_author(self, queryset, name, value):
         value = (value or "").strip()
@@ -335,6 +378,10 @@ class StoryFilter(filters.FilterSet):
             return with_audio_seconds(queryset).order_by(F("_audio_seconds").asc(nulls_last=True), "id")
         elif value.lower() == "audio_longest":
             return with_audio_seconds(queryset).order_by(F("_audio_seconds").desc(nulls_last=True), "id")
+        elif value.lower() == "summary_shortest":
+            return queryset.order_by(F("cached_summary_reading_minutes").asc(nulls_last=True), "id")
+        elif value.lower() == "summary_longest":
+            return queryset.order_by(F("cached_summary_reading_minutes").desc(nulls_last=True), "id")
         # Watch page: newest video first, regardless of when the story itself
         # was published. A subquery rather than Max("videos__created_at") so it
         # doesn't interact with joins added by other filters (has_video, genres…).
@@ -386,6 +433,8 @@ class StoryFilter(filters.FilterSet):
             "is_original",
             "audio_length",
             "max_audio_minutes",
+            "summary_length",
+            "not_read_quick",
             "sort",
             "q",
         ]

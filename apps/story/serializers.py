@@ -467,6 +467,7 @@ class StoryListSerializer(serializers.ModelSerializer):
     author = serializers.SerializerMethodField()
     story_type = serializers.CharField(source="story_type.name", read_only=True)
     summary_reading_minutes = serializers.SerializerMethodField()
+    quick_read_progress = serializers.SerializerMethodField()
     reviews_count = serializers.SerializerMethodField()
     is_favorite = serializers.SerializerMethodField()
     favorites_count = serializers.SerializerMethodField()
@@ -553,7 +554,15 @@ class StoryListSerializer(serializers.ModelSerializer):
     # read" and link to /quick-read/:slug without shipping the whole summary
     # HTML in every list response. The full text is only in StoryDetailSerializer.
     def get_summary_reading_minutes(self, obj):
+        if obj.cached_summary_reading_minutes is not None:
+            return obj.cached_summary_reading_minutes
         return reading_time.summary_reading_minutes(obj.summary) if obj.summary else None
+
+    def get_quick_read_progress(self, obj):
+        request = self.context.get("request")
+        if not request or not request.user or not request.user.is_authenticated:
+            return None
+        return getattr(obj, "_quick_read_progress", None)
 
     # The cached counterpart of StoryDetailSerializer.reading_time_minutes, so
     # cards, search results, recommendations and Continue Reading can all show
@@ -605,6 +614,7 @@ class StoryListSerializer(serializers.ModelSerializer):
             "categories",
             "author",
             "summary_reading_minutes",
+            "quick_read_progress",
             "reading_time_minutes",
             "reviews_count",
             "is_favorite",

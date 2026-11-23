@@ -7,7 +7,7 @@ import uuid
 from rest_framework.viewsets import ReadOnlyModelViewSet, ModelViewSet
 from rest_framework.views import APIView
 from django.core.exceptions import ValidationError as DjangoValidationError
-from django.db.models import Case, Sum, Avg, Count, Exists, F, IntegerField, Min, OuterRef, Prefetch, Subquery, When, Value, CharField
+from django.db.models import Case, Sum, Avg, Count, Exists, F, FloatField, IntegerField, Min, OuterRef, Prefetch, Subquery, When, Value, CharField
 from django.db.models import BooleanField, ExpressionWrapper, Max, Q
 from django.db.models.functions import Coalesce
 from django.http import FileResponse, Http404, HttpResponse, StreamingHttpResponse
@@ -29,6 +29,7 @@ from apps.story.filters import StoryFilter
 from apps.stats.models import (
     AnalyticsEvent,
     AudioReadingProgress,
+    QuickReadProgress,
     ReadingProgress,
     StoryCompletion,
     VideoWatchProgress,
@@ -875,6 +876,13 @@ class StoryViewSet(ReadOnlyModelViewSet):
                         story=OuterRef("pk"), user=self.request.user
                     )
                 )
+                if (self.request.query_params.get("has_summary") or "").lower() == "true":
+                    annotations["_quick_read_progress"] = Subquery(
+                        QuickReadProgress.objects.filter(
+                            user=self.request.user, story=OuterRef("pk")
+                        ).values("progress")[:1],
+                        output_field=FloatField(),
+                    )
             queryset = queryset.annotate(**annotations)
         return queryset
 
@@ -1055,6 +1063,68 @@ class StoryViewSet(ReadOnlyModelViewSet):
         }
         cache.set(cache_key, data, 60 * 10)
         return Response(data)
+
+    @action(
+        detail=False,
+        methods=["get"],
+        url_path="quick-read-hero",
+        permission_classes=[IsAuthenticated],
+    )
+    def quick_read_hero(self, request):
+        """Authenticated hero card for /quick-reads: either the user's most
+        recently updated in-progress summary (0 < progress < 0.9), or a
+        deterministic daily pick preferring unread summaries."""
+        has_summary_q = Q(summary__isnull=False) & ~Q(summary__exact="")
+        summary_stories = Story.objects.filter(published_story_q()).filter(has_summary_q)
+
+        in_progress = (
+            QuickReadProgress.objects.filter(
+                user=request.user,
+                progress__gt=0,
+                progress__lt=0.9,
+                story__in=summary_stories,
+            )
+            .order_by("-updated_at")
+            .first()
+        )
+        if in_progress is not None:
+            story = (
+                Story.objects.published()
+                .for_card_list()
+                .filter(pk=in_progress.story_id)
+                .first()
+            )
+            if story is not None:
+                story._quick_read_progress = in_progress.progress
+                return Response(
+                    {
+                        "mode": "continue",
+                        "story": StoryListSerializer(story, context={"request": request}).data,
+                        "progress": in_progress.progress,
+                    }
+                )
+
+        ordered = summary_stories.order_by("id")
+        read_ids = QuickReadProgress.objects.filter(
+            user=request.user, progress__gte=0.9
+        ).values_list("story_id", flat=True)
+        unread = ordered.exclude(id__in=read_ids)
+        pool = unread if unread.exists() else ordered
+        count = pool.count()
+        if count == 0:
+            return Response({"mode": "none"})
+
+        index = timezone.localdate().toordinal() % count
+        pick_id = pool.values_list("id", flat=True)[index]
+        story = Story.objects.published().for_card_list().filter(pk=pick_id).first()
+        if story is None:
+            return Response({"mode": "none"})
+        return Response(
+            {
+                "mode": "pick",
+                "story": StoryListSerializer(story, context={"request": request}).data,
+            }
+        )
 
     @action(detail=False, methods=["get"], url_path="collections")
     def collections(self, request):

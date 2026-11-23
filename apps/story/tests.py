@@ -8977,3 +8977,149 @@ class AudiobooksApiTests(APITestCase):
                 "unknown_duration_count": 1,
             },
         )
+
+
+class QuickReadsApiTests(APITestCase):
+    def setUp(self):
+        from apps.stats.models import QuickReadProgress
+        from django.core.management import call_command
+
+        self.QuickReadProgress = QuickReadProgress
+        self.call_command = call_command
+        self.user = User.objects.create_user(
+            email="qr@example.com", username="qrreader", password="password123"
+        )
+        # reading_time.summary_reading_minutes uses ~200 wpm (min 1 min)
+        self.s_short = Story.objects.create(
+            title="Short Summary",
+            slug="short-summary",
+            is_published=True,
+            summary="<p>" + " ".join(["word"] * 250) + "</p>",  # 2 min
+        )
+        self.s_mid = Story.objects.create(
+            title="Mid Summary",
+            slug="mid-summary",
+            is_published=True,
+            summary="<p>" + " ".join(["word"] * 800) + "</p>",  # 4 min
+        )
+        self.s_long = Story.objects.create(
+            title="Long Summary",
+            slug="long-summary",
+            is_published=True,
+            summary="<p>" + " ".join(["word"] * 1500) + "</p>",  # 8 min
+        )
+        self.s_null = Story.objects.create(
+            title="Null Cached Summary",
+            slug="null-cached-summary",
+            is_published=True,
+            summary="<p>Some summary text</p>",
+        )
+        Story.objects.filter(pk=self.s_null.pk).update(cached_summary_reading_minutes=None)
+        self.s_null.refresh_from_db()
+
+    def test_cached_field_updates_on_save_and_update_fields(self):
+        from apps.story import reading_time
+
+        self.assertEqual(
+            self.s_short.cached_summary_reading_minutes,
+            reading_time.summary_reading_minutes(self.s_short.summary),
+        )
+        self.assertLess(self.s_short.cached_summary_reading_minutes, 3)
+        self.assertTrue(3 <= self.s_mid.cached_summary_reading_minutes <= 5)
+        self.assertGreater(self.s_long.cached_summary_reading_minutes, 5)
+
+        self.s_short.summary = "<p>" + " ".join(["word"] * 1000) + "</p>"
+        self.s_short.save(update_fields=["summary"])
+        self.s_short.refresh_from_db()
+        self.assertEqual(
+            self.s_short.cached_summary_reading_minutes,
+            reading_time.summary_reading_minutes(self.s_short.summary),
+        )
+
+        self.s_short.summary = ""
+        self.s_short.save(update_fields=["summary"])
+        self.s_short.refresh_from_db()
+        self.assertIsNone(self.s_short.cached_summary_reading_minutes)
+
+    def test_backfill_summary_minutes_is_idempotent(self):
+        from io import StringIO
+
+        self.assertIsNone(self.s_null.cached_summary_reading_minutes)
+        out1 = StringIO()
+        self.call_command("backfill_summary_minutes", stdout=out1)
+        self.s_null.refresh_from_db()
+        self.assertEqual(self.s_null.cached_summary_reading_minutes, 1)
+        self.assertIn("1 stories", out1.getvalue())
+
+        out2 = StringIO()
+        self.call_command("backfill_summary_minutes", stdout=out2)
+        self.assertIn("0 stories", out2.getvalue())
+
+    def test_summary_length_buckets_exclude_nulls(self):
+        under3 = self.client.get("/api/stories/?has_summary=true&summary_length=under3")
+        self.assertEqual([r["slug"] for r in under3.data["results"]], ["short-summary"])
+
+        mid = self.client.get("/api/stories/?has_summary=true&summary_length=mid")
+        self.assertEqual([r["slug"] for r in mid.data["results"]], ["mid-summary"])
+
+        long_res = self.client.get("/api/stories/?has_summary=true&summary_length=long")
+        self.assertEqual([r["slug"] for r in long_res.data["results"]], ["long-summary"])
+
+        all_res = self.client.get("/api/stories/?has_summary=true&summary_length=all")
+        self.assertIn("null-cached-summary", [r["slug"] for r in all_res.data["results"]])
+
+    def test_summary_shortest_and_longest_sort_nulls_last(self):
+        asc = self.client.get("/api/stories/?has_summary=true&sort=summary_shortest")
+        self.assertEqual(
+            [r["slug"] for r in asc.data["results"]],
+            ["short-summary", "mid-summary", "long-summary", "null-cached-summary"],
+        )
+
+        desc = self.client.get("/api/stories/?has_summary=true&sort=summary_longest")
+        self.assertEqual(
+            [r["slug"] for r in desc.data["results"]],
+            ["long-summary", "mid-summary", "short-summary", "null-cached-summary"],
+        )
+
+    def test_not_read_quick_and_quick_read_progress_field(self):
+        self.QuickReadProgress.objects.create(user=self.user, story=self.s_short, progress=0.95)
+        self.QuickReadProgress.objects.create(user=self.user, story=self.s_mid, progress=0.45)
+
+        anon = self.client.get("/api/stories/?has_summary=true&not_read_quick=true")
+        self.assertIn("short-summary", [r["slug"] for r in anon.data["results"]])
+        for row in anon.data["results"]:
+            self.assertIsNone(row["quick_read_progress"])
+
+        self.client.force_authenticate(user=self.user)
+        authed = self.client.get("/api/stories/?has_summary=true&not_read_quick=true")
+        slugs = [r["slug"] for r in authed.data["results"]]
+        self.assertNotIn("short-summary", slugs)
+        self.assertIn("mid-summary", slugs)
+        by_slug = {r["slug"]: r["quick_read_progress"] for r in authed.data["results"]}
+        self.assertAlmostEqual(by_slug["mid-summary"], 0.45)
+        self.assertIsNone(by_slug["long-summary"])
+
+    def test_quick_read_hero_continue_pick_none_and_auth(self):
+        anon = self.client.get("/api/stories/quick-read-hero/")
+        self.assertEqual(anon.status_code, 401)
+
+        self.client.force_authenticate(user=self.user)
+        # No progress yet -> deterministic daily pick
+        pick_resp = self.client.get("/api/stories/quick-read-hero/")
+        self.assertEqual(pick_resp.status_code, 200)
+        self.assertEqual(pick_resp.data["mode"], "pick")
+        self.assertIn("slug", pick_resp.data["story"])
+
+        # Add in-progress -> mode continue
+        self.QuickReadProgress.objects.create(user=self.user, story=self.s_mid, progress=0.4)
+        cont_resp = self.client.get("/api/stories/quick-read-hero/")
+        self.assertEqual(cont_resp.status_code, 200)
+        self.assertEqual(cont_resp.data["mode"], "continue")
+        self.assertEqual(cont_resp.data["story"]["slug"], "mid-summary")
+        self.assertAlmostEqual(cont_resp.data["progress"], 0.4)
+
+        # Delete all summaries -> mode none
+        Story.objects.all().delete()
+        none_resp = self.client.get("/api/stories/quick-read-hero/")
+        self.assertEqual(none_resp.status_code, 200)
+        self.assertEqual(none_resp.data, {"mode": "none"})

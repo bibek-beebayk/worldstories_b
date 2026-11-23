@@ -645,6 +645,11 @@ class Story(models.Model):
     # read". Kept fresh by the Chapter signals in signals.py and backfilled by
     # the backfill_chapter_reading_times command.
     cached_chapter_reading_minutes = models.PositiveIntegerField(blank=True, null=True)
+    # Cached Quick Read summary estimate (minutes) so list views can filter
+    # and sort without parsing summary HTML in Python on every row.
+    cached_summary_reading_minutes = models.PositiveSmallIntegerField(
+        null=True, blank=True, editable=False
+    )
     # Declared with an explicit through model so every assignment carries its
     # provenance — see StoryMood.
     moods = models.ManyToManyField("Mood", through="StoryMood", related_name="stories", blank=True)
@@ -728,6 +733,17 @@ class Story(models.Model):
             update_fields = kwargs.get("update_fields")
             if update_fields is not None:
                 kwargs["update_fields"] = set(update_fields) | {"site_published_date"}
+        update_fields = kwargs.get("update_fields")
+        if update_fields is None or "summary" in update_fields:
+            from . import reading_time
+
+            self.cached_summary_reading_minutes = (
+                reading_time.summary_reading_minutes(self.summary)
+                if (self.summary or "").strip()
+                else None
+            )
+            if update_fields is not None and "cached_summary_reading_minutes" not in update_fields:
+                kwargs["update_fields"] = [*update_fields, "cached_summary_reading_minutes"]
         return super().save(*args, **kwargs)
 
     def original_published_date_display(self):

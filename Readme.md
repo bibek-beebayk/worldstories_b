@@ -28,6 +28,14 @@ Preview the selection and plain-text rendering without sending:
 python manage.py send_weekly_digest --dry-run
 ```
 
+## Story maintenance commands
+
+Backfill `Story.cached_summary_reading_minutes` after deploy (safe to run more than once):
+
+```bash
+python manage.py backfill_summary_minutes
+```
+
 ### Railway schedule
 
 Create a separate Railway cron service using the same application image and environment variables. Its command is:
