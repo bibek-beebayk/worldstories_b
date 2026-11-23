@@ -1068,48 +1068,55 @@ class StoryViewSet(ReadOnlyModelViewSet):
         detail=False,
         methods=["get"],
         url_path="quick-read-hero",
-        permission_classes=[IsAuthenticated],
+        permission_classes=[AllowAny],
     )
     def quick_read_hero(self, request):
-        """Authenticated hero card for /quick-reads: either the user's most
-        recently updated in-progress summary (0 < progress < 0.9), or a
-        deterministic daily pick preferring unread summaries."""
+        """Hero card for /quick-reads: for authenticated users, returns the most
+        recently updated in-progress summary (0 < progress < 0.9) or a
+        deterministic daily pick preferring unread summaries; for anonymous
+        guests, returns today's deterministic pick (never continue)."""
         has_summary_q = Q(summary__isnull=False) & ~Q(summary__exact="")
         summary_stories = Story.objects.filter(published_story_q()).filter(has_summary_q)
+        is_authed = bool(request.user and request.user.is_authenticated)
 
-        in_progress = (
-            QuickReadProgress.objects.filter(
-                user=request.user,
-                progress__gt=0,
-                progress__lt=0.9,
-                story__in=summary_stories,
-            )
-            .order_by("-updated_at")
-            .first()
-        )
-        if in_progress is not None:
-            story = (
-                Story.objects.published()
-                .for_card_list()
-                .filter(pk=in_progress.story_id)
+        if is_authed:
+            in_progress = (
+                QuickReadProgress.objects.filter(
+                    user=request.user,
+                    progress__gt=0,
+                    progress__lt=0.9,
+                    story__in=summary_stories,
+                )
+                .order_by("-updated_at")
                 .first()
             )
-            if story is not None:
-                story._quick_read_progress = in_progress.progress
-                return Response(
-                    {
-                        "mode": "continue",
-                        "story": StoryListSerializer(story, context={"request": request}).data,
-                        "progress": in_progress.progress,
-                    }
+            if in_progress is not None:
+                story = (
+                    Story.objects.published()
+                    .for_card_list()
+                    .filter(pk=in_progress.story_id)
+                    .first()
                 )
+                if story is not None:
+                    story._quick_read_progress = in_progress.progress
+                    return Response(
+                        {
+                            "mode": "continue",
+                            "story": StoryListSerializer(story, context={"request": request}).data,
+                            "progress": in_progress.progress,
+                        }
+                    )
 
         ordered = summary_stories.order_by("id")
-        read_ids = QuickReadProgress.objects.filter(
-            user=request.user, progress__gte=0.9
-        ).values_list("story_id", flat=True)
-        unread = ordered.exclude(id__in=read_ids)
-        pool = unread if unread.exists() else ordered
+        if is_authed:
+            read_ids = QuickReadProgress.objects.filter(
+                user=request.user, progress__gte=0.9
+            ).values_list("story_id", flat=True)
+            unread = ordered.exclude(id__in=read_ids)
+            pool = unread if unread.exists() else ordered
+        else:
+            pool = ordered
+
         count = pool.count()
         if count == 0:
             return Response({"mode": "none"})

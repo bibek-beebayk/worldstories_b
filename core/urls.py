@@ -79,6 +79,7 @@ def sitemap(request):
             "/story-map",
             "/audiobooks",
             "/watch",
+            "/quick-reads",
             "/tags",
             "/themes",
             "/contest",

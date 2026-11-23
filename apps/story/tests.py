@@ -9099,9 +9099,23 @@ class QuickReadsApiTests(APITestCase):
         self.assertAlmostEqual(by_slug["mid-summary"], 0.45)
         self.assertIsNone(by_slug["long-summary"])
 
-    def test_quick_read_hero_continue_pick_none_and_auth(self):
-        anon = self.client.get("/api/stories/quick-read-hero/")
-        self.assertEqual(anon.status_code, 401)
+    def test_quick_read_hero_continue_pick_none_and_public_access(self):
+        # Anonymous list + detail with summary are public and return 200
+        anon_list = self.client.get("/api/stories/?has_summary=true")
+        self.assertEqual(anon_list.status_code, 200)
+        self.assertGreaterEqual(len(anon_list.data["results"]), 4)
+        for row in anon_list.data["results"]:
+            self.assertIsNone(row["quick_read_progress"])
+
+        anon_detail = self.client.get(f"/api/stories/{self.s_mid.slug}/")
+        self.assertEqual(anon_detail.status_code, 200)
+        self.assertTrue(anon_detail.data.get("summary"))
+
+        # Anonymous hero returns deterministic daily pick (never continue)
+        anon_hero = self.client.get("/api/stories/quick-read-hero/")
+        self.assertEqual(anon_hero.status_code, 200)
+        self.assertEqual(anon_hero.data["mode"], "pick")
+        self.assertIn("slug", anon_hero.data["story"])
 
         self.client.force_authenticate(user=self.user)
         # No progress yet -> deterministic daily pick
@@ -9110,13 +9124,18 @@ class QuickReadsApiTests(APITestCase):
         self.assertEqual(pick_resp.data["mode"], "pick")
         self.assertIn("slug", pick_resp.data["story"])
 
-        # Add in-progress -> mode continue
+        # Add in-progress -> mode continue for authenticated user, still pick for anonymous
         self.QuickReadProgress.objects.create(user=self.user, story=self.s_mid, progress=0.4)
         cont_resp = self.client.get("/api/stories/quick-read-hero/")
         self.assertEqual(cont_resp.status_code, 200)
         self.assertEqual(cont_resp.data["mode"], "continue")
         self.assertEqual(cont_resp.data["story"]["slug"], "mid-summary")
         self.assertAlmostEqual(cont_resp.data["progress"], 0.4)
+
+        self.client.force_authenticate(user=None)
+        anon_hero_after = self.client.get("/api/stories/quick-read-hero/")
+        self.assertEqual(anon_hero_after.status_code, 200)
+        self.assertEqual(anon_hero_after.data["mode"], "pick")
 
         # Delete all summaries -> mode none
         Story.objects.all().delete()
