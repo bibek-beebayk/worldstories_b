@@ -61,6 +61,7 @@ from apps.story.models import (
     AudioTranscriptCue,
     Video,
     VideoSeries,
+    VideoType,
     Author,
     Blog,
     BlogTopic,
@@ -6817,6 +6818,543 @@ class HomeSectionTests(APITestCase):
         self.assertEqual(copy["position"], 1)
 
 
+class HomeSectionStoryRulesTests(APITestCase):
+    def setUp(self):
+        from apps.story.models import HomeSection
+
+        cache.clear()
+        self.HomeSection = HomeSection
+        HomeSection.objects.all().delete()
+        self.today = timezone.localdate()
+        self.author_a = Author.objects.create(name="Author A", slug="author-a-rules")
+        self.author_b = Author.objects.create(name="Author B", slug="author-b-rules")
+        self.a = self._story(
+            "Zulu", "rules-zulu", country="NP", author=self.author_a,
+            site_published_date=self.today - timedelta(days=10), views=5, rating=4,
+            cached_chapter_reading_minutes=3, cached_file_reading_minutes=99,
+        )
+        self.b = self._story(
+            "Alpha", "rules-alpha", country="FR", author=self.author_b,
+            site_published_date=self.today - timedelta(days=5), views=2, rating=5,
+            cached_file_reading_minutes=10,
+        )
+        self.c = self._story(
+            "Middle", "rules-middle", country="NP", author=self.author_b,
+            site_published_date=self.today - timedelta(days=1), views=100, rating=0,
+        )
+        self.reader_a = User.objects.create(
+            email="rules-reader-a@example.com", username="rules-reader-a", is_active=True
+        )
+        self.reader_b = User.objects.create(
+            email="rules-reader-b@example.com", username="rules-reader-b", is_active=True
+        )
+
+    def _story(self, title, slug, **extra):
+        return Story.objects.create(title=title, slug=slug, is_published=True, **extra)
+
+    def _section(self, **config):
+        from apps.story.home_sections import clean_config
+
+        return self.HomeSection.objects.create(
+            section_type="stories_query",
+            title=f"Rules {self.HomeSection.objects.count()}",
+            item_limit=24,
+            allow_repeats=True,
+            config=clean_config("stories_query", config),
+        )
+
+    def _ids(self, section):
+        from apps.story.home_sections import story_queryset
+
+        return [story.pk for story in story_queryset(section)]
+
+    def test_new_database_sorts_and_null_reading_times_last(self):
+        self.assertEqual(self._ids(self._section(sort="oldest")), [self.a.pk, self.b.pk, self.c.pk])
+        self.assertEqual(self._ids(self._section(sort="az")), [self.b.pk, self.c.pk, self.a.pk])
+        # Chapter time is the card value and therefore wins over the file cache.
+        self.assertEqual(self._ids(self._section(sort="shortest")), [self.a.pk, self.b.pk, self.c.pk])
+        self.assertEqual(self._ids(self._section(sort="longest")), [self.b.pk, self.a.pk, self.c.pk])
+
+    def test_most_completed_and_hidden_gems_order(self):
+        StoryCompletion.objects.create(user=self.reader_a, story=self.a, source="chapters")
+        StoryCompletion.objects.create(user=self.reader_a, story=self.b, source="chapters")
+        StoryCompletion.objects.create(user=self.reader_b, story=self.b, source="chapters")
+        self.assertEqual(self._ids(self._section(sort="most_completed"))[:3], [self.b.pk, self.a.pk, self.c.pk])
+        # Published views are [2, 5, 100], so the median is 5. Zero-rated C is excluded.
+        self.assertEqual(self._ids(self._section(sort="hidden_gems")), [self.b.pk, self.a.pk])
+
+    def test_daily_shuffle_is_stable_per_day_and_differs_by_section(self):
+        for number in range(8):
+            self._story(f"Shuffle {number}", f"shuffle-{number}")
+        first = self._section(sort="daily_shuffle")
+        second = self._section(sort="daily_shuffle")
+        first_order = self._ids(first)
+        self.assertEqual(self._ids(first), first_order)
+        self.assertNotEqual(self._ids(second), first_order)
+
+    def test_country_author_and_rule_filters(self):
+        Review.objects.create(story=self.a, user=self.reader_a, rating=4)
+        Review.objects.create(story=self.b, user=self.reader_a, rating=5)
+        Review.objects.create(story=self.b, user=self.reader_b, rating=5)
+        self.assertEqual(self._ids(self._section(countries=["np"], authors=[self.author_a.pk])), [self.a.pk])
+        self.assertEqual(self._ids(self._section(min_reading_minutes=5, max_reading_minutes=12)), [self.b.pk])
+        self.assertEqual(
+            set(self._ids(self._section(published_within_days=7))), {self.b.pk, self.c.pk}
+        )
+        self.assertEqual(self._ids(self._section(min_rating=4.5)), [self.b.pk])
+        self.assertEqual(self._ids(self._section(min_ratings_count=2)), [self.b.pk])
+
+    def test_exclusions_pins_and_no_repeat(self):
+        excluded_tag = Tag.objects.create(name="Excluded", slug="excluded-rules")
+        self.a.tags.add(excluded_tag)
+        pinned = self._section(countries=["NP"], pin_story_ids=[self.b.pk, self.a.pk, self.b.pk])
+        self.assertEqual(self._ids(pinned), [self.b.pk, self.a.pk, self.c.pk])
+        self.assertEqual(self._ids(pinned).count(self.b.pk), 1)
+
+        section = self._section(
+            countries=["NP"],
+            exclude_tags=[excluded_tag.pk],
+            exclude_story_ids=[self.c.pk],
+            pin_story_ids=[self.b.pk, self.a.pk, self.b.pk],
+        )
+        # B ignores the country include filter. A and C are removed by explicit
+        # exclusions, which take precedence over pins/includes.
+        self.assertEqual(self._ids(section), [self.b.pk])
+
+    def test_trending_window_is_forwarded(self):
+        with patch("apps.story.home_metrics.trending_story_ids", return_value=[self.b.pk]) as trending:
+            self.assertEqual(self._ids(self._section(sort="trending", trending_days=30)), [self.b.pk])
+        trending.assert_called_once_with(30)
+
+    def test_clean_config_validation_and_unknown_keys(self):
+        from apps.story.home_sections import clean_config
+
+        cleaned = clean_config("stories_query", {"countries": ["np"], "unknown": True})
+        self.assertEqual(cleaned["countries"], ["NP"])
+        self.assertNotIn("unknown", cleaned)
+        invalid = [
+            {"countries": ["XX"]},
+            {"countries": ["NP"] * 31},
+            {"authors": "1"},
+            {"exclude_story_ids": list(range(51))},
+            {"pin_story_ids": list(range(13))},
+            {"min_reading_minutes": 0},
+            {"max_reading_minutes": 601},
+            {"min_reading_minutes": 20, "max_reading_minutes": 10},
+            {"published_within_days": 0},
+            {"min_rating": 5.1},
+            {"min_ratings_count": 1001},
+            {"trending_days": 14},
+        ]
+        for config in invalid:
+            with self.subTest(config=config), self.assertRaisesRegex(ValueError, r".+"):
+                clean_config("stories_query", config)
+
+    def test_old_style_config_keeps_the_old_order(self):
+        section = self.HomeSection.objects.create(
+            section_type="stories_query", title="Legacy", config={"sort": "popular"}
+        )
+        self.assertEqual(self._ids(section), [self.c.pk, self.a.pk, self.b.pk])
+
+    def test_story_queryset_query_count_is_constant_as_catalogue_grows(self):
+        from apps.story.home_sections import story_queryset
+
+        section = self._section(sort="newest")
+        with CaptureQueriesContext(connection) as small:
+            list(story_queryset(section))
+        for number in range(20):
+            self._story(f"Extra {number}", f"rules-extra-{number}")
+        with CaptureQueriesContext(connection) as large:
+            list(story_queryset(section))
+        self.assertEqual(len(large), len(small))
+
+    def test_types_endpoint_exposes_described_sorts_by_content_type(self):
+        admin = User.objects.create(
+            email="rules-admin@example.com", username="rules-admin",
+            is_superuser=True, is_staff=True, is_active=True,
+        )
+        self.client.force_authenticate(admin)
+        sorts = self.client.get("/api/admin/home-sections/types/").json()["sorts"]
+        self.assertEqual(set(sorts), {"stories", "videos", "blogs"})
+        story_options = {option["value"]: option for option in sorts["stories"]}
+        self.assertEqual(set(story_options), {
+            "newest", "recently_added", "popular", "top_rated", "trending",
+            "oldest", "az", "shortest", "longest", "most_completed",
+            "hidden_gems", "daily_shuffle",
+        })
+        self.assertTrue(all(option["label"] and option["description"] for option in story_options.values()))
+
+
+class HomeSectionVideoBlogRulesTests(APITestCase):
+    def setUp(self):
+        from apps.story.models import HomeSection
+
+        cache.clear()
+        self.HomeSection = HomeSection
+        HomeSection.objects.all().delete()
+        self.now = timezone.now()
+        self.genre = Genre.objects.create(name="Rules genre", slug="rules-genre")
+        self.story_en = Story.objects.create(
+            title="English story", slug="video-rules-en", language="en", is_published=True
+        )
+        self.story_en.genres.add(self.genre)
+        self.story_fr = Story.objects.create(
+            title="French story", slug="video-rules-fr", language="fr", is_published=True
+        )
+        self.draft_story = Story.objects.create(
+            title="Draft story", slug="blog-rules-draft", is_published=False
+        )
+        self.video_type = VideoType.objects.create(name="Rules type")
+        self.video_old = self._video(
+            "Old landscape", "video-old", "oldvideo001", story=self.story_en,
+            duration_seconds=300, aspect_ratio="16:9", video_type=self.video_type,
+        )
+        self.video_new = self._video(
+            "New vertical", "video-new", "newvideo001", story=self.story_fr,
+            duration_seconds=60, aspect_ratio="9:16",
+        )
+        self.video_null = self._video(
+            "Standalone", "video-null", "nullvideo01", duration_seconds=None,
+        )
+        Video.objects.filter(pk=self.video_old.pk).update(created_at=self.now - timedelta(days=3))
+        Video.objects.filter(pk=self.video_new.pk).update(created_at=self.now - timedelta(days=2))
+        Video.objects.filter(pk=self.video_null.pk).update(created_at=self.now - timedelta(days=1))
+
+        self.topic = BlogTopic.objects.create(name="Rules topic", slug="rules-topic")
+        self.blog_old = Blog.objects.create(
+            title="Old post", slug="rules-old-post", content="word " * 230
+        )
+        self.blog_new = Blog.objects.create(
+            title="New post", slug="rules-new-post", content="word " * 690
+        )
+        self.blog_null = Blog.objects.create(
+            title="Null post", slug="rules-null-post", content="word"
+        )
+        Blog.objects.filter(pk=self.blog_old.pk).update(created_at=self.now - timedelta(days=10))
+        Blog.objects.filter(pk=self.blog_new.pk).update(created_at=self.now - timedelta(days=2))
+        Blog.objects.filter(pk=self.blog_null.pk).update(
+            created_at=self.now - timedelta(days=1), reading_time_minutes=None
+        )
+        self.blog_old.topics.add(self.topic)
+        self.blog_old.linked_stories.add(self.story_en)
+        self.blog_new.linked_stories.add(self.draft_story)
+
+    def _video(self, title, slug, youtube_id, **extra):
+        return Video.objects.create(
+            title=title, slug=slug, youtube_id=youtube_id,
+            youtube_url=f"https://youtu.be/{youtube_id}", **extra,
+        )
+
+    def _section(self, section_type, **config):
+        from apps.story.home_sections import clean_config
+
+        return self.HomeSection.objects.create(
+            section_type=section_type,
+            title=f"Rules {self.HomeSection.objects.count()}",
+            item_limit=24,
+            config=clean_config(section_type, config),
+        )
+
+    def _video_ids(self, section):
+        from apps.story.home_sections import video_queryset
+
+        return [video.pk for video in video_queryset(section)]
+
+    def _blog_ids(self, section):
+        from apps.story.home_sections import blog_queryset
+
+        return [blog.pk for blog in blog_queryset(section)]
+
+    def test_video_sorts_keep_null_durations_last(self):
+        self.assertEqual(
+            self._video_ids(self._section("videos", video_sort="newest")),
+            [self.video_null.pk, self.video_new.pk, self.video_old.pk],
+        )
+        self.assertEqual(
+            self._video_ids(self._section("videos", video_sort="oldest")),
+            [self.video_old.pk, self.video_new.pk, self.video_null.pk],
+        )
+        self.assertEqual(
+            self._video_ids(self._section("videos", video_sort="shortest")),
+            [self.video_new.pk, self.video_old.pk, self.video_null.pk],
+        )
+        self.assertEqual(
+            self._video_ids(self._section("videos", video_sort="longest")),
+            [self.video_old.pk, self.video_new.pk, self.video_null.pk],
+        )
+
+    def test_video_filters_and_existing_filters(self):
+        self.assertEqual(
+            self._video_ids(self._section("videos", format="vertical")), [self.video_new.pk]
+        )
+        self.assertEqual(
+            self._video_ids(
+                self._section("videos", min_duration_seconds=50, max_duration_seconds=100)
+            ),
+            [self.video_new.pk],
+        )
+        # Standalone videos have no language, so the language setting is skipped for them.
+        self.assertEqual(
+            set(self._video_ids(self._section("videos", language="en"))),
+            {self.video_old.pk, self.video_null.pk},
+        )
+        self.assertEqual(
+            self._video_ids(self._section("videos", story_genres=[self.genre.pk])),
+            [self.video_old.pk],
+        )
+        self.assertEqual(
+            self._video_ids(self._section("videos", video_type=self.video_type.pk)),
+            [self.video_old.pk],
+        )
+        self.assertEqual(
+            self._video_ids(self._section("videos", standalone_only=True)),
+            [self.video_null.pk],
+        )
+
+    def test_video_hand_pick_overrides_filters_and_keeps_order(self):
+        section = self._section(
+            "videos", video_ids=[self.video_old.pk, self.video_new.pk],
+            format="vertical", min_duration_seconds=9999, standalone_only=True,
+        )
+        self.assertEqual(self._video_ids(section), [self.video_old.pk, self.video_new.pk])
+
+    def test_video_daily_shuffle_is_stable(self):
+        for number in range(6):
+            self._video(f"Shuffle video {number}", f"video-shuffle-{number}", f"shuffle{number:04}")
+        section = self._section("videos", video_sort="daily_shuffle")
+        self.assertEqual(self._video_ids(section), self._video_ids(section))
+
+    def test_blog_sorts_keep_null_reading_time_last(self):
+        self.assertEqual(
+            self._blog_ids(self._section("blogs", blog_sort="newest")),
+            [self.blog_null.pk, self.blog_new.pk, self.blog_old.pk],
+        )
+        self.assertEqual(
+            self._blog_ids(self._section("blogs", blog_sort="oldest")),
+            [self.blog_old.pk, self.blog_new.pk, self.blog_null.pk],
+        )
+        self.assertEqual(
+            self._blog_ids(self._section("blogs", blog_sort="shortest")),
+            [self.blog_old.pk, self.blog_new.pk, self.blog_null.pk],
+        )
+
+    def test_blog_filters(self):
+        self.assertEqual(
+            self._blog_ids(self._section("blogs", topics=[self.topic.pk])), [self.blog_old.pk]
+        )
+        self.assertEqual(
+            set(self._blog_ids(self._section("blogs", published_within_days=3))),
+            {self.blog_new.pk, self.blog_null.pk},
+        )
+        self.assertEqual(
+            self._blog_ids(self._section("blogs", story_genres=[self.genre.pk])),
+            [self.blog_old.pk],
+        )
+        self.assertEqual(
+            self._blog_ids(self._section("blogs", only_with_story=True)), [self.blog_old.pk]
+        )
+
+    def test_blog_pins_and_hand_pick_override(self):
+        pinned = self._section(
+            "blogs", topics=[self.topic.pk], pin_blog_ids=[self.blog_new.pk, self.blog_old.pk]
+        )
+        self.assertEqual(self._blog_ids(pinned), [self.blog_new.pk, self.blog_old.pk])
+        picked = self._section(
+            "blogs", blog_ids=[self.blog_null.pk, self.blog_old.pk],
+            topics=[999999], only_with_story=True,
+        )
+        self.assertEqual(self._blog_ids(picked), [self.blog_null.pk, self.blog_old.pk])
+
+    def test_blog_daily_shuffle_is_stable(self):
+        for number in range(6):
+            Blog.objects.create(
+                title=f"Shuffle blog {number}", slug=f"blog-shuffle-{number}", content="word"
+            )
+        section = self._section("blogs", blog_sort="daily_shuffle")
+        self.assertEqual(self._blog_ids(section), self._blog_ids(section))
+
+    def test_video_blog_validation_and_old_config_compatibility(self):
+        from apps.story.home_sections import clean_config
+
+        invalid = [
+            ("videos", {"video_sort": "most_viewed"}),
+            ("videos", {"format": "square"}),
+            ("videos", {"min_duration_seconds": -1}),
+            ("videos", {"min_duration_seconds": 10, "max_duration_seconds": 5}),
+            ("videos", {"video_ids": list(range(25))}),
+            ("blogs", {"blog_sort": "most_read"}),
+            ("blogs", {"published_within_days": 0}),
+            ("blogs", {"pin_blog_ids": list(range(7))}),
+            ("blogs", {"blog_ids": list(range(25))}),
+        ]
+        for section_type, config in invalid:
+            with self.subTest(config=config), self.assertRaisesRegex(ValueError, r".+"):
+                clean_config(section_type, config)
+
+        legacy_video = self.HomeSection.objects.create(
+            section_type="videos", title="Legacy videos", config={}
+        )
+        legacy_blog = self.HomeSection.objects.create(
+            section_type="blogs", title="Legacy blogs", config={}
+        )
+        self.assertEqual(
+            self._video_ids(legacy_video), [self.video_null.pk, self.video_new.pk, self.video_old.pk]
+        )
+        self.assertEqual(
+            self._blog_ids(legacy_blog), [self.blog_null.pk, self.blog_new.pk, self.blog_old.pk]
+        )
+
+    def test_video_and_blog_queryset_counts_are_constant(self):
+        from apps.story.home_sections import blog_queryset, video_queryset
+        from apps.story.serializers import BlogCardSerializer, PublicVideoSerializer
+
+        video_section = self._section("videos", format="landscape")
+        blog_section = self._section("blogs", only_with_story=True)
+        with CaptureQueriesContext(connection) as small_videos:
+            PublicVideoSerializer(video_queryset(video_section), many=True).data
+        with CaptureQueriesContext(connection) as small_blogs:
+            BlogCardSerializer(blog_queryset(blog_section), many=True).data
+        for number in range(10):
+            self._video(
+                f"Extra video {number}", f"extra-video-{number}", f"extravid{number:03}"
+            )
+            Blog.objects.create(
+                title=f"Extra blog {number}", slug=f"extra-blog-{number}", content="word"
+            )
+        with CaptureQueriesContext(connection) as large_videos:
+            PublicVideoSerializer(video_queryset(video_section), many=True).data
+        with CaptureQueriesContext(connection) as large_blogs:
+            BlogCardSerializer(blog_queryset(blog_section), many=True).data
+        self.assertEqual(len(large_videos), len(small_videos))
+        self.assertEqual(len(large_blogs), len(small_blogs))
+
+    def test_types_metadata_lists_supported_video_and_blog_options(self):
+        admin = User.objects.create(
+            email="video-blog-rules-admin@example.com", username="video-blog-rules-admin",
+            is_superuser=True, is_staff=True, is_active=True,
+        )
+        self.client.force_authenticate(admin)
+        data = self.client.get("/api/admin/home-sections/types/").json()
+        self.assertEqual(
+            [option["value"] for option in data["sorts"]["videos"]],
+            ["newest", "oldest", "longest", "shortest", "daily_shuffle"],
+        )
+        self.assertEqual(
+            [option["value"] for option in data["sorts"]["blogs"]],
+            ["newest", "oldest", "shortest", "daily_shuffle"],
+        )
+        by_type = {item["value"]: item for item in data["types"]}
+        self.assertIn("video_ids", by_type["videos"]["fields"])
+        self.assertIn("blog_ids", by_type["blogs"]["fields"])
+
+
+class HomeSectionPreviewTests(APITestCase):
+    UA = {"HTTP_USER_AGENT": "Mozilla/5.0 Chrome"}
+
+    def setUp(self):
+        from apps.story.models import HomeSection
+
+        cache.clear()
+        self.HomeSection = HomeSection
+        HomeSection.objects.all().delete()
+        self.admin = User.objects.create(
+            email="preview-admin@example.com", username="preview-admin",
+            is_superuser=True, is_staff=True, is_active=True,
+        )
+        self.regular = User.objects.create(
+            email="preview-user@example.com", username="preview-user", is_active=True
+        )
+        self.stories = [
+            Story.objects.create(
+                title=f"Preview Story {number}", slug=f"preview-story-{number}",
+                is_published=True, views=number,
+            )
+            for number in range(8)
+        ]
+        self.video = Video.objects.create(
+            title="Preview Video", slug="preview-video", youtube_id="preview00001",
+            youtube_url="https://youtu.be/preview00001", duration_seconds=90,
+        )
+        self.blog = Blog.objects.create(
+            title="Preview Blog", slug="preview-blog", content="Preview content"
+        )
+        self.url = "/api/admin/home-sections/preview/"
+
+    def _post(self, payload):
+        self.client.force_authenticate(self.admin)
+        return self.client.post(self.url, payload, format="json")
+
+    def test_preview_is_superuser_only(self):
+        payload = {"section_type": "stories_query", "config": {"sort": "newest"}}
+        self.assertEqual(self.client.post(self.url, payload, format="json").status_code, 401)
+        self.client.force_authenticate(self.regular)
+        self.assertEqual(self.client.post(self.url, payload, format="json").status_code, 403)
+
+    def test_story_video_and_blog_preview_shapes_and_full_totals(self):
+        story_response = self._post({
+            "section_type": "stories_query", "item_limit": 3,
+            "allow_repeats": True, "config": {"sort": "popular"},
+        })
+        self.assertEqual(story_response.status_code, 200, story_response.content)
+        self.assertEqual(story_response.json()["total_matching"], 8)
+        self.assertEqual(len(story_response.json()["items"]), 3)
+        self.assertTrue({"id", "title", "slug"}.issubset(story_response.json()["items"][0]))
+
+        video_response = self._post({
+            "section_type": "videos", "item_limit": 6,
+            "config": {"video_ids": [self.video.pk, 999999]},
+        })
+        self.assertEqual(video_response.status_code, 200, video_response.content)
+        self.assertEqual(video_response.json()["total_matching"], 1)
+        self.assertTrue({"id", "display_title", "youtube_id"}.issubset(video_response.json()["items"][0]))
+
+        blog_response = self._post({
+            "section_type": "blogs", "item_limit": 6,
+            "config": {"blog_ids": [self.blog.pk, 999999]},
+        })
+        self.assertEqual(blog_response.status_code, 200, blog_response.content)
+        self.assertEqual(blog_response.json()["total_matching"], 1)
+        self.assertTrue({"id", "title", "published_at"}.issubset(blog_response.json()["items"][0]))
+
+    def test_invalid_config_returns_clean_message_and_non_content_is_rejected(self):
+        invalid = self._post({
+            "section_type": "stories_query", "config": {"min_reading_minutes": 0}
+        })
+        self.assertEqual(invalid.status_code, 400)
+        self.assertEqual(
+            invalid.json(),
+            {"detail": "min_reading_minutes must be an integer from 1 to 600."},
+        )
+        non_content = self._post({"section_type": "banner", "config": {}})
+        self.assertEqual(non_content.status_code, 400)
+
+    def test_preview_never_writes_home_sections(self):
+        before = self.HomeSection.objects.count()
+        response = self._post({
+            "section_type": "stories_query", "variant": "standard",
+            "item_limit": 4, "allow_repeats": False, "config": {"sort": "az"},
+        })
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(self.HomeSection.objects.count(), before)
+
+    def test_preview_items_equal_the_saved_homepage_section(self):
+        from apps.story.home_sections import clean_config
+
+        config = clean_config("stories_query", {"sort": "az", "countries": []})
+        self.HomeSection.objects.create(
+            section_type="stories_query", title="Preview comparison", position=0,
+            item_limit=4, allow_repeats=True, config=config,
+        )
+        preview = self._post({
+            "section_type": "stories_query", "variant": "standard",
+            "item_limit": 4, "allow_repeats": True, "config": config,
+        }).json()
+        self.client.force_authenticate(None)
+        cache.clear()
+        homepage = self.client.get("/api/home/", **self.UA).json()["sections"][0]
+        self.assertEqual(preview["items"], homepage["items"])
+
+
 class FeaturedVideoTests(APITestCase):
     UA = {"HTTP_USER_AGENT": "Mozilla/5.0 Chrome"}
 
@@ -7020,8 +7558,8 @@ class HomepageImprovementsTests(APITestCase):
 
     def test_trending_is_an_admin_sort_option(self):
         self.client.force_authenticate(self.admin)
-        sorts = self.client.get("/api/admin/home-sections/types/").json()["sorts"]
-        self.assertIn("trending", sorts)
+        sorts = self.client.get("/api/admin/home-sections/types/").json()["sorts"]["stories"]
+        self.assertIn("trending", [option["value"] for option in sorts])
         r = self.client.post(
             "/api/admin/home-sections/",
             {"section_type": "stories_query", "title": "T", "layout": "trending", "config": {"sort": "trending"}},

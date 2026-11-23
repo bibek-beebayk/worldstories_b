@@ -162,6 +162,7 @@ from .serializers import (
     BlogAdminSerializer,
     BlogAdminListSerializer,
     BlogListSerializer,
+    BlogCardSerializer,
     BlogTopicSerializer,
     StoryQueueSerializer,
 )
@@ -2903,6 +2904,51 @@ class HomeSectionAdminViewSet(ModelViewSet):
 
         return Response(section_click_stats())
 
+    @action(detail=False, methods=["post"])
+    def preview(self, request):
+        """Resolve unsaved content-section values without writing anything."""
+        section_type = request.data.get("section_type")
+        if section_type not in HomeSection.CONTENT_TYPES:
+            return Response(
+                {"detail": "Only story, video, and blog sections can be previewed."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        serializer_data = {"title": "Preview", "section_type": section_type}
+        for field in ("variant", "item_limit", "allow_repeats", "config"):
+            if field in request.data:
+                serializer_data[field] = request.data[field]
+        serializer = self.get_serializer(data=serializer_data)
+        if not serializer.is_valid():
+            def first_error(value):
+                if isinstance(value, dict):
+                    preferred = value.get("config")
+                    return first_error(preferred if preferred is not None else next(iter(value.values())))
+                if isinstance(value, (list, tuple)):
+                    return first_error(value[0]) if value else "Invalid preview settings."
+                return str(value)
+
+            return Response(
+                {"detail": first_error(serializer.errors)},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        section = HomeSection(**serializer.validated_data)
+        preview_limit = min(section.item_limit, 6)
+        context = {"request": request}
+        from .home_sections import blog_queryset, story_queryset, video_queryset
+
+        if section_type in (HomeSection.TYPE_STORIES_QUERY, HomeSection.TYPE_STORIES_MANUAL):
+            items, total = story_queryset(section, with_total=True)
+            data = StoryListSerializer(items[:preview_limit], many=True, context=context).data
+        elif section_type == HomeSection.TYPE_VIDEOS:
+            items, total = video_queryset(section, with_total=True)
+            data = PublicVideoSerializer(items[:preview_limit], many=True, context=context).data
+        else:
+            items, total = blog_queryset(section, with_total=True)
+            data = BlogCardSerializer(items[:preview_limit], many=True, context=context).data
+        return Response({"total_matching": total, "items": data})
+
     @action(detail=False, methods=["get"], url_path="missing-covers")
     def missing_covers(self, request):
         """Published stories with neither cover image nor cover URL — they
@@ -2921,7 +2967,14 @@ class HomeSectionAdminViewSet(ModelViewSet):
     def types(self, request):
         """Static description of the section types and choice lists the admin
         form is built from."""
-        from .home_sections import AD_SIZES, BANNER_THEMES, STORY_SORTS, TYPE_META
+        from .home_sections import (
+            AD_SIZES,
+            BANNER_THEMES,
+            BLOG_SORT_OPTIONS,
+            STORY_SORT_OPTIONS,
+            TYPE_META,
+            VIDEO_SORT_OPTIONS,
+        )
         from .models import HOME_SECTION_ICON_NAMES
 
         return Response(
@@ -2934,7 +2987,11 @@ class HomeSectionAdminViewSet(ModelViewSet):
                 "layouts": [{"value": v, "label": l} for v, l in HomeSection.LAYOUT_CHOICES],
                 "card_styles": [{"value": v, "label": l} for v, l in HomeSection.CARD_STYLE_CHOICES],
                 "show_to": [{"value": v, "label": l} for v, l in HomeSection.SHOW_TO_CHOICES],
-                "sorts": list(STORY_SORTS),
+                "sorts": {
+                    "stories": STORY_SORT_OPTIONS,
+                    "videos": VIDEO_SORT_OPTIONS,
+                    "blogs": BLOG_SORT_OPTIONS,
+                },
                 "banner_themes": BANNER_THEMES,
                 "ad_sizes": AD_SIZES,
                 "icons": HOME_SECTION_ICON_NAMES,

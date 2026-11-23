@@ -105,15 +105,22 @@ def _trending_in_window(days):
     return [story_id for _readers, story_id in scored]
 
 
-def trending_story_ids():
-    """Story ids ranked by unique recent readers/listeners, best first."""
-    ids = cache.get(TRENDING_CACHE_KEY)
+def trending_story_ids(days=TRENDING_WINDOW_DAYS):
+    """Story ids ranked by unique recent readers/listeners, best first.
+
+    The default keeps the historical seven-day window with its low-signal
+    fallback to 30 days. An explicit 30-day section uses that window directly.
+    """
+    if days not in (TRENDING_WINDOW_DAYS, TRENDING_FALLBACK_DAYS):
+        raise ValueError("Trending days must be 7 or 30.")
+    cache_key = TRENDING_CACHE_KEY if days == TRENDING_WINDOW_DAYS else f"{TRENDING_CACHE_KEY}:{days}"
+    ids = cache.get(cache_key)
     if ids is None:
-        ids = _trending_in_window(TRENDING_WINDOW_DAYS)
-        if len(ids) < TRENDING_MIN_STORIES:
+        ids = _trending_in_window(days)
+        if days == TRENDING_WINDOW_DAYS and len(ids) < TRENDING_MIN_STORIES:
             ids = _trending_in_window(TRENDING_FALLBACK_DAYS)
         ids = ids[:TRENDING_MAX_IDS]
-        cache.set(TRENDING_CACHE_KEY, ids, TRENDING_CACHE_SECONDS)
+        cache.set(cache_key, ids, TRENDING_CACHE_SECONDS)
     return ids
 
 

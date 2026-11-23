@@ -957,7 +957,11 @@ class PublicVideoSerializer(serializers.ModelSerializer):
     def get_other_versions(self, obj):
         if obj.story_id is None:
             return []
-        versions = obj.story.videos.exclude(pk=obj.pk).select_related("series").order_by("order", "id")
+        prefetched = getattr(obj.story, "home_section_videos", None)
+        if prefetched is None:
+            versions = obj.story.videos.exclude(pk=obj.pk).select_related("series").order_by("order", "id")
+        else:
+            versions = (video for video in prefetched if video.pk != obj.pk)
         return [
             {
                 "id": video.id,
