@@ -132,6 +132,7 @@ from .serializers import (
     AdminCategorySerializer,
     AdminAuthorSerializer,
     StoryListSerializer,
+    StoryCardWithSummarySerializer,
     FeaturedStorySerializer,
     FeaturedStoryAdminSerializer,
     DailyStorySerializer,
@@ -2893,6 +2894,7 @@ class HomeSectionAdminViewSet(ModelViewSet):
             copy.pk = None
             copy.title = f"{source.title} (copy)"[:120] if source.title else ""
             copy.is_enabled = False
+            copy.anchor_id = ""
             copy.position = source.position + 1
             copy.save()
         return Response(self.get_serializer(copy).data, status=status.HTTP_201_CREATED)
@@ -2915,7 +2917,7 @@ class HomeSectionAdminViewSet(ModelViewSet):
             )
 
         serializer_data = {"title": "Preview", "section_type": section_type}
-        for field in ("variant", "item_limit", "allow_repeats", "config"):
+        for field in ("variant", "item_limit", "allow_repeats", "config", "display"):
             if field in request.data:
                 serializer_data[field] = request.data[field]
         serializer = self.get_serializer(data=serializer_data)
@@ -2936,11 +2938,13 @@ class HomeSectionAdminViewSet(ModelViewSet):
         section = HomeSection(**serializer.validated_data)
         preview_limit = min(section.item_limit, 6)
         context = {"request": request}
-        from .home_sections import blog_queryset, story_queryset, video_queryset
+        from .home_sections import blog_queryset, clean_display, story_queryset, video_queryset
 
+        display = clean_display(section.display)
         if section_type in (HomeSection.TYPE_STORIES_QUERY, HomeSection.TYPE_STORIES_MANUAL):
             items, total = story_queryset(section, with_total=True)
-            data = StoryListSerializer(items[:preview_limit], many=True, context=context).data
+            story_ser = StoryCardWithSummarySerializer if display.get("show_summary") else StoryListSerializer
+            data = story_ser(items[:preview_limit], many=True, context=context).data
         elif section_type == HomeSection.TYPE_VIDEOS:
             items, total = video_queryset(section, with_total=True)
             data = PublicVideoSerializer(items[:preview_limit], many=True, context=context).data
@@ -2971,6 +2975,8 @@ class HomeSectionAdminViewSet(ModelViewSet):
             AD_SIZES,
             BANNER_THEMES,
             BLOG_SORT_OPTIONS,
+            CARD_STYLE_OPTIONS,
+            LAYOUT_OPTIONS,
             STORY_SORT_OPTIONS,
             TYPE_META,
             VIDEO_SORT_OPTIONS,
@@ -2980,12 +2986,18 @@ class HomeSectionAdminViewSet(ModelViewSet):
         return Response(
             {
                 "types": [
-                    {"value": value, "label": label, **TYPE_META[value]}
+                    {
+                        "value": value,
+                        "label": label,
+                        **TYPE_META[value],
+                        "layouts": [LAYOUT_OPTIONS[code] for code in TYPE_META[value].get("layouts", [])],
+                        "card_styles": [CARD_STYLE_OPTIONS[code] for code in TYPE_META[value].get("card_styles", [])],
+                    }
                     for value, label in HomeSection.TYPE_CHOICES
                 ],
                 "variants": [{"value": v, "label": l} for v, l in HomeSection.VARIANT_CHOICES],
-                "layouts": [{"value": v, "label": l} for v, l in HomeSection.LAYOUT_CHOICES],
-                "card_styles": [{"value": v, "label": l} for v, l in HomeSection.CARD_STYLE_CHOICES],
+                "layouts": [LAYOUT_OPTIONS[v] for v, _l in HomeSection.LAYOUT_CHOICES],
+                "card_styles": [CARD_STYLE_OPTIONS[v] for v, _l in HomeSection.CARD_STYLE_CHOICES],
                 "show_to": [{"value": v, "label": l} for v, l in HomeSection.SHOW_TO_CHOICES],
                 "sorts": {
                     "stories": STORY_SORT_OPTIONS,
@@ -2995,8 +3007,63 @@ class HomeSectionAdminViewSet(ModelViewSet):
                 "banner_themes": BANNER_THEMES,
                 "ad_sizes": AD_SIZES,
                 "icons": HOME_SECTION_ICON_NAMES,
+                "devices": [{"value": v, "label": l} for v, l in HomeSection.DEVICE_CHOICES],
             }
         )
+
+    @action(detail=False, methods=["get"])
+    def templates(self, request):
+        from .home_section_templates import HOME_SECTION_TEMPLATES
+
+        return Response(
+            [
+                {
+                    "key": t["key"],
+                    "name": t["name"],
+                    "description": t["description"],
+                    "section_type": t["section_type"],
+                    "layout": t["layout"],
+                    "card_style": t["card_style"],
+                    "summary": t["summary"],
+                }
+                for t in HOME_SECTION_TEMPLATES
+            ]
+        )
+
+    @action(detail=False, methods=["post"], url_path="from-template")
+    def from_template(self, request):
+        from .home_section_templates import TEMPLATES_BY_KEY
+
+        key = (request.data.get("key") or "").strip()
+        template = TEMPLATES_BY_KEY.get(key)
+        if not template:
+            return Response({"detail": "Template not found."}, status=status.HTTP_404_NOT_FOUND)
+        payload = {
+            k: template[k]
+            for k in (
+                "section_type",
+                "variant",
+                "title",
+                "subtitle",
+                "icon",
+                "layout",
+                "card_style",
+                "columns_mobile",
+                "columns_desktop",
+                "item_limit",
+                "allow_repeats",
+                "show_see_all",
+                "config",
+                "display",
+                "device",
+            )
+        }
+        payload["is_enabled"] = False
+        serializer = self.get_serializer(data=payload)
+        serializer.is_valid(raise_exception=True)
+        last = HomeSection.objects.aggregate(m=Max("position"))["m"]
+        section = serializer.save(position=0 if last is None else last + 1)
+        return Response(self.get_serializer(section).data, status=status.HTTP_201_CREATED)
 
 
 class StoryTypeAdminViewSet(ModelViewSet):

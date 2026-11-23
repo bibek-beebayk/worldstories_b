@@ -601,6 +601,26 @@ class FeaturedStorySerializer(StoryListSerializer):
         fields = StoryListSerializer.Meta.fields + ["about"]
 
 
+class StoryCardWithSummarySerializer(StoryListSerializer):
+    """Thin StoryListSerializer subclass used only for homepage sections with
+    display.show_summary enabled. Keeps `summary` off the shared StoryListSerializer."""
+
+    summary = serializers.SerializerMethodField()
+
+    def get_summary(self, obj):
+        raw = strip_tags(obj.summary or obj.about or "").strip()
+        if not raw:
+            return ""
+        text = " ".join(raw.split())
+        if len(text) <= 160:
+            return text
+        trimmed = text[:160].rsplit(" ", 1)[0].rstrip(" ,;:-")
+        return f"{trimmed or text[:159]}…"
+
+    class Meta(StoryListSerializer.Meta):
+        fields = StoryListSerializer.Meta.fields + ["summary"]
+
+
 class DailyStorySerializer(serializers.ModelSerializer):
     """Today's pick: either a story or a video, the other is null."""
 
@@ -2603,8 +2623,46 @@ class HomeSectionAdminSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError("Use a site path like /library or a full https:// URL.")
         return value
 
+    def validate_anchor_id(self, value):
+        import re
+        from .home_sections import RESERVED_ANCHOR_IDS
+
+        value = (value or "").strip()
+        if not value:
+            return ""
+        if not re.match(r"^[a-z][a-z0-9-]{0,39}$", value):
+            raise serializers.ValidationError(
+                "Use lowercase letters, numbers, and hyphens, starting with a letter (max 40 characters)."
+            )
+        if value in RESERVED_ANCHOR_IDS:
+            raise serializers.ValidationError(f'"{value}" is a reserved anchor id.')
+        qs = HomeSection.objects.filter(anchor_id__iexact=value)
+        if self.instance is not None:
+            qs = qs.exclude(pk=self.instance.pk)
+        if qs.exists():
+            raise serializers.ValidationError("Another homepage section already uses this anchor id.")
+        return value
+
+    def validate_display(self, value):
+        from .home_sections import clean_display
+
+        try:
+            return clean_display(value)
+        except ValueError as exc:
+            raise serializers.ValidationError(str(exc))
+
+    def to_representation(self, instance):
+        from .home_sections import DEFAULT_DISPLAY, clean_display
+
+        data = super().to_representation(instance)
+        try:
+            data["display"] = clean_display(instance.display)
+        except ValueError:
+            data["display"] = dict(DEFAULT_DISPLAY)
+        return data
+
     def validate(self, attrs):
-        from .home_sections import clean_config
+        from .home_sections import CARD_STYLE_OPTIONS, LAYOUT_OPTIONS, TYPE_META, clean_config
 
         section_type = attrs.get("section_type") or (self.instance.section_type if self.instance else None)
         if "config" in attrs or "section_type" in attrs:
@@ -2618,6 +2676,26 @@ class HomeSectionAdminSerializer(serializers.ModelSerializer):
             found = set(Story.objects.filter(pk__in=ids).values_list("pk", flat=True))
             if found != set(ids):
                 raise serializers.ValidationError({"config": "Some picked stories no longer exist."})
+        if section_type in HomeSection.CONTENT_TYPES:
+            meta = TYPE_META.get(section_type, {})
+            allowed_layouts = meta.get("layouts", [])
+            allowed_styles = meta.get("card_styles", [])
+            layout_changed = "layout" in attrs and (
+                self.instance is None or attrs["layout"] != self.instance.layout
+            )
+            if layout_changed and attrs["layout"] not in allowed_layouts:
+                label = LAYOUT_OPTIONS.get(attrs["layout"], {}).get("label", attrs["layout"])
+                raise serializers.ValidationError(
+                    {"layout": f"{label} is only available for story sections."}
+                )
+            style_changed = "card_style" in attrs and (
+                self.instance is None or attrs["card_style"] != self.instance.card_style
+            )
+            if style_changed and attrs["card_style"] not in allowed_styles:
+                label = CARD_STYLE_OPTIONS.get(attrs["card_style"], {}).get("label", attrs["card_style"])
+                raise serializers.ValidationError(
+                    {"card_style": f"{label} is only available for story sections."}
+                )
         title = attrs.get("title", self.instance.title if self.instance else "")
         if section_type in (
             HomeSection.CONTENT_TYPES | {HomeSection.TYPE_BANNER, HomeSection.TYPE_NEW_ENTRIES}
@@ -2635,7 +2713,7 @@ class HomeSectionAdminSerializer(serializers.ModelSerializer):
             "id", "title", "subtitle", "section_type", "variant", "position", "is_enabled", "icon",
             "layout", "columns_mobile", "columns_desktop", "card_style", "item_limit", "allow_repeats",
             "show_see_all", "see_all_label", "see_all_url", "config", "stories_detail", "updated_at",
-            "show_to", "starts_at", "ends_at",
+            "show_to", "starts_at", "ends_at", "device", "anchor_id", "display",
         ]
         read_only_fields = ["updated_at"]
         extra_kwargs = {"position": {"required": False}}

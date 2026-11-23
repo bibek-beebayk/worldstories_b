@@ -87,21 +87,216 @@ BLOG_SORTS = {option["value"] for option in BLOG_SORT_OPTIONS}
 BANNER_THEMES = ["ocean", "violet", "rose", "amber", "emerald"]
 AD_SIZES = ["banner", "square", "rectangle"]
 
+DISPLAY_BACKGROUNDS = ("none", "tint", "dark", "brand")
+DISPLAY_HEADING_ALIGNS = ("left", "center")
+DISPLAY_SPACINGS = ("compact", "normal", "roomy")
+DISPLAY_WIDTHS = ("contained", "full")
+RESERVED_ANCHOR_IDS = frozenset({"main", "root", "content", "top", "header", "footer"})
+
+# Matches what cards and sections render by default today (StoryCard does not
+# display ratings by default, so show_rating defaults to False).
+DEFAULT_DISPLAY = {
+    "background": "none",
+    "heading_align": "left",
+    "spacing": "normal",
+    "width": "contained",
+    "hide_title": False,
+    "show_author": True,
+    "show_rating": False,
+    "show_reading_time": True,
+    "show_badges": True,
+    "show_summary": False,
+}
+
+
+def clean_display(values):
+    """Whitelist + validate a section's `display` dict. Unknown keys are
+    dropped, missing keys are filled with defaults, and invalid values raise
+    ValueError with a clear message."""
+    if values is None:
+        raw = {}
+    elif isinstance(values, dict):
+        raw = values
+    else:
+        raise ValueError("display must be an object.")
+
+    out = dict(DEFAULT_DISPLAY)
+
+    enum_rules = (
+        ("background", DISPLAY_BACKGROUNDS),
+        ("heading_align", DISPLAY_HEADING_ALIGNS),
+        ("spacing", DISPLAY_SPACINGS),
+        ("width", DISPLAY_WIDTHS),
+    )
+    for key, allowed in enum_rules:
+        if key in raw and raw[key] is not None:
+            val = raw[key]
+            if not isinstance(val, str) or val not in allowed:
+                raise ValueError(f"{key} must be one of: {', '.join(allowed)}.")
+            out[key] = val
+
+    bool_keys = (
+        "hide_title",
+        "show_author",
+        "show_rating",
+        "show_reading_time",
+        "show_badges",
+        "show_summary",
+    )
+    for key in bool_keys:
+        if key in raw and raw[key] is not None:
+            val = raw[key]
+            if not isinstance(val, bool):
+                raise ValueError(f"{key} must be true or false.")
+            out[key] = val
+
+    return out
+
+LAYOUT_OPTIONS = {
+    HomeSection.LAYOUT_GRID: {
+        "value": HomeSection.LAYOUT_GRID,
+        "label": "Grid",
+        "description": "Even multi-column grid of cards.",
+    },
+    HomeSection.LAYOUT_RAIL: {
+        "value": HomeSection.LAYOUT_RAIL,
+        "label": "Scrolling rail",
+        "description": "Single horizontal row you can swipe or scroll.",
+    },
+    HomeSection.LAYOUT_TRENDING: {
+        "value": HomeSection.LAYOUT_TRENDING,
+        "label": "Ranked list",
+        "description": "Numbered list ideal for Trending stories.",
+    },
+    HomeSection.LAYOUT_FEATURED: {
+        "value": HomeSection.LAYOUT_FEATURED,
+        "label": "Featured + grid",
+        "description": "Large 2x2 lead card beside a grid of items.",
+    },
+    HomeSection.LAYOUT_BENTO: {
+        "value": HomeSection.LAYOUT_BENTO,
+        "label": "Bento",
+        "description": "Dense editorial grid with mixed card sizes.",
+    },
+    HomeSection.LAYOUT_LIST: {
+        "value": HomeSection.LAYOUT_LIST,
+        "label": "List",
+        "description": "Two-column horizontal list on desktop, single column on phone.",
+    },
+    HomeSection.LAYOUT_CAROUSEL: {
+        "value": HomeSection.LAYOUT_CAROUSEL,
+        "label": "Paged carousel",
+        "description": "Paged slider with prev/next buttons and page dots.",
+    },
+    HomeSection.LAYOUT_TWOROW: {
+        "value": HomeSection.LAYOUT_TWOROW,
+        "label": "Two-row rail",
+        "description": "Horizontally scrolling shelf with two stacked rows.",
+    },
+    HomeSection.LAYOUT_COVERS: {
+        "value": HomeSection.LAYOUT_COVERS,
+        "label": "Cover-only shelf",
+        "description": "Compact horizontal shelf showing story covers only.",
+    },
+}
+
+CARD_STYLE_OPTIONS = {
+    HomeSection.CARD_DEFAULT: {
+        "value": HomeSection.CARD_DEFAULT,
+        "label": "Default",
+        "description": "Standard vertical card with cover and metadata.",
+    },
+    HomeSection.CARD_COMPACT: {
+        "value": HomeSection.CARD_COMPACT,
+        "label": "Compact",
+        "description": "Tighter vertical card for dense story shelves.",
+    },
+    HomeSection.CARD_OVERLAY: {
+        "value": HomeSection.CARD_OVERLAY,
+        "label": "Overlay title",
+        "description": "Full-bleed cover with title and author over a bottom scrim.",
+    },
+    HomeSection.CARD_WIDE: {
+        "value": HomeSection.CARD_WIDE,
+        "label": "Horizontal",
+        "description": "Side-by-side thumbnail and details in a compact row.",
+    },
+    HomeSection.CARD_TEXT: {
+        "value": HomeSection.CARD_TEXT,
+        "label": "Text only",
+        "description": "Coverless editorial row for dense text lists.",
+    },
+}
+
+STORY_LAYOUTS = [
+    HomeSection.LAYOUT_GRID,
+    HomeSection.LAYOUT_RAIL,
+    HomeSection.LAYOUT_TRENDING,
+    HomeSection.LAYOUT_FEATURED,
+    HomeSection.LAYOUT_BENTO,
+    HomeSection.LAYOUT_LIST,
+    HomeSection.LAYOUT_CAROUSEL,
+    HomeSection.LAYOUT_TWOROW,
+    HomeSection.LAYOUT_COVERS,
+]
+MEDIA_LAYOUTS = [
+    HomeSection.LAYOUT_GRID,
+    HomeSection.LAYOUT_RAIL,
+    HomeSection.LAYOUT_FEATURED,
+    HomeSection.LAYOUT_BENTO,
+    HomeSection.LAYOUT_LIST,
+    HomeSection.LAYOUT_CAROUSEL,
+    HomeSection.LAYOUT_TWOROW,
+]
+STORY_CARD_STYLES = [
+    HomeSection.CARD_DEFAULT,
+    HomeSection.CARD_COMPACT,
+    HomeSection.CARD_OVERLAY,
+    HomeSection.CARD_WIDE,
+    HomeSection.CARD_TEXT,
+]
+MEDIA_CARD_STYLES = [
+    HomeSection.CARD_DEFAULT,
+    HomeSection.CARD_OVERLAY,
+    HomeSection.CARD_WIDE,
+    HomeSection.CARD_TEXT,
+]
+
 # What the admin form offers per type. Served by the `types` endpoint so the
 # form needs no per-type knowledge of its own beyond rendering these fields.
 TYPE_META = {
-    HomeSection.TYPE_STORIES_QUERY: {"content": True, "fields": ["layout", "item_limit", "card_style", "allow_repeats", "see_all", "icon", "variant", "filters", "countries", "authors", "exclude_tags", "exclude_story_ids", "pin_story_ids", "min_reading_minutes", "max_reading_minutes", "published_within_days", "min_rating", "min_ratings_count", "trending_days"]},
-    HomeSection.TYPE_STORIES_MANUAL: {"content": True, "fields": ["layout", "item_limit", "card_style", "allow_repeats", "see_all", "icon", "variant", "story_ids"]},
-    HomeSection.TYPE_VIDEOS: {"content": True, "fields": ["layout", "item_limit", "see_all", "icon", "video_filters", "video_sort", "format", "min_duration_seconds", "max_duration_seconds", "language", "story_genres", "video_ids"]},
-    HomeSection.TYPE_BLOGS: {"content": True, "fields": ["layout", "item_limit", "see_all", "icon", "blog_sort", "topics", "published_within_days", "story_genres", "only_with_story", "pin_blog_ids", "blog_ids"]},
-    HomeSection.TYPE_BANNER: {"content": False, "fields": ["icon", "banner"]},
-    HomeSection.TYPE_AD_SLOT: {"content": False, "fields": ["ad_size"]},
-    HomeSection.TYPE_NEW_ENTRIES: {"content": False, "fields": ["icon"]},
-    HomeSection.TYPE_CONTINUE_SHELF: {"content": False, "fields": []},
-    HomeSection.TYPE_READING_JOURNEY: {"content": False, "fields": []},
-    HomeSection.TYPE_RECOMMENDED: {"content": False, "fields": ["see_all", "icon"]},
-    HomeSection.TYPE_JOURNEYS_BANNER: {"content": False, "fields": []},
-    HomeSection.TYPE_EXPLORE_TILES: {"content": False, "fields": []},
+    HomeSection.TYPE_STORIES_QUERY: {
+        "content": True,
+        "fields": ["layout", "item_limit", "card_style", "allow_repeats", "see_all", "icon", "variant", "filters", "countries", "authors", "exclude_tags", "exclude_story_ids", "pin_story_ids", "min_reading_minutes", "max_reading_minutes", "published_within_days", "min_rating", "min_ratings_count", "trending_days"],
+        "layouts": STORY_LAYOUTS,
+        "card_styles": STORY_CARD_STYLES,
+    },
+    HomeSection.TYPE_STORIES_MANUAL: {
+        "content": True,
+        "fields": ["layout", "item_limit", "card_style", "allow_repeats", "see_all", "icon", "variant", "story_ids"],
+        "layouts": STORY_LAYOUTS,
+        "card_styles": STORY_CARD_STYLES,
+    },
+    HomeSection.TYPE_VIDEOS: {
+        "content": True,
+        "fields": ["layout", "item_limit", "card_style", "see_all", "icon", "video_filters", "video_sort", "format", "min_duration_seconds", "max_duration_seconds", "language", "story_genres", "video_ids"],
+        "layouts": MEDIA_LAYOUTS,
+        "card_styles": MEDIA_CARD_STYLES,
+    },
+    HomeSection.TYPE_BLOGS: {
+        "content": True,
+        "fields": ["layout", "item_limit", "card_style", "see_all", "icon", "blog_sort", "topics", "published_within_days", "story_genres", "only_with_story", "pin_blog_ids", "blog_ids"],
+        "layouts": MEDIA_LAYOUTS,
+        "card_styles": MEDIA_CARD_STYLES,
+    },
+    HomeSection.TYPE_BANNER: {"content": False, "fields": ["icon", "banner"], "layouts": [], "card_styles": []},
+    HomeSection.TYPE_AD_SLOT: {"content": False, "fields": ["ad_size"], "layouts": [], "card_styles": []},
+    HomeSection.TYPE_NEW_ENTRIES: {"content": False, "fields": ["icon"], "layouts": [], "card_styles": []},
+    HomeSection.TYPE_CONTINUE_SHELF: {"content": False, "fields": [], "layouts": [], "card_styles": []},
+    HomeSection.TYPE_READING_JOURNEY: {"content": False, "fields": [], "layouts": [], "card_styles": []},
+    HomeSection.TYPE_RECOMMENDED: {"content": False, "fields": ["see_all", "icon"], "layouts": [], "card_styles": []},
+    HomeSection.TYPE_JOURNEYS_BANNER: {"content": False, "fields": [], "layouts": [], "card_styles": []},
+    HomeSection.TYPE_EXPLORE_TILES: {"content": False, "fields": [], "layouts": [], "card_styles": []},
 }
 
 
@@ -637,7 +832,7 @@ def section_is_visible(section, *, signed_in, now):
 
 def resolve_home_sections(request):
     # Imported here: serializers import models, and this module is imported by api.
-    from .serializers import PublicVideoSerializer, StoryListSerializer
+    from .serializers import PublicVideoSerializer, StoryCardWithSummarySerializer, StoryListSerializer
 
     context = {"request": request}
     resolved = []
@@ -648,11 +843,18 @@ def resolve_home_sections(request):
         if not section_is_visible(section, signed_in=signed_in, now=now):
             continue
         kind = section.section_type
+        try:
+            display = clean_display(section.display)
+        except ValueError:
+            display = dict(DEFAULT_DISPLAY)
         items = []
         if kind == HomeSection.TYPE_STORIES_QUERY or kind == HomeSection.TYPE_STORIES_MANUAL:
             stories = story_queryset(section)
             stories = stories[: _fetch_count(section)]
-            items = StoryListSerializer(stories, many=True, context=context).data
+            story_serializer = (
+                StoryCardWithSummarySerializer if display.get("show_summary") else StoryListSerializer
+            )
+            items = story_serializer(stories, many=True, context=context).data
         elif kind == HomeSection.TYPE_VIDEOS:
             items = PublicVideoSerializer(
                 video_queryset(section)[: section.item_limit], many=True, context=context
@@ -685,6 +887,9 @@ def resolve_home_sections(request):
                 "see_all_url": see_all_url,
                 "see_all_label": section.see_all_label or "See all",
                 "config": section.config if kind in (HomeSection.TYPE_BANNER, HomeSection.TYPE_AD_SLOT) else {},
+                "display": display,
+                "device": section.device,
+                "anchor_id": section.anchor_id,
                 "items": items,
             }
         )

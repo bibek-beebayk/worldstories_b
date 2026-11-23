@@ -6817,6 +6817,236 @@ class HomeSectionTests(APITestCase):
         self.assertFalse(copy["is_enabled"])
         self.assertEqual(copy["position"], 1)
 
+    def test_layout_and_card_style_matrix_validation_types_and_home_response(self):
+        from apps.story.home_sections import (
+            MEDIA_CARD_STYLES,
+            MEDIA_LAYOUTS,
+            STORY_CARD_STYLES,
+            STORY_LAYOUTS,
+        )
+
+        self.client.force_authenticate(self.admin)
+
+        # 1. types endpoint returns the exact matrix per type
+        types_resp = self.client.get("/api/admin/home-sections/types/")
+        self.assertEqual(types_resp.status_code, 200)
+        types_by_val = {entry["value"]: entry for entry in types_resp.json()["types"]}
+        for stype in ("stories_query", "stories_manual"):
+            self.assertEqual([x["value"] for x in types_by_val[stype]["layouts"]], STORY_LAYOUTS)
+            self.assertEqual([x["value"] for x in types_by_val[stype]["card_styles"]], STORY_CARD_STYLES)
+            for opt in types_by_val[stype]["layouts"]:
+                self.assertTrue({"value", "label", "description"} <= set(opt.keys()))
+        for stype in ("videos", "blogs"):
+            self.assertEqual([x["value"] for x in types_by_val[stype]["layouts"]], MEDIA_LAYOUTS)
+            self.assertEqual([x["value"] for x in types_by_val[stype]["card_styles"]], MEDIA_CARD_STYLES)
+
+        # 2. Every allowed combination saves
+        for stype, layouts, styles in (
+            ("stories_query", STORY_LAYOUTS, STORY_CARD_STYLES),
+            ("stories_manual", STORY_LAYOUTS, STORY_CARD_STYLES),
+            ("videos", MEDIA_LAYOUTS, MEDIA_CARD_STYLES),
+            ("blogs", MEDIA_LAYOUTS, MEDIA_CARD_STYLES),
+        ):
+            for layout in layouts:
+                resp = self.client.post(
+                    "/api/admin/home-sections/",
+                    {"title": f"{stype}-{layout}", "section_type": stype, "layout": layout},
+                    format="json",
+                )
+                self.assertEqual(resp.status_code, 201, msg=(stype, layout, resp.content))
+            for style in styles:
+                resp = self.client.post(
+                    "/api/admin/home-sections/",
+                    {"title": f"{stype}-{style}", "section_type": stype, "card_style": style},
+                    format="json",
+                )
+                self.assertEqual(resp.status_code, 201, msg=(stype, style, resp.content))
+
+        # 3. Every disallowed combination is rejected with 400
+        for stype in ("videos", "blogs"):
+            for bad_layout in ("trending", "covers"):
+                resp = self.client.post(
+                    "/api/admin/home-sections/",
+                    {"title": "Bad", "section_type": stype, "layout": bad_layout},
+                    format="json",
+                )
+                self.assertEqual(resp.status_code, 400, msg=(stype, bad_layout))
+                self.assertIn("layout", resp.json())
+            bad_style_resp = self.client.post(
+                "/api/admin/home-sections/",
+                {"title": "Bad style", "section_type": stype, "card_style": "compact"},
+                format="json",
+            )
+            self.assertEqual(bad_style_resp.status_code, 400, msg=(stype, "compact"))
+            self.assertIn("card_style", bad_style_resp.json())
+
+        # 4. /api/home/ returns new layout & card_style unchanged
+        self.HomeSection.objects.all().delete()
+        self.HomeSection.objects.create(
+            section_type="stories_query",
+            title="Bento Overlay",
+            position=0,
+            layout="bento",
+            card_style="overlay",
+        )
+        sections = self._public()
+        self.assertEqual(sections[0]["layout"], "bento")
+        self.assertEqual(sections[0]["card_style"], "overlay")
+
+    def test_display_anchor_device_summary_duplicate_and_preview_parity(self):
+        from apps.story.home_sections import DEFAULT_DISPLAY, clean_display
+
+        # clean_display defaults and validation errors
+        self.assertEqual(clean_display({}), DEFAULT_DISPLAY)
+        self.assertEqual(clean_display({"unknown_key": 123, "background": "dark"})["background"], "dark")
+        self.assertNotIn("unknown_key", clean_display({"unknown_key": 123}))
+        for bad in (
+            {"background": "neon"},
+            {"heading_align": "right"},
+            {"spacing": "huge"},
+            {"width": "wide"},
+            {"hide_title": "yes"},
+            {"show_summary": 1},
+        ):
+            with self.assertRaises(ValueError):
+                clean_display(bad)
+
+        self.client.force_authenticate(self.admin)
+
+        # anchor_id validation: uppercase, reserved, duplicate
+        for bad_anchor in ("Upper", "1starts-digit", "main", "header", "bad space"):
+            resp = self.client.post(
+                "/api/admin/home-sections/",
+                {"title": "A", "section_type": "stories_query", "anchor_id": bad_anchor},
+                format="json",
+            )
+            self.assertEqual(resp.status_code, 400, msg=bad_anchor)
+            self.assertIn("anchor_id", resp.json())
+
+        # device validation
+        bad_dev = self.client.post(
+            "/api/admin/home-sections/",
+            {"title": "A", "section_type": "stories_query", "device": "tablet"},
+            format="json",
+        )
+        self.assertEqual(bad_dev.status_code, 400)
+        self.assertIn("device", bad_dev.json())
+
+        # Create valid section with anchor_id, device, display
+        Story.objects.filter(slug="home-story-0").update(
+            summary="<p>" + ("word " * 50).strip() + "</p>"
+        )
+        created = self.client.post(
+            "/api/admin/home-sections/",
+            {
+                "title": "Featured Band",
+                "section_type": "stories_query",
+                "anchor_id": "featured-band",
+                "device": "desktop",
+                "display": {"background": "tint", "show_summary": True, "show_rating": True},
+            },
+            format="json",
+        )
+        self.assertEqual(created.status_code, 201)
+        section_id = created.json()["id"]
+
+        # Duplicate anchor_id rejected
+        dup_anchor = self.client.post(
+            "/api/admin/home-sections/",
+            {"title": "B", "section_type": "stories_query", "anchor_id": "featured-band"},
+            format="json",
+        )
+        self.assertEqual(dup_anchor.status_code, 400)
+        self.assertIn("anchor_id", dup_anchor.json())
+
+        # Duplicate action clears anchor_id but keeps device and display
+        copy = self.client.post(f"/api/admin/home-sections/{section_id}/duplicate/").json()
+        self.assertEqual(copy["anchor_id"], "")
+        self.assertEqual(copy["device"], "desktop")
+        self.assertEqual(copy["display"]["background"], "tint")
+        self.assertTrue(copy["display"]["show_summary"])
+
+        # Old section with empty display returns full defaults and NO summary on stories
+        old = self.HomeSection.objects.create(
+            section_type="stories_query", title="Legacy", position=10, display={}
+        )
+        sections = self._public()
+        by_id = {s["id"]: s for s in sections}
+        self.assertEqual(by_id[old.pk]["display"], DEFAULT_DISPLAY)
+        self.assertEqual(by_id[old.pk]["device"], "all")
+        self.assertEqual(by_id[old.pk]["anchor_id"], "")
+        self.assertNotIn("summary", by_id[old.pk]["items"][0])
+
+        # Section with show_summary=True carries trimmed summary <= 160 chars
+        self.assertEqual(by_id[section_id]["device"], "desktop")
+        self.assertEqual(by_id[section_id]["anchor_id"], "featured-band")
+        self.assertTrue(by_id[section_id]["display"]["show_summary"])
+        with_summary = next(i for i in by_id[section_id]["items"] if i["slug"] == "home-story-0")
+        self.assertIn("summary", with_summary)
+        self.assertLessEqual(len(with_summary["summary"]), 161)
+
+        # Preview parity with display.show_summary
+        prev_on = self.client.post(
+            "/api/admin/home-sections/preview/",
+            {"section_type": "stories_query", "display": {"show_summary": True}},
+            format="json",
+        )
+        self.assertEqual(prev_on.status_code, 200)
+        self.assertIn("summary", prev_on.json()["items"][0])
+
+        prev_off = self.client.post(
+            "/api/admin/home-sections/preview/",
+            {"section_type": "stories_query", "display": {"show_summary": False}},
+            format="json",
+        )
+        self.assertEqual(prev_off.status_code, 200)
+        self.assertNotIn("summary", prev_off.json()["items"][0])
+
+    def test_templates_list_and_from_template_endpoint(self):
+        # Superuser only
+        regular = User.objects.create(
+            email="nonadmin@example.com", username="nonadmin_tpl", is_superuser=False, is_staff=True, is_active=True
+        )
+        self.client.force_authenticate(regular)
+        self.assertEqual(self.client.get("/api/admin/home-sections/templates/").status_code, 403)
+        self.assertEqual(
+            self.client.post("/api/admin/home-sections/from-template/", {"key": "new-this-week"}, format="json").status_code,
+            403,
+        )
+
+        self.client.force_authenticate(self.admin)
+        existing = self.HomeSection.objects.create(section_type="banner", title="Existing", position=5)
+
+        list_resp = self.client.get("/api/admin/home-sections/templates/")
+        self.assertEqual(list_resp.status_code, 200)
+        templates = list_resp.json()
+        self.assertEqual(len(templates), 10)
+        for tpl in templates:
+            self.assertTrue(
+                {"key", "name", "description", "section_type", "layout", "card_style", "summary"} <= set(tpl.keys())
+            )
+
+        # Unknown key -> 404
+        missing = self.client.post(
+            "/api/admin/home-sections/from-template/", {"key": "does-not-exist"}, format="json"
+        )
+        self.assertEqual(missing.status_code, 404)
+
+        # Creating from every template succeeds, hidden, appended at end
+        expected_pos = 6
+        for tpl in templates:
+            resp = self.client.post(
+                "/api/admin/home-sections/from-template/", {"key": tpl["key"]}, format="json"
+            )
+            self.assertEqual(resp.status_code, 201, msg=(tpl["key"], resp.content))
+            body = resp.json()
+            self.assertFalse(body["is_enabled"])
+            self.assertEqual(body["position"], expected_pos)
+            expected_pos += 1
+
+        existing.refresh_from_db()
+        self.assertEqual(existing.position, 5)
+
 
 class HomeSectionStoryRulesTests(APITestCase):
     def setUp(self):

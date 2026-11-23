@@ -1812,15 +1812,36 @@ class HomeSection(TimeStampModel):
     LAYOUT_GRID = "grid"
     LAYOUT_RAIL = "rail"
     LAYOUT_TRENDING = "trending"
+    LAYOUT_FEATURED = "featured"
+    LAYOUT_BENTO = "bento"
+    LAYOUT_LIST = "list"
+    LAYOUT_CAROUSEL = "carousel"
+    LAYOUT_TWOROW = "tworow"
+    LAYOUT_COVERS = "covers"
     LAYOUT_CHOICES = [
         (LAYOUT_GRID, "Grid"),
         (LAYOUT_RAIL, "Scrolling rail"),
         (LAYOUT_TRENDING, "Ranked list (best with the Trending sort)"),
+        (LAYOUT_FEATURED, "Featured + grid"),
+        (LAYOUT_BENTO, "Bento"),
+        (LAYOUT_LIST, "List"),
+        (LAYOUT_CAROUSEL, "Paged carousel"),
+        (LAYOUT_TWOROW, "Two-row rail"),
+        (LAYOUT_COVERS, "Cover-only shelf"),
     ]
 
     CARD_DEFAULT = "default"
     CARD_COMPACT = "compact"
-    CARD_STYLE_CHOICES = [(CARD_DEFAULT, "Default"), (CARD_COMPACT, "Compact")]
+    CARD_OVERLAY = "overlay"
+    CARD_WIDE = "wide"
+    CARD_TEXT = "text"
+    CARD_STYLE_CHOICES = [
+        (CARD_DEFAULT, "Default"),
+        (CARD_COMPACT, "Compact"),
+        (CARD_OVERLAY, "Overlay title"),
+        (CARD_WIDE, "Horizontal"),
+        (CARD_TEXT, "Text only"),
+    ]
 
     title = models.CharField(max_length=120, blank=True)
     subtitle = models.CharField(max_length=300, blank=True)
@@ -1865,6 +1886,18 @@ class HomeSection(TimeStampModel):
     # Optional schedule window (both ends optional, ends exclusive).
     starts_at = models.DateTimeField(null=True, blank=True)
     ends_at = models.DateTimeField(null=True, blank=True)
+
+    DEVICE_ALL = "all"
+    DEVICE_MOBILE = "mobile"
+    DEVICE_DESKTOP = "desktop"
+    DEVICE_CHOICES = [
+        (DEVICE_ALL, "Phone and desktop"),
+        (DEVICE_MOBILE, "Phone only"),
+        (DEVICE_DESKTOP, "Desktop only"),
+    ]
+    device = models.CharField(max_length=8, choices=DEVICE_CHOICES, default=DEVICE_ALL)
+    anchor_id = models.CharField(max_length=40, blank=True, default="")
+    display = models.JSONField(default=dict, blank=True)
 
     class Meta:
         ordering = ["position", "id"]
