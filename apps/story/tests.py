@@ -8978,6 +8978,17 @@ class AudiobooksApiTests(APITestCase):
             },
         )
 
+    def test_story_detail_audio_duration_seconds(self):
+        resp_known = self.client.get(f"/api/stories/{self.short_story.slug}/")
+        self.assertEqual(resp_known.status_code, 200)
+        durations = {a["slug"]: a["duration_seconds"] for a in resp_known.data["audios"]}
+        self.assertEqual(durations["short-p1"], 610.0)
+        self.assertEqual(durations["short-p2"], 600.0)
+
+        resp_unknown = self.client.get(f"/api/stories/{self.unknown_story.slug}/")
+        self.assertEqual(resp_unknown.status_code, 200)
+        self.assertIsNone(resp_unknown.data["audios"][0]["duration_seconds"])
+
 
 class QuickReadsApiTests(APITestCase):
     def setUp(self):

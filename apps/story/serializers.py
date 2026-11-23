@@ -813,8 +813,9 @@ class AudioSerializer(serializers.ModelSerializer):
         model = Audio
         fields = [
             "id", "title", "slug", "audio_file", "order", "download_size_bytes",
-            "has_transcript", "read_along_available", "transcript_synchronized",
+            "duration_seconds", "has_transcript", "read_along_available", "transcript_synchronized",
         ]
+        read_only_fields = ["duration_seconds"]
 
 
 class AudioListSerializer(serializers.ModelSerializer):
