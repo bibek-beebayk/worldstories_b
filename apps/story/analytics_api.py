@@ -358,7 +358,7 @@ def collect_content_metrics(days, kind, *, until=None, caps=None):
     is_audiobook = kind == "audiobook"
     title_queryset = Story.objects.published() if is_story else Blog.objects.published()
     if is_audiobook:
-        title_queryset = title_queryset.filter(audios__isnull=False).distinct()
+        title_queryset = title_queryset.filter(audiobooks__isnull=False).distinct()
     elif is_quick_read:
         title_queryset = title_queryset.exclude(Q(summary__isnull=True) | Q(summary__exact=""))
     titles = list(title_queryset.values("id", "title", "slug").order_by("title"))

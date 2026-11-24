@@ -57,3 +57,37 @@ Verify the sending domain in Resend and publish the exact records it supplies:
 - DMARC TXT record at `_dmarc`, beginning with a monitoring policy such as `v=DMARC1; p=none;` and an aggregate-report address you monitor. Tighten the policy after SPF and DKIM alignment are confirmed.
 
 DNS hostnames and verification values are account/domain-specific; copy them from the Resend domain-verification screen rather than using example values.
+
+## Admin audiobooks
+
+Superuser-only endpoints for managing standalone and story-linked audiobooks, tracks, and series:
+
+- `GET/POST /api/admin/audiobooks/` — list (filters: `q`, `story_link=all|linked|standalone`, `series`, `status=published|draft|scheduled`, `ordering`) and create audiobooks. Standalone audiobooks require `title`, `author`, `language`, and `about`.
+- `GET/PATCH/DELETE /api/admin/audiobooks/<id>/` — retrieve (with `effective` fallback fields and ordered `tracks`), update (supports `remove_cover=true`), or delete (cascades tracks, transcripts, cues, and listener progress; leaves linked `Story` intact).
+- `GET /api/admin/audiobooks/stats/` — summary counts (`total`, `standalone`, `series_count`, `missing_duration`).
+- `GET /api/admin/audiobooks/story-search/?q=` — search up to 10 stories (published or draft) with `audiobook_count`.
+- `POST /api/admin/audiobooks/<id>/tracks/` — multi-file `.mp3` upload (`files`), derives titles from filenames, probes duration/size, skips invalid files and returns `{created, errors}`.
+- `POST /api/admin/audiobooks/<id>/tracks/reorder/` — atomic reorder by exact track ID list (`{ids: [...]}`).
+- `PATCH/DELETE /api/admin/audiobooks/<id>/tracks/<track_id>/` — rename, replace audio file, or delete track (closes order gap and refreshes cache).
+- `POST /api/admin/audiobooks/<id>/tracks/<track_id>/reread-duration/` — re-probes duration from stored audio file.
+- `POST /api/admin/audiobooks/<id>/tracks/<track_id>/move/` — moves track (with transcript, cues, and progress preserved) to another audiobook (`{audiobook_id}`) and refreshes both caches.
+- `GET/POST/PATCH/DELETE /api/admin/audiobook-series/` — CRUD for audiobook series (deleting a series nulls `audiobook.series` and keeps audiobooks intact).
+
+## Public audiobooks & progress (Phase 3)
+
+- `GET/PUT /api/audio-progress/audiobook/<audiobook_slug>/` — authenticated audiobook-keyed listening progress (accepts `audio_id` or `audio_slug`). On `GET`, if no audiobook-keyed row exists yet but a legacy story-keyed row (`audiobook=None`) exists for a track of the linked story, returns the legacy row so listeners keep their place; the next `PUT` upgrades/writes the audiobook-keyed row. Standalone audiobooks (`story=None`) save and reload cleanly.
+- `GET /api/audio-progress/<story_slug>/` — legacy story-keyed progress endpoint remains unchanged (to be deprecated/removed in Phase 4).
+- `GET /api/audiobooks/overview/` — `continue_listening` merges audiobook-keyed and legacy rows (audiobook-keyed wins), deduplicated per audiobook.
+- `GET /api/audiobooks/stats/`, `GET /api/audiobooks/<slug>/read-along/<audio_slug>/`, and `GET /api/audiobooks/<slug>/tracks/<audio_slug>/stream/` — public stats, read-along transcript/cue payload, and byte-range stream proxy for both standalone and story-linked audiobooks.
+- `GET /api/sitemap.xml` — includes every published playable audiobook once at `/listen/<audiobook.slug>`.
+- **Phase 4 (current state)**:
+  - `AudioReadingProgress` uses `audiobook` as the canonical key with `UniqueConstraint(fields=["user", "audiobook", "audio"], condition=Q(audiobook__isnull=False))` (`stats.0033`). New rows do not write the legacy `story` column.
+  - `GET/PUT /api/audio-progress/audiobook/<audiobook_slug>/` and `AudiobookViewSet.overview` `continue_listening` read audiobook-keyed rows only.
+  - `GET/PUT /api/audio-progress/<story_slug>/` is a thin compatibility wrapper that logs a deprecation warning and delegates to the story's first published audiobook.
+  - `Audio` enforces `UniqueConstraint(fields=["audiobook", "order"])` (`story.0106`).
+  - Analytics (`completion.py`, `overview_api.py`, `users_api.py`, `analytics_api.py`, and `AudiobookViewSet._order_by_popular`) aggregate by `audiobook` / `audiobooks`.
+  - **Management commands**:
+    - `python manage.py audit_audiobooks` — read-only integrity audit (exits 1 on any violation; run before and after backfills and before schema tightening).
+    - `python manage.py backfill_audiobooks [--dry-run]` — creates missing `Audiobook` rows for legacy story `Audio` tracks and attaches them.
+    - `python manage.py backfill_audio_progress [--dry-run]` — moves `AudioReadingProgress` rows with `audiobook IS NULL` onto audiobook keys (batches of 500, idempotent).
+    - `python manage.py recompute_audiobook_totals [--dry-run]` — recomputes `track_count` and `total_duration_seconds` on all audiobooks (batches of 500, idempotent).

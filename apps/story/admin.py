@@ -570,9 +570,9 @@ class VideoAdmin(admin.ModelAdmin):
 @admin.register(AudioTranscriptCue)
 class AudioTranscriptCueAdmin(admin.ModelAdmin):
     list_display = ("audio", "order", "start_ms", "end_ms", "text_preview")
-    search_fields = ("text", "audio__title", "audio__story__title")
-    list_filter = ("audio__story",)
-    list_select_related = ("audio", "audio__story")
+    search_fields = ("text", "audio__title", "audio__audiobook__title")
+    list_filter = ("audio__audiobook",)
+    list_select_related = ("audio", "audio__audiobook")
     autocomplete_fields = ("audio",)
     ordering = ("audio", "order")
 

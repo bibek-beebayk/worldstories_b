@@ -2,7 +2,7 @@ from django.conf import settings
 from django.db import models
 import uuid
 
-from apps.story.models import Story, Chapter, Audio, Video, Blog
+from apps.story.models import Story, Chapter, Audio, Audiobook, Video, Blog
 
 
 class ReadingProgress(models.Model):
@@ -196,6 +196,15 @@ class AudioReadingProgress(models.Model):
         Story,
         on_delete=models.CASCADE,
         related_name="audio_reading_progress",
+        null=True,
+        blank=True,
+    )
+    audiobook = models.ForeignKey(
+        Audiobook,
+        on_delete=models.CASCADE,
+        related_name="audio_reading_progress",
+        null=True,
+        blank=True,
     )
     audio = models.ForeignKey(
         Audio,
@@ -209,9 +218,17 @@ class AudioReadingProgress(models.Model):
 
     class Meta:
         unique_together = ("user", "audio")
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "audiobook", "audio"],
+                condition=models.Q(audiobook__isnull=False),
+                name="stats_audioreadingprogress_user_audiobook_audio_uniq",
+            ),
+        ]
         indexes = [
             models.Index(fields=["user", "story"]),
             models.Index(fields=["user", "audio"]),
+            models.Index(fields=["user", "audiobook"]),
         ]
 
     def __str__(self):

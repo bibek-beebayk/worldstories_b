@@ -69,7 +69,19 @@ def completed_source(user, story):
 
     if finished(ChapterReadingProgress, "chapter_id", Chapter):
         return StoryCompletion.SOURCE_CHAPTERS
-    if finished(AudioReadingProgress, "audio_id", Audio):
+
+    # Audio completion: check if every track across any of the story's audiobooks
+    # (or all tracks belonging to the story's audiobooks) is finished, using
+    # audiobook keys rather than legacy Audio.story / AudioReadingProgress.story.
+    audio_ids = set(Audio.objects.filter(audiobook__story=story).values_list("id", flat=True))
+    finished_audio_ids = set(
+        AudioReadingProgress.objects.filter(
+            user=user,
+            audiobook__story=story,
+            progress__gte=COMPLETION_THRESHOLD,
+        ).values_list("audio_id", flat=True)
+    )
+    if _all_items_finished(audio_ids, finished_audio_ids):
         return StoryCompletion.SOURCE_AUDIO
 
     file_formats = set(

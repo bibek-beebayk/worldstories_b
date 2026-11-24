@@ -18,6 +18,8 @@ from .models import (
     BlogTopic,
     HomeSection,
     Audio,
+    Audiobook,
+    AudiobookSeries,
     AudioTranscriptCue,
     Video,
     Story,
@@ -56,6 +58,7 @@ CARD_COVER_SIZE = "480x640"
 LARGE_COVER_SIZE = "900x1200"
 BLOG_COVER_SIZE = "1200x630"
 VIDEO_COVER_SIZE = "1280x1280"
+AUDIOBOOK_COVER_SIZE = "1280x1280"
 
 
 class GenreSerializer(serializers.ModelSerializer):
@@ -818,6 +821,179 @@ class AudioSerializer(serializers.ModelSerializer):
         read_only_fields = ["duration_seconds"]
 
 
+class AudiobookSeriesSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = AudiobookSeries
+        fields = ["slug", "name", "description"]
+
+
+class PublicAudiobookSerializer(serializers.ModelSerializer):
+    title = serializers.SerializerMethodField()
+    author = serializers.SerializerMethodField()
+    language = serializers.SerializerMethodField()
+    about = serializers.SerializerMethodField()
+    cover_image = serializers.SerializerMethodField()
+    genres = serializers.SerializerMethodField()
+    series = serializers.SerializerMethodField()
+    minutes = serializers.SerializerMethodField()
+    has_read_along = serializers.SerializerMethodField()
+    story = serializers.SerializerMethodField()
+
+    def get_title(self, obj):
+        return obj.effective_title()
+
+    def get_author(self, obj):
+        author = obj.effective_author()
+        return author.name if author is not None else None
+
+    def get_language(self, obj):
+        return obj.effective_language()
+
+    def get_about(self, obj):
+        return obj.effective_about()
+
+    def get_cover_image(self, obj):
+        return obj.effective_cover(
+            request=self.context.get("request"),
+            size=AUDIOBOOK_COVER_SIZE,
+            story_size=CARD_COVER_SIZE,
+        )
+
+    def get_genres(self, obj):
+        return [genre.name for genre in obj.effective_genres()[:3]]
+
+    def get_series(self, obj):
+        if not obj.series_id:
+            return None
+        return {"slug": obj.series.slug, "name": obj.series.name}
+
+    def get_minutes(self, obj):
+        total = obj.total_duration_seconds
+        if total is None or total <= 0:
+            return None
+        return math.ceil(total / 60)
+
+    def get_has_read_along(self, obj):
+        cache = getattr(obj, "_prefetched_objects_cache", None)
+        rows = cache["tracks"] if cache and "tracks" in cache else obj.tracks.all()
+        return any(track.audio_file and rich_text_has_content(track.transcript) for track in rows)
+
+    def get_story(self, obj):
+        if not obj.story_id:
+            return None
+        return {
+            "id": obj.story.id,
+            "slug": obj.story.slug,
+            "title": obj.story.title,
+        }
+
+    class Meta:
+        model = Audiobook
+        fields = [
+            "id",
+            "slug",
+            "title",
+            "author",
+            "narrator",
+            "language",
+            "about",
+            "cover_image",
+            "genres",
+            "series",
+            "series_order",
+            "track_count",
+            "total_duration_seconds",
+            "minutes",
+            "has_read_along",
+            "story",
+            "created_at",
+        ]
+
+
+class AudiobookDetailSerializer(PublicAudiobookSerializer):
+    tracks = serializers.SerializerMethodField()
+    other_versions = serializers.SerializerMethodField()
+    suggested = serializers.SerializerMethodField()
+
+    def get_tracks(self, obj):
+        cache = getattr(obj, "_prefetched_objects_cache", None)
+        rows = cache["tracks"] if cache and "tracks" in cache else obj.tracks.order_by("order")
+        return AudioSerializer(rows, many=True, context=self.context).data
+
+    def get_other_versions(self, obj):
+        if not obj.story_id:
+            return []
+        siblings = (
+            Audiobook.objects.published()
+            .filter(story_id=obj.story_id)
+            .exclude(pk=obj.pk)
+            .select_related("story")
+            .order_by("id")
+        )
+        return [
+            {
+                "slug": sib.slug,
+                "title": sib.effective_title(),
+                "narrator": sib.narrator,
+                "total_duration_seconds": sib.total_duration_seconds,
+            }
+            for sib in siblings
+        ]
+
+    def get_suggested(self, obj):
+        from django.db.models import Exists, OuterRef
+
+        has_playable = Exists(
+            Audio.objects.filter(
+                audiobook=OuterRef("pk"),
+                audio_file__isnull=False,
+            ).exclude(audio_file="")
+        )
+        base = (
+            Audiobook.objects.published()
+            .filter(has_playable)
+            .exclude(pk=obj.pk)
+            .select_related("story", "story__author", "author", "series")
+            .prefetch_related("genres", "story__genres", "tracks")
+        )
+        if obj.story_id:
+            base = base.exclude(story_id=obj.story_id)
+
+        genre_ids = [g.id for g in obj.effective_genres()]
+        picked = []
+        seen_ids = set()
+
+        if obj.series_id:
+            for item in base.filter(series_id=obj.series_id).order_by("series_order", "-created_at")[:6]:
+                if item.pk not in seen_ids:
+                    seen_ids.add(item.pk)
+                    picked.append(item)
+
+        if len(picked) < 6 and genre_ids:
+            genre_matches = (
+                base.exclude(pk__in=seen_ids)
+                .filter(Q(genres__id__in=genre_ids) | Q(story__genres__id__in=genre_ids))
+                .distinct()
+                .order_by("-created_at", "-id")[: 6 - len(picked)]
+            )
+            for item in genre_matches:
+                if item.pk not in seen_ids:
+                    seen_ids.add(item.pk)
+                    picked.append(item)
+
+        if len(picked) < 6:
+            fallback = base.exclude(pk__in=seen_ids).order_by("-created_at", "-id")[: 6 - len(picked)]
+            for item in fallback:
+                if item.pk not in seen_ids:
+                    seen_ids.add(item.pk)
+                    picked.append(item)
+
+        return PublicAudiobookSerializer(picked, many=True, context=self.context).data
+
+    class Meta(PublicAudiobookSerializer.Meta):
+        fields = PublicAudiobookSerializer.Meta.fields + ["tracks", "other_versions", "suggested"]
+
+
 class AudioListSerializer(serializers.ModelSerializer):
     has_transcript = serializers.SerializerMethodField()
     read_along_available = serializers.SerializerMethodField()
@@ -1122,6 +1298,7 @@ class StoryDetailSerializer(serializers.ModelSerializer):
     favorites_count = serializers.SerializerMethodField()
     chapters = ChapterListSerializer(many=True, read_only=True)
     audios = AudioSerializer(many=True, read_only=True)
+    audiobooks = serializers.SerializerMethodField()
     videos = VideoSerializer(many=True, read_only=True)
     translations = serializers.SerializerMethodField()
     reading_time_minutes = serializers.SerializerMethodField()
@@ -1228,6 +1405,34 @@ class StoryDetailSerializer(serializers.ModelSerializer):
             return None
         return StoryUserSerializer(obj.submitted_by).data
 
+    def get_audiobooks(self, obj):
+        cache = getattr(obj, "_prefetched_objects_cache", None)
+        if cache and "published_audiobooks" in cache:
+            rows = cache["published_audiobooks"]
+        else:
+            from django.db.models import Exists, OuterRef
+
+            has_playable = Exists(
+                Audio.objects.filter(
+                    audiobook=OuterRef("pk"),
+                    audio_file__isnull=False,
+                ).exclude(audio_file="")
+            )
+            rows = list(
+                obj.audiobooks.published()
+                .filter(has_playable)
+                .order_by("id")
+            )
+        return [
+            {
+                "slug": ab.slug,
+                "title": ab.effective_title(),
+                "narrator": ab.narrator,
+                "total_duration_seconds": ab.total_duration_seconds,
+            }
+            for ab in rows
+        ]
+
     class Meta:
         model = Story
         fields = [
@@ -1269,6 +1474,7 @@ class StoryDetailSerializer(serializers.ModelSerializer):
             "chapter_count",
             "chapters",
             "audios",
+            "audiobooks",
             "videos",
             "has_audio",
             "has_video",
@@ -1608,6 +1814,34 @@ class StoryAdminSerializer(serializers.ModelSerializer):
         if not obj.submitted_by:
             return None
         return StoryUserSerializer(obj.submitted_by).data
+
+    def get_audiobooks(self, obj):
+        cache = getattr(obj, "_prefetched_objects_cache", None)
+        if cache and "published_audiobooks" in cache:
+            rows = cache["published_audiobooks"]
+        else:
+            from django.db.models import Exists, OuterRef
+
+            has_playable = Exists(
+                Audio.objects.filter(
+                    audiobook=OuterRef("pk"),
+                    audio_file__isnull=False,
+                ).exclude(audio_file="")
+            )
+            rows = list(
+                obj.audiobooks.published()
+                .filter(has_playable)
+                .order_by("id")
+            )
+        return [
+            {
+                "slug": ab.slug,
+                "title": ab.effective_title(),
+                "narrator": ab.narrator,
+                "total_duration_seconds": ab.total_duration_seconds,
+            }
+            for ab in rows
+        ]
 
     def get_source(self, obj):
         try:
@@ -2749,3 +2983,453 @@ class HomeSectionAdminSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ["updated_at"]
         extra_kwargs = {"position": {"required": False}}
+
+
+def _audiobook_status(obj) -> str:
+    if not obj.is_published:
+        return "draft"
+    if obj.publish_at and obj.publish_at > timezone.now():
+        return "scheduled"
+    return "published"
+
+
+def _unique_audiobook_series_slug(name: str, instance=None) -> str:
+    base = (slugify(name) or "series")[:130]
+    slug = base
+    suffix = 2
+    qs = AudiobookSeries.objects.all()
+    if instance is not None:
+        qs = qs.exclude(pk=instance.pk)
+    while qs.filter(slug=slug).exists():
+        slug = f"{base}-{suffix}"[:140]
+        suffix += 1
+    return slug
+
+
+def _unique_audiobook_slug_for_admin(base_text: str, instance=None) -> str:
+    base = (slugify(base_text) or "audiobook")[:240]
+    slug = base
+    suffix = 2
+    qs = Audiobook.objects.all()
+    if instance is not None:
+        qs = qs.exclude(pk=instance.pk)
+    while qs.filter(slug=slug).exists():
+        slug = f"{base}-{suffix}"[:256]
+        suffix += 1
+    return slug
+
+
+class AudiobookSeriesAdminSerializer(serializers.ModelSerializer):
+    title = serializers.CharField(source="name", max_length=120)
+    slug = serializers.SlugField(max_length=140, required=False, allow_blank=True)
+    audiobook_count = serializers.SerializerMethodField(read_only=True)
+
+    def get_audiobook_count(self, obj):
+        annotated = getattr(obj, "_audiobook_count", None)
+        if annotated is not None:
+            return annotated
+        return obj.audiobooks.count()
+
+    def validate_title(self, value):
+        cleaned = (value or "").strip()
+        if not cleaned:
+            raise serializers.ValidationError("Title is required.")
+        qs = AudiobookSeries.objects.filter(name__iexact=cleaned)
+        if self.instance is not None:
+            qs = qs.exclude(pk=self.instance.pk)
+        if qs.exists():
+            raise serializers.ValidationError("A series with this title already exists.")
+        return cleaned
+
+    def validate(self, attrs):
+        name = attrs.get("name") or (self.instance.name if self.instance else "")
+        raw_slug = attrs.get("slug")
+        if raw_slug is None and self.instance is None:
+            attrs["slug"] = _unique_audiobook_series_slug(name)
+        elif raw_slug is not None:
+            cleaned_slug = raw_slug.strip()
+            if not cleaned_slug:
+                attrs["slug"] = _unique_audiobook_series_slug(name, self.instance)
+            else:
+                qs = AudiobookSeries.objects.filter(slug=cleaned_slug)
+                if self.instance is not None:
+                    qs = qs.exclude(pk=self.instance.pk)
+                if qs.exists():
+                    raise serializers.ValidationError({"slug": "A series with this slug already exists."})
+                attrs["slug"] = cleaned_slug
+        return attrs
+
+    class Meta:
+        model = AudiobookSeries
+        fields = ["id", "title", "slug", "description", "audiobook_count"]
+
+
+class AudiobookTrackAdminSerializer(serializers.ModelSerializer):
+    audio_file = serializers.FileField(required=False)
+    audio_file_name = serializers.SerializerMethodField(read_only=True)
+    has_transcript = serializers.SerializerMethodField(read_only=True)
+    has_cues = serializers.SerializerMethodField(read_only=True)
+    cue_count = serializers.SerializerMethodField(read_only=True)
+    transcript_state = serializers.SerializerMethodField(read_only=True)
+
+    def get_audio_file_name(self, obj):
+        import os
+
+        if not obj.audio_file:
+            return ""
+        return os.path.basename(obj.audio_file.name or "")
+
+    def get_has_transcript(self, obj):
+        return bool(rich_text_has_content(obj.transcript))
+
+    def get_has_cues(self, obj):
+        annotated = getattr(obj, "_has_timed_cues", None)
+        if annotated is not None:
+            return bool(annotated)
+        return obj.transcript_cues.exists()
+
+    def get_cue_count(self, obj):
+        annotated = getattr(obj, "_cue_count", None)
+        if annotated is not None:
+            return int(annotated)
+        return obj.transcript_cues.count()
+
+    def get_transcript_state(self, obj):
+        if self.get_has_cues(obj):
+            return "synced"
+        if self.get_has_transcript(obj):
+            return "plain"
+        return "empty"
+
+    def validate_audio_file(self, value):
+        if value is None:
+            return value
+        return normalize_uploaded_audio(value)
+
+    def validate_title(self, value):
+        cleaned = (value or "").strip()
+        if not cleaned:
+            raise serializers.ValidationError("Track title cannot be blank.")
+        return cleaned
+
+    def update(self, instance, validated_data):
+        uploaded_file = validated_data.get("audio_file")
+        if uploaded_file is not None:
+            raw_bytes = reading_time.read_local_upload_bytes(uploaded_file)
+            validated_data["duration_seconds"] = reading_time.probe_audio_duration_from_bytes(raw_bytes)
+            validated_data["file_size_bytes"] = len(raw_bytes) if raw_bytes else (getattr(uploaded_file, "size", 0) or 0)
+        if "title" in validated_data and not instance.slug:
+            validated_data["slug"] = slugify(validated_data["title"])[:256] or f"track-{instance.pk}"
+        return super().update(instance, validated_data)
+
+    class Meta:
+        model = Audio
+        fields = [
+            "id",
+            "title",
+            "slug",
+            "order",
+            "audio_file",
+            "audio_file_name",
+            "duration_seconds",
+            "file_size_bytes",
+            "has_transcript",
+            "has_cues",
+            "cue_count",
+            "transcript_state",
+            "read_along_offset_ms",
+        ]
+        read_only_fields = [
+            "slug",
+            "duration_seconds",
+            "file_size_bytes",
+            "has_transcript",
+            "has_cues",
+            "cue_count",
+            "transcript_state",
+        ]
+
+
+class AudiobookAdminListSerializer(serializers.ModelSerializer):
+    effective_title = serializers.SerializerMethodField()
+    cover = serializers.SerializerMethodField()
+    author_name = serializers.SerializerMethodField()
+    story = serializers.SerializerMethodField()
+    is_standalone = serializers.SerializerMethodField()
+    series = serializers.SerializerMethodField()
+    track_count = serializers.SerializerMethodField()
+    total_duration_seconds = serializers.SerializerMethodField()
+    missing_duration_count = serializers.SerializerMethodField()
+    status = serializers.SerializerMethodField()
+
+    def get_effective_title(self, obj):
+        return obj.effective_title()
+
+    def get_cover(self, obj):
+        return obj.effective_cover(self.context.get("request"), size=AUDIOBOOK_COVER_SIZE)
+
+    def get_author_name(self, obj):
+        author = obj.effective_author()
+        return author.name if author else ""
+
+    def get_story(self, obj):
+        if not obj.story_id:
+            return None
+        return {"id": obj.story.id, "title": obj.story.title, "slug": obj.story.slug}
+
+    def get_is_standalone(self, obj):
+        return obj.story_id is None
+
+    def get_series(self, obj):
+        if not obj.series_id:
+            return None
+        return {"id": obj.series.id, "title": obj.series.name}
+
+    def get_track_count(self, obj):
+        annotated = getattr(obj, "_track_count", None)
+        if annotated is not None:
+            return int(annotated)
+        return obj.track_count
+
+    def get_total_duration_seconds(self, obj):
+        annotated = getattr(obj, "_total_duration_seconds", None)
+        if annotated is not None:
+            return float(annotated)
+        return obj.total_duration_seconds
+
+    def get_missing_duration_count(self, obj):
+        annotated = getattr(obj, "_missing_duration_count", None)
+        if annotated is not None:
+            return int(annotated)
+        return (
+            obj.tracks.filter(audio_file__isnull=False)
+            .exclude(audio_file="")
+            .filter(Q(duration_seconds__isnull=True) | Q(duration_seconds__lte=0))
+            .count()
+        )
+
+    def get_status(self, obj):
+        return _audiobook_status(obj)
+
+    class Meta:
+        model = Audiobook
+        fields = [
+            "id",
+            "title",
+            "display_title",
+            "effective_title",
+            "slug",
+            "cover",
+            "author_name",
+            "narrator",
+            "story",
+            "is_standalone",
+            "series",
+            "series_order",
+            "track_count",
+            "total_duration_seconds",
+            "missing_duration_count",
+            "is_published",
+            "publish_at",
+            "status",
+            "updated_at",
+        ]
+
+
+class AudiobookAdminDetailSerializer(serializers.ModelSerializer):
+    title = serializers.CharField(max_length=256, required=False, allow_blank=True)
+    slug = serializers.SlugField(max_length=256, required=False, allow_blank=True)
+    story = serializers.PrimaryKeyRelatedField(queryset=Story.objects.all(), required=False, allow_null=True)
+    author = serializers.PrimaryKeyRelatedField(queryset=Author.objects.all(), required=False, allow_null=True)
+    series = serializers.PrimaryKeyRelatedField(queryset=AudiobookSeries.objects.all(), required=False, allow_null=True)
+    genres = serializers.PrimaryKeyRelatedField(queryset=Genre.objects.all(), many=True, required=False)
+    cover_image_file = serializers.ImageField(required=False, allow_null=True)
+    remove_cover = serializers.BooleanField(write_only=True, required=False, default=False)
+    series_order = serializers.IntegerField(required=False, min_value=0, max_value=32767)
+
+    effective_title = serializers.SerializerMethodField(read_only=True)
+    cover = serializers.SerializerMethodField(read_only=True)
+    own_cover = serializers.SerializerMethodField(read_only=True)
+    author_name = serializers.SerializerMethodField(read_only=True)
+    story_detail = serializers.SerializerMethodField(read_only=True)
+    series_detail = serializers.SerializerMethodField(read_only=True)
+    is_standalone = serializers.SerializerMethodField(read_only=True)
+    track_count = serializers.SerializerMethodField(read_only=True)
+    total_duration_seconds = serializers.SerializerMethodField(read_only=True)
+    missing_duration_count = serializers.SerializerMethodField(read_only=True)
+    status = serializers.SerializerMethodField(read_only=True)
+    effective = serializers.SerializerMethodField(read_only=True)
+    tracks = serializers.SerializerMethodField(read_only=True)
+
+    def get_effective_title(self, obj):
+        return obj.effective_title()
+
+    def get_cover(self, obj):
+        return obj.effective_cover(self.context.get("request"), size=AUDIOBOOK_COVER_SIZE)
+
+    def get_own_cover(self, obj):
+        return get_cover_image_url(obj.cover_image_file, None, self.context.get("request"), size=AUDIOBOOK_COVER_SIZE)
+
+    def get_author_name(self, obj):
+        author = obj.effective_author()
+        return author.name if author else ""
+
+    def get_story_detail(self, obj):
+        if not obj.story_id:
+            return None
+        return {"id": obj.story.id, "title": obj.story.title, "slug": obj.story.slug}
+
+    def get_series_detail(self, obj):
+        if not obj.series_id:
+            return None
+        return {"id": obj.series.id, "title": obj.series.name}
+
+    def get_is_standalone(self, obj):
+        return obj.story_id is None
+
+    def get_track_count(self, obj):
+        annotated = getattr(obj, "_track_count", None)
+        if annotated is not None:
+            return int(annotated)
+        return obj.track_count
+
+    def get_total_duration_seconds(self, obj):
+        annotated = getattr(obj, "_total_duration_seconds", None)
+        if annotated is not None:
+            return float(annotated)
+        return obj.total_duration_seconds
+
+    def get_missing_duration_count(self, obj):
+        annotated = getattr(obj, "_missing_duration_count", None)
+        if annotated is not None:
+            return int(annotated)
+        return (
+            obj.tracks.filter(audio_file__isnull=False)
+            .exclude(audio_file="")
+            .filter(Q(duration_seconds__isnull=True) | Q(duration_seconds__lte=0))
+            .count()
+        )
+
+    def get_status(self, obj):
+        return _audiobook_status(obj)
+
+    def get_effective(self, obj):
+        author = obj.effective_author()
+        genres = obj.effective_genres()
+        return {
+            "title": obj.effective_title(),
+            "author": {"id": author.id, "name": author.name} if author else None,
+            "author_name": author.name if author else "",
+            "language": obj.effective_language(),
+            "about": obj.effective_about(),
+            "genres": [{"id": g.id, "name": g.name} for g in genres],
+            "cover": obj.effective_cover(self.context.get("request"), size=AUDIOBOOK_COVER_SIZE),
+        }
+
+    def get_tracks(self, obj):
+        tracks = obj.tracks.all().order_by("order", "id")
+        return AudiobookTrackAdminSerializer(tracks, many=True, context=self.context).data
+
+    def validate(self, attrs):
+        story = attrs.get("story", getattr(self.instance, "story", None))
+        title = attrs.get("title", getattr(self.instance, "title", ""))
+        title = (title or "").strip()
+
+        errors = {}
+
+        if not title:
+            if story is not None:
+                title = story.title
+            else:
+                errors["title"] = "Title is required for standalone audiobooks."
+        attrs["title"] = title
+
+        if story is None:
+            author = attrs.get("author", getattr(self.instance, "author", None))
+            language = (attrs.get("language", getattr(self.instance, "language", "")) or "").strip()
+            about = (attrs.get("about", getattr(self.instance, "about", "")) or "").strip()
+            if author is None:
+                errors["author"] = "Author is required when not linked to a story."
+            if not language:
+                errors["language"] = "Language is required when not linked to a story."
+            if not about:
+                errors["about"] = "About is required when not linked to a story."
+
+        raw_slug = attrs.get("slug")
+        if raw_slug is None and self.instance is None:
+            seed = title or (story.slug if story is not None else "audiobook")
+            attrs["slug"] = _unique_audiobook_slug_for_admin(seed)
+        elif raw_slug is not None:
+            cleaned_slug = raw_slug.strip()
+            if not cleaned_slug:
+                seed = title or (story.slug if story is not None else "audiobook")
+                attrs["slug"] = _unique_audiobook_slug_for_admin(seed, self.instance)
+            else:
+                qs = Audiobook.objects.filter(slug=cleaned_slug)
+                if self.instance is not None:
+                    qs = qs.exclude(pk=self.instance.pk)
+                if qs.exists():
+                    errors["slug"] = "An audiobook with this slug already exists."
+                else:
+                    attrs["slug"] = cleaned_slug
+
+        if errors:
+            raise serializers.ValidationError(errors)
+        return attrs
+
+    def create(self, validated_data):
+        validated_data.pop("remove_cover", False)
+        genres = validated_data.pop("genres", None)
+        instance = super().create(validated_data)
+        if genres is not None:
+            instance.genres.set(genres)
+        return instance
+
+    def update(self, instance, validated_data):
+        remove_cover = validated_data.pop("remove_cover", False)
+        genres = validated_data.pop("genres", None)
+        if remove_cover and "cover_image_file" not in validated_data:
+            if instance.cover_image_file:
+                instance.cover_image_file.delete(save=False)
+            instance.cover_image_file = None
+        instance = super().update(instance, validated_data)
+        if genres is not None:
+            instance.genres.set(genres)
+        return instance
+
+    class Meta:
+        model = Audiobook
+        fields = [
+            "id",
+            "title",
+            "display_title",
+            "effective_title",
+            "slug",
+            "story",
+            "story_detail",
+            "is_standalone",
+            "author",
+            "author_name",
+            "narrator",
+            "language",
+            "about",
+            "genres",
+            "series",
+            "series_detail",
+            "series_order",
+            "cover_image_file",
+            "remove_cover",
+            "own_cover",
+            "cover",
+            "is_published",
+            "publish_at",
+            "status",
+            "track_count",
+            "total_duration_seconds",
+            "missing_duration_count",
+            "effective",
+            "tracks",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["created_at", "updated_at"]

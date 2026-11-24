@@ -501,7 +501,7 @@ def build_needs_attention():
             distinct=True,
         ),
         missing_cover=Count("id", filter=published & no_cover, distinct=True),
-        missing_audio=Count("id", filter=published & Q(audios__isnull=True), distinct=True),
+        missing_audio=Count("id", filter=published & Q(audiobooks__isnull=True), distinct=True),
     )
     job_cutoff = now - timedelta(days=FAILED_JOB_WINDOW_DAYS)
     candidates = [
@@ -548,9 +548,12 @@ def build_needs_attention():
 
 
 def build_catalog():
+    from .models import Audiobook
+
     return {
         "stories": Story.objects.count(),
         "chapters": Chapter.objects.count(),
+        "audiobooks": Audiobook.objects.count(),
         "audios": Audio.objects.count(),
         "videos": Video.objects.count(),
         "users": User.objects.count(),

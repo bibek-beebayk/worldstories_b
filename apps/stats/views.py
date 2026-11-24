@@ -1,6 +1,9 @@
+import logging
 from django.db.models import Q
 from django.shortcuts import get_object_or_404
 from rest_framework.views import APIView
+
+logger = logging.getLogger(__name__)
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework import status
@@ -9,7 +12,7 @@ from rest_framework.throttling import SimpleRateThrottle
 from apps.stats.achievements import evaluate as evaluate_achievements, serialize_earned
 from apps.stats.completion import record_completion_if_finished
 from apps.story.api import is_untracked_request
-from apps.story.models import Blog, Story, Video, published_story_q
+from apps.story.models import Audiobook, Blog, Story, Video, published_story_q
 from apps.stats.models import (
     AnalyticsEvent,
     ReadingProgress,
@@ -27,6 +30,7 @@ from apps.stats.serializers import (
     ReadingProgressWriteSerializer,
     AudioReadingProgressSerializer,
     AudioReadingProgressWriteSerializer,
+    AudiobookProgressWriteSerializer,
     VideoWatchProgressSerializer,
     VideoProgressWriteSerializer,
     VideoWatchProgressWriteSerializer,
@@ -176,31 +180,80 @@ class ReadingProgressAPIView(APIView):
 
 
 class AudioReadingProgressAPIView(APIView):
+    """Deprecated compatibility wrapper around AudiobookProgressAPIView.
+
+    Resolves the story's first published audiobook and delegates to the
+    audiobook-keyed progress logic while logging a deprecation warning.
+    """
+
     permission_classes = [IsAuthenticated]
 
-    def _build_progress_payload(self, request, story, progress):
-        audio_progress_qs = AudioReadingProgress.objects.filter(
-            user=request.user, story=story
-        ).select_related("audio")
+    def _resolve_audiobook(self, request, story_slug):
+        logger.warning(
+            "Deprecated story-keyed audio progress endpoint called: %s",
+            request.path,
+        )
+        story = get_object_or_404(Story.objects.published(), slug=story_slug)
+        audiobook = (
+            Audiobook.objects.published()
+            .filter(story=story)
+            .order_by("id")
+            .first()
+        )
+        return audiobook
+
+    def get(self, request, story_slug):
+        audiobook = self._resolve_audiobook(request, story_slug)
+        if audiobook is None:
+            return Response({"detail": "Progress not found."}, status=status.HTTP_404_NOT_FOUND)
+        return AudiobookProgressAPIView().get(request, audiobook.slug)
+
+    def put(self, request, story_slug):
+        audiobook = self._resolve_audiobook(request, story_slug)
+        if audiobook is None:
+            return Response({"detail": "Audiobook not found."}, status=status.HTTP_404_NOT_FOUND)
+        return AudiobookProgressAPIView().put(request, audiobook.slug)
+
+
+class AudiobookProgressAPIView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def _collect_rows(self, user, audiobook):
+        """Return audiobook-keyed progress rows for this user and audiobook."""
+        track_ids = set(audiobook.tracks.values_list("id", flat=True))
+        if not track_ids:
+            return []
+        return list(
+            AudioReadingProgress.objects.filter(
+                user=user,
+                audiobook=audiobook,
+                audio_id__in=track_ids,
+            )
+            .select_related("audio")
+            .order_by("-updated_at")
+        )
+
+    def _build_progress_payload(self, audiobook, rows, latest):
         audio_progress_map = {
             item.audio.slug: {
+                "audio_id": item.audio_id,
                 "progress": max(0.0, min(1.0, item.progress)),
                 "position_seconds": max(0.0, item.position_seconds),
                 "duration_seconds": max(0.0, item.duration_seconds),
             }
-            for item in audio_progress_qs
+            for item in rows
             if item.audio and item.audio.slug
         }
 
-        total_audios = story.audios.count()
+        total_tracks = audiobook.tracks.count()
         overall_progress = 0.0
-        if total_audios > 0:
+        if total_tracks > 0:
             overall_progress = sum(
                 item["progress"] for item in audio_progress_map.values()
-            ) / total_audios
+            ) / total_tracks
 
         serializer = AudioReadingProgressSerializer(
-            progress,
+            latest,
             context={
                 "audio_progress_map": audio_progress_map,
                 "overall_progress": round(overall_progress, 4),
@@ -208,43 +261,41 @@ class AudioReadingProgressAPIView(APIView):
         )
         return serializer.data
 
-    def get(self, request, story_slug):
-        story = get_object_or_404(Story.objects.published(), slug=story_slug)
-        progress = AudioReadingProgress.objects.filter(
-            user=request.user, story=story
-        ).order_by("-updated_at").first()
-        if not progress:
+    def get(self, request, audiobook_slug):
+        audiobook = get_object_or_404(Audiobook.objects.published(), slug=audiobook_slug)
+        rows = self._collect_rows(request.user, audiobook)
+        if not rows:
             return Response({"detail": "Progress not found."}, status=status.HTTP_404_NOT_FOUND)
-        return Response(self._build_progress_payload(request, story, progress))
+        return Response(self._build_progress_payload(audiobook, rows, rows[0]))
 
-    def put(self, request, story_slug):
-        story = get_object_or_404(Story.objects.published(), slug=story_slug)
-        serializer = AudioReadingProgressWriteSerializer(
+    def put(self, request, audiobook_slug):
+        audiobook = get_object_or_404(Audiobook.objects.published(), slug=audiobook_slug)
+        serializer = AudiobookProgressWriteSerializer(
             data=request.data,
-            context={"story": story},
+            context={"audiobook": audiobook},
         )
         serializer.is_valid(raise_exception=True)
+        audio = serializer.validated_data["audio"]
 
-        audio = serializer.validated_data.get("audio")
-        if not audio:
-            return Response(
-                {"detail": "audio_slug is required."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
+        # Do not write legacy `story` on new rows; `audiobook` is the canonical key.
         progress_obj, _ = AudioReadingProgress.objects.get_or_create(
             user=request.user,
-            story=story,
             audio=audio,
+            defaults={"audiobook": audiobook},
         )
+        progress_obj.audiobook = audiobook
         current_progress = serializer.validated_data["progress"]
         progress_obj.progress = max(progress_obj.progress, current_progress)
         progress_obj.position_seconds = serializer.validated_data.get("position_seconds", 0.0)
         progress_obj.duration_seconds = serializer.validated_data.get("duration_seconds", 0.0)
         progress_obj.save()
 
-        payload = self._build_progress_payload(request, story, progress_obj)
-        annotate_completion(payload, record_completion_if_finished(request.user, story))
+        rows = self._collect_rows(request.user, audiobook)
+        payload = self._build_progress_payload(audiobook, rows, progress_obj)
+        if audiobook.story_id is not None:
+            annotate_completion(
+                payload, record_completion_if_finished(request.user, audiobook.story)
+            )
         return Response(payload)
 
 

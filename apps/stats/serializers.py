@@ -112,6 +112,7 @@ class AudioProgressSerializer(serializers.Serializer):
 
 
 class AudioReadingProgressSerializer(serializers.ModelSerializer):
+    audio_id = serializers.IntegerField(read_only=True)
     audio_slug = serializers.SerializerMethodField()
     overall_progress = serializers.SerializerMethodField()
     audio_progresses = serializers.SerializerMethodField()
@@ -119,6 +120,7 @@ class AudioReadingProgressSerializer(serializers.ModelSerializer):
     class Meta:
         model = AudioReadingProgress
         fields = [
+            "audio_id",
             "audio_slug",
             "progress",
             "position_seconds",
@@ -138,6 +140,7 @@ class AudioReadingProgressSerializer(serializers.ModelSerializer):
         audio_progress_map = self.context.get("audio_progress_map", {})
         return [
             {
+                "audio_id": values.get("audio_id"),
                 "audio_slug": audio_slug,
                 "progress": values["progress"],
                 "position_seconds": values["position_seconds"],
@@ -166,6 +169,41 @@ class AudioReadingProgressWriteSerializer(serializers.Serializer):
                 raise serializers.ValidationError(
                     {"audio_slug": "Invalid audio for this story."}
                 )
+        attrs["audio"] = audio
+        return attrs
+
+
+class AudiobookProgressWriteSerializer(serializers.Serializer):
+    audio_id = serializers.IntegerField(required=False, allow_null=True)
+    audio_slug = serializers.CharField(required=False, allow_blank=True)
+    progress = serializers.FloatField(min_value=0.0, max_value=1.0)
+    position_seconds = serializers.FloatField(required=False, min_value=0.0, default=0.0)
+    duration_seconds = serializers.FloatField(required=False, min_value=0.0, default=0.0)
+
+    def validate_audio_slug(self, value):
+        return value.strip()
+
+    def validate(self, attrs):
+        audiobook = self.context["audiobook"]
+        audio_id = attrs.get("audio_id")
+        audio_slug = attrs.get("audio_slug")
+        audio = None
+        if audio_id:
+            audio = Audio.objects.filter(audiobook=audiobook, pk=audio_id).first()
+            if not audio:
+                raise serializers.ValidationError(
+                    {"audio_id": "Invalid track for this audiobook."}
+                )
+        elif audio_slug:
+            audio = Audio.objects.filter(audiobook=audiobook, slug=audio_slug).first()
+            if not audio:
+                raise serializers.ValidationError(
+                    {"audio_slug": "Invalid track for this audiobook."}
+                )
+        else:
+            raise serializers.ValidationError(
+                {"audio_slug": "audio_id or audio_slug is required."}
+            )
         attrs["audio"] = audio
         return attrs
 

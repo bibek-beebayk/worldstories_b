@@ -674,8 +674,14 @@ def build_user_timeline(user):
         chapter_progress[story_id] = chapter_progress.get(story_id, 0) + progress
     for story_id, progress in ReadingProgress.objects.filter(user=user).values_list("story_id", "progress"):
         chapter_progress.setdefault(story_id, progress * max(chapter_counts.get(story_id, 1), 1))
-    audio_counts = dict(Story.objects.filter(pk__in=story_ids).annotate(n=Count("audios")).values_list("id", "n"))
-    for story_id, progress in AudioReadingProgress.objects.filter(user=user).values_list("story_id", "progress"):
+    audio_counts = dict(
+        Story.objects.filter(pk__in=story_ids)
+        .annotate(n=Count("audiobooks__tracks", distinct=True))
+        .values_list("id", "n")
+    )
+    for story_id, progress in AudioReadingProgress.objects.filter(
+        user=user, audiobook__story_id__isnull=False
+    ).values_list("audiobook__story_id", "progress"):
         audio_progress[story_id] = audio_progress.get(story_id, 0) + progress
     for video_id, progress in VideoWatchProgress.objects.filter(user=user).values_list("video_id", "progress"):
         video_progress[video_id] = progress

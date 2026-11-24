@@ -23,11 +23,23 @@ from apps.users import api as users_api
 from apps.pages import api as pages_api
 from apps.feedback import api as feedback_api
 from apps.pages.models import Page
-from apps.story.models import Author, Story, Blog, Tag, Theme, Genre, Category, published_story_q
+from apps.story.models import (
+    Audiobook,
+    Author,
+    Story,
+    Blog,
+    Tag,
+    Theme,
+    Genre,
+    Category,
+    published_story_q,
+)
 
 router = DefaultRouter()
 
 router.register("stories", story_api.StoryViewSet, basename="story")
+router.register("audiobooks", story_api.AudiobookViewSet, basename="audiobook")
+router.register("audiobook-series", story_api.AudiobookSeriesViewSet, basename="audiobook-series")
 router.register("videos", story_api.VideoViewSet, basename="video")
 router.register("video-types", story_api.VideoTypeViewSet, basename="video-type")
 router.register("video-series", story_api.VideoSeriesViewSet, basename="video-series")
@@ -43,6 +55,8 @@ router.register("admin/blog-topics", story_api.BlogTopicAdminViewSet, basename="
 router.register("admin/stories", story_api.StoryAdminViewSet, basename="admin-story")
 router.register("admin/chapters", story_api.ChapterAdminViewSet, basename="admin-chapter")
 router.register("admin/audios", story_api.AudioAdminViewSet, basename="admin-audio")
+router.register("admin/audiobooks", story_api.AudiobookAdminViewSet, basename="admin-audiobook")
+router.register("admin/audiobook-series", story_api.AudiobookSeriesAdminViewSet, basename="admin-audiobook-series")
 router.register("admin/videos", story_api.VideoAdminViewSet, basename="admin-video")
 router.register("admin/submissions", story_api.SubmissionAdminViewSet, basename="admin-submission")
 router.register("admin/authors", story_api.AuthorAdminViewSet, basename="admin-author")
@@ -199,6 +213,35 @@ def sitemap(request):
     for category in categories.iterator():
         entries.append(
             f"<url><loc>{escape(f'{site_url}/category/{category.slug}')}</loc></url>"
+        )
+
+    from django.db.models import Exists, OuterRef
+    from apps.story.models import Audio
+
+    has_playable_track = Exists(
+        Audio.objects.filter(
+            audiobook=OuterRef("pk"),
+            audio_file__isnull=False,
+        ).exclude(audio_file="")
+    )
+    seen_audiobook_slugs = set()
+    audiobooks = (
+        Audiobook.objects.published()
+        .filter(has_playable_track)
+        .only("slug", "updated_at")
+        .order_by("id")
+    )
+    for audiobook in audiobooks.iterator(chunk_size=1000):
+        if not audiobook.slug or audiobook.slug in seen_audiobook_slugs:
+            continue
+        seen_audiobook_slugs.add(audiobook.slug)
+        lastmod = (
+            f"<lastmod>{audiobook.updated_at.date().isoformat()}</lastmod>"
+            if audiobook.updated_at
+            else ""
+        )
+        entries.append(
+            f"<url><loc>{escape(f'{site_url}/listen/{audiobook.slug}')}</loc>{lastmod}</url>"
         )
 
     xml = (
@@ -390,6 +433,11 @@ urlpatterns = [
         "api/reading-progress/<slug:story_slug>/",
         stats_views.ReadingProgressAPIView.as_view(),
         name="reading-progress",
+    ),
+    path(
+        "api/audio-progress/audiobook/<slug:audiobook_slug>/",
+        stats_views.AudiobookProgressAPIView.as_view(),
+        name="audiobook-reading-progress",
     ),
     path(
         "api/audio-progress/<slug:story_slug>/",

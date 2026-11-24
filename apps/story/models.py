@@ -1259,8 +1259,189 @@ class PromptSettings(SingletonModel):
         return "AI Generation Prompt Settings"
 
 
+class AudiobookSeries(models.Model):
+    name = models.CharField(max_length=120, unique=True)
+    slug = models.SlugField(max_length=140, unique=True)
+    description = models.TextField(blank=True, default="")
+    order = models.PositiveSmallIntegerField(default=0)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ["order", "name"]
+        verbose_name_plural = "audiobook series"
+
+    def __str__(self):
+        return self.name
+
+
+def audiobook_published_q(prefix=""):
+    """Reusable Q matching published Audiobooks: is_published=True, publish_at
+    null or <= now, and either standalone (story is null) or linked to a
+    published story."""
+    now = timezone.now()
+    p = f"{prefix}__" if prefix else ""
+    return (
+        models.Q(**{f"{p}is_published": True})
+        & (models.Q(**{f"{p}publish_at__isnull": True}) | models.Q(**{f"{p}publish_at__lte": now}))
+        & (models.Q(**{f"{p}story__isnull": True}) | published_story_q(f"{p}story"))
+    )
+
+
+class AudiobookQuerySet(models.QuerySet):
+    def published(self):
+        return self.filter(audiobook_published_q())
+
+
+class Audiobook(models.Model):
+    story = models.ForeignKey(
+        Story,
+        null=True,
+        blank=True,
+        on_delete=models.CASCADE,
+        related_name="audiobooks",
+    )
+    title = models.CharField(max_length=256)
+    display_title = models.CharField(max_length=256, blank=True, default="")
+    slug = models.SlugField(max_length=256, unique=True)
+    author = models.ForeignKey(
+        Author,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="audiobooks",
+    )
+    narrator = models.CharField(max_length=120, blank=True, default="")
+    # Blank means "use the linked story's language, else English".
+    language = models.CharField(
+        max_length=10,
+        choices=LANGUAGE_CHOICES,
+        blank=True,
+        default="",
+        db_index=True,
+    )
+    about = models.TextField(blank=True, default="")
+    genres = models.ManyToManyField(Genre, blank=True, related_name="audiobooks")
+    series = models.ForeignKey(
+        AudiobookSeries,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="audiobooks",
+    )
+    series_order = models.PositiveSmallIntegerField(default=0)
+    cover_image_file = VersatileImageField(upload_to="audiobook_covers/", blank=True, null=True)
+    is_published = models.BooleanField(default=True)
+    publish_at = models.DateTimeField(null=True, blank=True)
+    # Cached sum of track durations (seconds); null when any track with a file
+    # lacks a duration, or when there are no tracks.
+    total_duration_seconds = models.FloatField(null=True, blank=True, default=None, editable=False)
+    track_count = models.PositiveSmallIntegerField(default=0, editable=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    objects = AudiobookQuerySet.as_manager()
+
+    # Keep in sync with AUDIOBOOK_COVER_SIZE in apps/story/serializers.py — see
+    # the matching comment on Story.SIZES / Video.SIZES for why this exists.
+    SIZES = {
+        "cover_image_file": {
+            "card": "thumbnail__1280x1280",
+        }
+    }
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+        indexes = [
+            models.Index(fields=["is_published", "publish_at"]),
+            models.Index(fields=["series", "series_order"]),
+        ]
+
+    def __str__(self):
+        return self.effective_title() or self.slug
+
+    def effective_title(self):
+        if (self.display_title or "").strip():
+            return self.display_title.strip()
+        if (self.title or "").strip():
+            return self.title.strip()
+        if self.story_id:
+            return self.story.title
+        return ""
+
+    def effective_author(self):
+        if self.author_id:
+            return self.author
+        if self.story_id and self.story.author_id:
+            return self.story.author
+        return None
+
+    def effective_language(self):
+        if (self.language or "").strip():
+            return self.language.strip()
+        if self.story_id and (self.story.language or "").strip():
+            return self.story.language.strip()
+        return "en"
+
+    def effective_about(self):
+        if (self.about or "").strip():
+            return self.about.strip()
+        if self.story_id and (self.story.about or "").strip():
+            return self.story.about.strip()
+        return ""
+
+    def effective_genres(self):
+        cache = getattr(self, "_prefetched_objects_cache", None)
+        own = list(cache["genres"]) if cache and "genres" in cache else list(self.genres.all())
+        if own:
+            return own
+        if self.story_id:
+            story_cache = getattr(self.story, "_prefetched_objects_cache", None)
+            if story_cache and "genres" in story_cache:
+                return list(story_cache["genres"])
+            return list(self.story.genres.all())
+        return []
+
+    def effective_cover(self, request=None, size="1280x1280", story_size="480x640"):
+        from core.libs.images import get_cover_image_url
+
+        own_url = get_cover_image_url(self.cover_image_file, None, request, size=size)
+        if own_url:
+            return own_url
+        if self.story_id:
+            return get_cover_image_url(
+                self.story.cover_image_file,
+                self.story.cover_image,
+                request,
+                size=story_size,
+            )
+        return None
+
+    def refresh_cache(self):
+        """Recompute total_duration_seconds and track_count from tracks that
+        have an audio file. Total is None if there are no tracks or any track
+        with a file has a null duration_seconds."""
+        durations = list(
+            self.tracks.filter(audio_file__isnull=False)
+            .exclude(audio_file="")
+            .values_list("duration_seconds", flat=True)
+        )
+        self.track_count = len(durations)
+        if not durations or any(d is None for d in durations):
+            self.total_duration_seconds = None
+        else:
+            self.total_duration_seconds = float(sum(durations))
+        self.save(update_fields=["total_duration_seconds", "track_count"])
+
+
 class Audio(models.Model):
-    story = models.ForeignKey(Story, on_delete=models.CASCADE, related_name="audios")
+    story = models.ForeignKey(Story, on_delete=models.CASCADE, related_name="audios", null=True, blank=True)
+    audiobook = models.ForeignKey(
+        Audiobook,
+        on_delete=models.CASCADE,
+        related_name="tracks",
+        null=True,
+        blank=True,
+    )
     title = models.CharField(max_length=256)
     slug = models.SlugField(max_length=256, null=True)
     audio_file = models.FileField(
@@ -1295,11 +1476,20 @@ class Audio(models.Model):
     )
 
     def __str__(self):
-        return f"Audio for {self.story.title} uploaded at {self.uploaded_at}"
+        if self.story_id is not None:
+            return f"Audio for {self.story.title} uploaded at {self.uploaded_at}"
+        if self.audiobook_id is not None:
+            return f"Audio for {self.audiobook.effective_title()}: {self.title}"
+        return f"Audio: {self.title}"
 
     class Meta:
-        unique_together = ("story", "order")
         ordering = ["order"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["audiobook", "order"],
+                name="story_audio_audiobook_order_uniq",
+            ),
+        ]
 
 
 class AudioTranscriptCue(models.Model):

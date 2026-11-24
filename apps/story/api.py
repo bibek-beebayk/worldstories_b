@@ -9,7 +9,7 @@ from rest_framework.views import APIView
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db.models import Case, Sum, Avg, Count, Exists, F, FloatField, IntegerField, Min, OuterRef, Prefetch, Subquery, When, Value, CharField
 from django.db.models import BooleanField, ExpressionWrapper, Max, Q
-from django.db.models.functions import Coalesce
+from django.db.models.functions import Coalesce, Lower, NullIf
 from django.http import FileResponse, Http404, HttpResponse, StreamingHttpResponse
 from django.db import transaction
 from django.shortcuts import get_object_or_404
@@ -52,7 +52,10 @@ from .models import (
     Story,
     Chapter,
     Audio,
+    Audiobook,
+    AudiobookSeries,
     AudioTranscriptCue,
+    audiobook_published_q,
     Video,
     Author,
     Review,
@@ -143,6 +146,9 @@ from .serializers import (
     StoryDetailSerializer,
     ChapterSerializer,
     AudioSerializer,
+    AudiobookDetailSerializer,
+    AudiobookSeriesSerializer,
+    PublicAudiobookSerializer,
     AudioTranscriptCueSerializer,
     ReadAlongSerializer,
     VideoSerializer,
@@ -155,6 +161,10 @@ from .serializers import (
     StoryAdminSerializer,
     ChapterAdminSerializer,
     AudioAdminSerializer,
+    AudiobookSeriesAdminSerializer,
+    AudiobookTrackAdminSerializer,
+    AudiobookAdminListSerializer,
+    AudiobookAdminDetailSerializer,
     VideoAdminSerializer,
     SubmissionAdminSerializer,
     EpubImportJobSerializer,
@@ -613,6 +623,457 @@ class VideoSeriesViewSet(ReadOnlyModelViewSet):
     queryset = VideoSeries.objects.filter(is_active=True).order_by("order", "name")
 
 
+def _stream_audio_file_response(request, audio):
+    """Serve an Audio file with the byte-range semantics required by Safari."""
+    file_size = audio.audio_file.size
+    file_name = os.path.basename(audio.audio_file.name)
+    safe_file_name = file_name.replace('"', "")
+    content_type = mimetypes.guess_type(file_name)[0] or "audio/mpeg"
+    range_header = request.headers.get("Range")
+
+    if range_header:
+        match = AUDIO_RANGE_PATTERN.fullmatch(range_header.strip())
+        if not match:
+            response = HttpResponse(status=416)
+            response["Content-Range"] = f"bytes */{file_size}"
+            return response
+
+        start_text, end_text = match.groups()
+        if not start_text:
+            suffix_length = int(end_text or 0)
+            if suffix_length <= 0:
+                response = HttpResponse(status=416)
+                response["Content-Range"] = f"bytes */{file_size}"
+                return response
+            start = max(0, file_size - suffix_length)
+            end = file_size - 1
+        else:
+            start = int(start_text)
+            end = min(int(end_text), file_size - 1) if end_text else file_size - 1
+
+        if start >= file_size or start > end:
+            response = HttpResponse(status=416)
+            response["Content-Range"] = f"bytes */{file_size}"
+            return response
+
+        length = end - start + 1
+        remote_object = open_s3_audio_stream(audio.audio_file, start, end)
+        if remote_object is not None:
+            response = StreamingHttpResponse(
+                iter_streaming_body(remote_object["Body"]),
+                status=206,
+                content_type=remote_object.get("ContentType") or content_type,
+            )
+        else:
+            file_obj = audio.audio_file.open("rb")
+            file_obj.seek(start)
+            response = StreamingHttpResponse(
+                iter_file_range(file_obj, length),
+                status=206,
+                content_type=content_type,
+            )
+        response["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+        response["Content-Length"] = str(length)
+    else:
+        remote_object = open_s3_audio_stream(audio.audio_file)
+        if remote_object is not None:
+            response = StreamingHttpResponse(
+                iter_streaming_body(remote_object["Body"]),
+                content_type=remote_object.get("ContentType") or content_type,
+            )
+        else:
+            file_obj = audio.audio_file.open("rb")
+            response = FileResponse(file_obj, content_type=content_type)
+        response["Content-Length"] = str(file_size)
+
+    response["Accept-Ranges"] = "bytes"
+    response["Content-Disposition"] = f'inline; filename="{safe_file_name}"'
+    response["Cache-Control"] = "public, max-age=3600"
+    return response
+
+
+class AudiobookSeriesViewSet(ReadOnlyModelViewSet):
+    serializer_class = AudiobookSeriesSerializer
+    pagination_class = None
+    queryset = AudiobookSeries.objects.filter(is_active=True).order_by("order", "name")
+
+
+class AudiobookViewSet(ReadOnlyModelViewSet):
+    """Public Audiobooks catalogue: standalone audiobooks plus audiobooks of
+    published stories that have at least one playable audio track."""
+
+    lookup_field = "slug"
+    http_method_names = ["get", "head", "options"]
+    permission_classes = [AllowAny]
+    pagination_class = CataloguePagination
+
+    def get_serializer_class(self):
+        if self.action == "retrieve":
+            return AudiobookDetailSerializer
+        return PublicAudiobookSerializer
+
+    def _base_queryset(self):
+        has_playable_track = Exists(
+            Audio.objects.filter(
+                audiobook=OuterRef("pk"),
+                audio_file__isnull=False,
+            ).exclude(audio_file="")
+        )
+        return (
+            Audiobook.objects.published()
+            .filter(has_playable_track)
+            .select_related("story", "story__author", "author", "series")
+            .prefetch_related(
+                "genres",
+                "story__genres",
+                Prefetch(
+                    "tracks",
+                    queryset=Audio.objects.annotate(
+                        _has_timed_cues=Exists(
+                            AudioTranscriptCue.objects.filter(audio=OuterRef("pk"))
+                        )
+                    ).order_by("order"),
+                ),
+            )
+        )
+
+    @staticmethod
+    def _order_by_popular(queryset):
+        return queryset.annotate(
+            _ab_listeners=Count("audio_reading_progress__user", distinct=True),
+            _pop_views=Coalesce("story__views", Value(0)),
+            _pop_rating=Coalesce("story__rating", Value(0.0), output_field=FloatField()),
+        ).order_by("-_ab_listeners", "-_pop_views", "-_pop_rating", "-created_at", "-id")
+
+    def get_queryset(self):
+        queryset = self._base_queryset().order_by("-created_at", "-id")
+        if self.action != "list":
+            return queryset
+
+        params = self.request.query_params
+        q = (params.get("q") or "").strip()
+        if q:
+            queryset = queryset.filter(
+                Q(title__icontains=q)
+                | Q(display_title__icontains=q)
+                | Q(narrator__icontains=q)
+                | Q(author__name__icontains=q)
+                | Q(story__author__name__icontains=q)
+                | Q(story__title__icontains=q)
+            ).distinct()
+
+        genre = (params.get("genre") or "").strip()
+        if genre and genre.lower() != "all":
+            has_own_genres = Exists(
+                Audiobook.genres.through.objects.filter(audiobook_id=OuterRef("pk"))
+            )
+            if genre.isdigit():
+                gid = int(genre)
+                queryset = queryset.filter(
+                    Q(genres__id=gid) | (~has_own_genres & Q(story__genres__id=gid))
+                ).distinct()
+            else:
+                queryset = queryset.filter(
+                    Q(genres__slug=genre) | (~has_own_genres & Q(story__genres__slug=genre))
+                ).distinct()
+
+        language = (params.get("language") or "").strip().lower()
+        if language and language != "all":
+            lang_q = Q(language=language) | (Q(language="") & Q(story__language=language))
+            if language == "en":
+                lang_q |= Q(language="", story__isnull=True)
+            queryset = queryset.filter(lang_q)
+
+        series = (params.get("series") or "").strip()
+        if series:
+            queryset = queryset.filter(series__slug=series)
+
+        narrator = (params.get("narrator") or "").strip()
+        if narrator:
+            queryset = queryset.filter(narrator__icontains=narrator)
+
+        if (params.get("has_read_along") or "").strip().lower() == "true":
+            has_ra = Exists(
+                Audio.objects.filter(
+                    audiobook=OuterRef("pk"),
+                    audio_file__isnull=False,
+                    transcript__isnull=False,
+                )
+                .exclude(audio_file="")
+                .exclude(transcript="")
+            )
+            queryset = queryset.filter(has_ra)
+
+        audio_length = (params.get("audio_length") or "").strip().lower()
+        if audio_length == "short":
+            queryset = queryset.filter(
+                total_duration_seconds__isnull=False,
+                total_duration_seconds__gt=0,
+                total_duration_seconds__lt=1800,
+            )
+        elif audio_length == "medium":
+            queryset = queryset.filter(
+                total_duration_seconds__isnull=False,
+                total_duration_seconds__gte=1800,
+                total_duration_seconds__lt=7200,
+            )
+        elif audio_length == "long":
+            queryset = queryset.filter(
+                total_duration_seconds__isnull=False,
+                total_duration_seconds__gte=7200,
+                total_duration_seconds__lt=18000,
+            )
+        elif audio_length == "epic":
+            queryset = queryset.filter(
+                total_duration_seconds__isnull=False,
+                total_duration_seconds__gte=18000,
+            )
+
+        max_minutes = (params.get("max_minutes") or "").strip()
+        if max_minutes.isdigit():
+            queryset = queryset.filter(
+                total_duration_seconds__isnull=False,
+                total_duration_seconds__gt=0,
+                total_duration_seconds__lte=int(max_minutes) * 60,
+            )
+
+        sort = (params.get("sort") or "newest").strip().lower()
+        if sort == "title":
+            queryset = queryset.annotate(
+                _eff_title=Lower(
+                    Coalesce(
+                        NullIf("display_title", Value("")),
+                        NullIf("title", Value("")),
+                        F("story__title"),
+                        Value(""),
+                    )
+                )
+            ).order_by("_eff_title", "id")
+        elif sort == "shortest":
+            queryset = queryset.order_by(F("total_duration_seconds").asc(nulls_last=True), "id")
+        elif sort == "longest":
+            queryset = queryset.order_by(F("total_duration_seconds").desc(nulls_last=True), "id")
+        elif sort == "popular":
+            queryset = self._order_by_popular(queryset)
+        else:
+            queryset = queryset.order_by("-created_at", "-id")
+
+        return queryset
+
+    @action(detail=False, methods=["get"])
+    def overview(self, request):
+        cache_key = "audiobook-overview-v1"
+        anonymous = cache.get(cache_key)
+        ctx = self.get_serializer_context()
+        if anonymous is None:
+            base = self._base_queryset()
+            has_cover_q = (
+                (Q(cover_image_file__isnull=False) & ~Q(cover_image_file=""))
+                | (Q(story__cover_image_file__isnull=False) & ~Q(story__cover_image_file=""))
+                | (Q(story__cover_image__isnull=False) & ~Q(story__cover_image=""))
+            )
+            featured = self._order_by_popular(base.filter(has_cover_q)).first()
+            shelves = []
+            for series in AudiobookSeries.objects.filter(is_active=True).order_by("order", "name"):
+                items = list(
+                    base.filter(series=series).order_by("series_order", "-created_at", "-id")[:13]
+                )
+                shelves.append(
+                    {
+                        "series": AudiobookSeriesSerializer(series).data,
+                        "audiobooks": PublicAudiobookSerializer(items, many=True, context=ctx).data,
+                    }
+                )
+            anonymous = {
+                "featured": PublicAudiobookSerializer(featured, context=ctx).data if featured else None,
+                "shelves": shelves,
+                "count": base.count(),
+            }
+            cache.set(cache_key, anonymous, 60 * 15)
+
+        continue_listening = []
+        if request.user.is_authenticated:
+            ab_rows = list(
+                AudioReadingProgress.objects.filter(
+                    user=request.user,
+                    audiobook__isnull=False,
+                    progress__gt=0,
+                    progress__lt=1,
+                )
+                .filter(audiobook_published_q("audiobook"))
+                .select_related(
+                    "audio",
+                    "audiobook",
+                    "audiobook__story",
+                    "audiobook__story__author",
+                    "audiobook__author",
+                    "audiobook__series",
+                )
+                .prefetch_related(
+                    "audiobook__genres",
+                    "audiobook__story__genres",
+                    "audiobook__tracks",
+                )
+                .order_by("-updated_at")
+            )
+            seen_audiobooks = set()
+            for row in ab_rows:
+                if row.audiobook_id in seen_audiobooks:
+                    continue
+                seen_audiobooks.add(row.audiobook_id)
+                continue_listening.append(
+                    {
+                        "audiobook": PublicAudiobookSerializer(row.audiobook, context=ctx).data,
+                        "audio_id": row.audio_id,
+                        "track_slug": row.audio.slug if row.audio_id else None,
+                        "track_title": row.audio.title if row.audio_id else None,
+                        "position_seconds": max(0.0, row.position_seconds),
+                        "progress_percent": round(max(0.0, min(row.progress, 1.0)) * 100),
+                        "updated_at": row.updated_at,
+                    }
+                )
+                if len(continue_listening) >= 6:
+                    break
+
+        return Response({**anonymous, "continue_listening": continue_listening})
+
+    @action(detail=False, methods=["get"])
+    def stats(self, request):
+        base = self._base_queryset()
+        count = base.count()
+        total_seconds = base.aggregate(total=Sum("total_duration_seconds")).get("total") or 0
+        unknown_duration_count = base.filter(
+            Q(total_duration_seconds__isnull=True) | Q(total_duration_seconds__lte=0)
+        ).count()
+        return Response(
+            {
+                "count": count,
+                "total_seconds": float(total_seconds),
+                "unknown_duration_count": unknown_duration_count,
+            }
+        )
+
+    @action(
+        detail=True,
+        methods=["get"],
+        url_path=r"read-along/(?P<audio_slug>[^/.]+)",
+    )
+    def read_along(self, request, slug=None, audio_slug=None):
+        audiobook = self.get_object()
+        tracks = list(
+            audiobook.tracks.prefetch_related("transcript_cues").order_by("order", "id")
+        )
+        audio = next((t for t in tracks if t.slug == audio_slug), None)
+        if audio is None:
+            raise Http404("Audio track not found.")
+
+        from .rich_text import sanitize_reader_html
+
+        audio_file_url = None
+        if audio.audio_file:
+            try:
+                audio_file_url = audio.audio_file.url
+            except (AttributeError, ValueError):
+                audio_file_url = None
+            if audio_file_url:
+                audio_file_url = request.build_absolute_uri(audio_file_url)
+
+        stream_url = None
+        if audio.audio_file:
+            stream_path = f"/api/audiobooks/{audiobook.slug}/tracks/{audio.slug}/stream/"
+            stream_url = request.build_absolute_uri(stream_path)
+
+        has_transcript = rich_text_has_content(audio.transcript)
+        transcript_html = sanitize_reader_html(audio.transcript) if has_transcript else ""
+        cue_payload = [
+            {
+                "id": cue.id,
+                "start_seconds": round(cue.start_ms / 1000, 3),
+                "end_seconds": round(cue.end_ms / 1000, 3),
+                "text": cue.text,
+            }
+            for cue in audio.transcript_cues.all()
+        ]
+        synchronized = has_transcript and bool(cue_payload)
+        author = audiobook.effective_author()
+        nav_tracks = [
+            {
+                "id": t.id,
+                "title": t.title,
+                "slug": t.slug,
+                "order": t.order,
+                "has_transcript": rich_text_has_content(t.transcript),
+                "read_along_available": bool(t.audio_file) and rich_text_has_content(t.transcript),
+                "transcript_synchronized": bool(t.transcript_cues.all()),
+            }
+            for t in tracks
+        ]
+        idx = next((i for i, t in enumerate(tracks) if t.id == audio.id), 0)
+        prev_audio = nav_tracks[idx - 1] if idx > 0 else None
+        next_audio = nav_tracks[idx + 1] if idx + 1 < len(nav_tracks) else None
+
+        return Response(
+            {
+                "audiobook": {
+                    "id": audiobook.id,
+                    "title": audiobook.effective_title(),
+                    "slug": audiobook.slug,
+                    "story_slug": audiobook.story.slug if audiobook.story_id else None,
+                    "narrator": audiobook.narrator,
+                    "language": audiobook.effective_language(),
+                    "cover_image": audiobook.effective_cover(request=request, size="1280x1280"),
+                    "author": {"id": author.id, "name": author.name} if author else None,
+                },
+                "story": {
+                    "id": audiobook.story_id or audiobook.id,
+                    "title": audiobook.effective_title(),
+                    "slug": audiobook.slug,
+                    "story_slug": audiobook.story.slug if audiobook.story_id else None,
+                    "language": audiobook.effective_language(),
+                    "story_type": audiobook.story.story_type.name if audiobook.story_id else "Audiobook",
+                    "cover_image": audiobook.effective_cover(request=request, size="1280x1280"),
+                    "author": {"id": author.id, "name": author.name} if author else None,
+                },
+                "audio": {
+                    "id": audio.id,
+                    "title": audio.title,
+                    "slug": audio.slug,
+                    "order": audio.order,
+                    "audio_file": audio_file_url,
+                    "stream_url": stream_url,
+                    "duration_seconds": audio.duration_seconds,
+                    "download_size_bytes": audio.file_size_bytes,
+                    "has_transcript": has_transcript,
+                    "read_along_available": bool(audio.audio_file) and has_transcript,
+                    "transcript_synchronized": synchronized,
+                },
+                "transcript": {
+                    "html": transcript_html,
+                    "cues": cue_payload,
+                    "synchronized": synchronized,
+                    "read_along_offset_ms": audio.read_along_offset_ms,
+                },
+                "navigation": {
+                    "previous": prev_audio,
+                    "next": next_audio,
+                    "audios": nav_tracks,
+                },
+            }
+        )
+
+    @action(
+        detail=True,
+        methods=["get"],
+        url_path=r"tracks/(?P<audio_slug>[^/.]+)/stream",
+    )
+    def stream_track(self, request, slug=None, audio_slug=None):
+        audiobook = self.get_object()
+        audio = get_object_or_404(Audio, audiobook=audiobook, slug=audio_slug)
+        if not audio.audio_file:
+            raise Http404("Audio file not found.")
+        return _stream_audio_file_response(request, audio)
+
+
 class TagViewSet(ReadOnlyModelViewSet):
     """Public tag directory backing /tag/<slug> SEO landing pages. Unpaginated
     like Genre/Category (a small, admin-curated set), unlike AuthorViewSet."""
@@ -842,6 +1303,20 @@ class StoryViewSet(ReadOnlyModelViewSet):
                 Prefetch(
                     "themes",
                     queryset=Theme.objects.annotate(published_stories_count=_published_count("themes")),
+                ),
+                Prefetch(
+                    "audiobooks",
+                    queryset=Audiobook.objects.published()
+                    .filter(
+                        Exists(
+                            Audio.objects.filter(
+                                audiobook=OuterRef("pk"),
+                                audio_file__isnull=False,
+                            ).exclude(audio_file="")
+                        )
+                    )
+                    .order_by("id"),
+                    to_attr="published_audiobooks",
                 ),
             )
         if self.action == "list":
@@ -1492,72 +1967,7 @@ class StoryViewSet(ReadOnlyModelViewSet):
         audio = story.audios.filter(slug=audio_slug).first()
         if not audio or not audio.audio_file:
             return Response({"detail": "Audio file not available."}, status=status.HTTP_404_NOT_FOUND)
-
-        file_size = audio.audio_file.size
-        file_name = os.path.basename(audio.audio_file.name)
-        safe_file_name = file_name.replace('"', "")
-        content_type = mimetypes.guess_type(file_name)[0] or "audio/mpeg"
-        range_header = request.headers.get("Range")
-
-        if range_header:
-            match = AUDIO_RANGE_PATTERN.fullmatch(range_header.strip())
-            if not match:
-                response = HttpResponse(status=416)
-                response["Content-Range"] = f"bytes */{file_size}"
-                return response
-
-            start_text, end_text = match.groups()
-            if not start_text:
-                suffix_length = int(end_text or 0)
-                if suffix_length <= 0:
-                    response = HttpResponse(status=416)
-                    response["Content-Range"] = f"bytes */{file_size}"
-                    return response
-                start = max(0, file_size - suffix_length)
-                end = file_size - 1
-            else:
-                start = int(start_text)
-                end = min(int(end_text), file_size - 1) if end_text else file_size - 1
-
-            if start >= file_size or start > end:
-                response = HttpResponse(status=416)
-                response["Content-Range"] = f"bytes */{file_size}"
-                return response
-
-            length = end - start + 1
-            remote_object = open_s3_audio_stream(audio.audio_file, start, end)
-            if remote_object is not None:
-                response = StreamingHttpResponse(
-                    iter_streaming_body(remote_object["Body"]),
-                    status=206,
-                    content_type=remote_object.get("ContentType") or content_type,
-                )
-            else:
-                file_obj = audio.audio_file.open("rb")
-                file_obj.seek(start)
-                response = StreamingHttpResponse(
-                    iter_file_range(file_obj, length),
-                    status=206,
-                    content_type=content_type,
-                )
-            response["Content-Range"] = f"bytes {start}-{end}/{file_size}"
-            response["Content-Length"] = str(length)
-        else:
-            remote_object = open_s3_audio_stream(audio.audio_file)
-            if remote_object is not None:
-                response = StreamingHttpResponse(
-                    iter_streaming_body(remote_object["Body"]),
-                    content_type=remote_object.get("ContentType") or content_type,
-                )
-            else:
-                file_obj = audio.audio_file.open("rb")
-                response = FileResponse(file_obj, content_type=content_type)
-            response["Content-Length"] = str(file_size)
-
-        response["Accept-Ranges"] = "bytes"
-        response["Content-Disposition"] = f'inline; filename="{safe_file_name}"'
-        response["Cache-Control"] = "public, max-age=3600"
-        return response
+        return _stream_audio_file_response(request, audio)
 
 
 class BlogViewSet(ReadOnlyModelViewSet):
@@ -2614,6 +3024,373 @@ class AudioAdminViewSet(ModelViewSet):
             audio.transcript = ""
             audio.save(update_fields=["transcript"])
         return Response({"transcript_state": "empty", "cue_count": 0, "transcript": ""})
+
+
+def _title_from_audio_filename(filename: str) -> str:
+    base = os.path.splitext(os.path.basename(filename or ""))[0]
+    cleaned = re.sub(r"[_\-]+", " ", base)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not cleaned:
+        return "Untitled Track"
+    return cleaned.title()
+
+
+class AudiobookSeriesAdminViewSet(ModelViewSet):
+    serializer_class = AudiobookSeriesAdminSerializer
+    permission_classes = [IsSuperUser]
+    pagination_class = None
+    filter_backends = [SearchFilter]
+    search_fields = ["name", "slug", "description"]
+
+    def get_queryset(self):
+        return (
+            AudiobookSeries.objects.annotate(
+                _audiobook_count=Count("audiobooks", distinct=True)
+            )
+            .order_by("order", "name", "id")
+        )
+
+
+class AudiobookAdminViewSet(ModelViewSet):
+    permission_classes = [IsSuperUser]
+    pagination_class = CataloguePagination
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
+
+    def get_serializer_class(self):
+        if self.action == "list":
+            return AudiobookAdminListSerializer
+        return AudiobookAdminDetailSerializer
+
+    def get_queryset(self):
+        track_with_file = Q(tracks__audio_file__isnull=False) & ~Q(tracks__audio_file="")
+        qs = (
+            Audiobook.objects.select_related("story", "story__author", "author", "series")
+            .prefetch_related("genres", "story__genres")
+            .annotate(
+                _track_count=Count("tracks", filter=track_with_file, distinct=True),
+                _total_duration_seconds=Sum(
+                    "tracks__duration_seconds",
+                    filter=track_with_file & Q(tracks__duration_seconds__gt=0),
+                ),
+                _missing_duration_count=Count(
+                    "tracks",
+                    filter=track_with_file
+                    & (Q(tracks__duration_seconds__isnull=True) | Q(tracks__duration_seconds__lte=0)),
+                    distinct=True,
+                ),
+            )
+        )
+        if self.action != "list":
+            qs = qs.prefetch_related(
+                Prefetch(
+                    "tracks",
+                    queryset=Audio.objects.annotate(
+                        _has_timed_cues=Exists(
+                            AudioTranscriptCue.objects.filter(audio=OuterRef("pk"))
+                        ),
+                        _cue_count=Count("transcript_cues", distinct=True),
+                    ).order_by("order", "id"),
+                )
+            )
+
+        if self.action == "list":
+            params = self.request.query_params
+            q = (params.get("q") or "").strip()
+            if q:
+                qs = qs.filter(
+                    Q(title__icontains=q)
+                    | Q(display_title__icontains=q)
+                    | Q(slug__icontains=q)
+                    | Q(narrator__icontains=q)
+                    | Q(author__name__icontains=q)
+                    | Q(story__title__icontains=q)
+                    | Q(story__author__name__icontains=q)
+                )
+
+            story_link = (params.get("story_link") or "").strip().lower()
+            if story_link == "linked":
+                qs = qs.filter(story__isnull=False)
+            elif story_link == "standalone":
+                qs = qs.filter(story__isnull=True)
+
+            series_param = (params.get("series") or "").strip()
+            if series_param and series_param.isdigit():
+                qs = qs.filter(series_id=int(series_param))
+
+            status_param = (params.get("status") or "").strip().lower()
+            now = timezone.now()
+            if status_param == "draft":
+                qs = qs.filter(is_published=False)
+            elif status_param == "scheduled":
+                qs = qs.filter(is_published=True, publish_at__gt=now)
+            elif status_param == "published":
+                qs = qs.filter(is_published=True).filter(
+                    Q(publish_at__isnull=True) | Q(publish_at__lte=now)
+                )
+
+            ordering = (params.get("ordering") or "-updated_at").strip()
+            if ordering == "title":
+                qs = qs.order_by(Lower("title"), "id")
+            elif ordering == "-title":
+                qs = qs.order_by(Lower("title").desc(), "-id")
+            elif ordering == "duration":
+                qs = qs.order_by(F("_total_duration_seconds").asc(nulls_last=True), "id")
+            elif ordering == "-duration":
+                qs = qs.order_by(F("_total_duration_seconds").desc(nulls_last=True), "-id")
+            elif ordering == "tracks":
+                qs = qs.order_by("_track_count", "id")
+            elif ordering == "-tracks":
+                qs = qs.order_by("-_track_count", "-id")
+            else:
+                qs = qs.order_by("-updated_at", "-id")
+
+        return qs
+
+    @action(detail=False, methods=["get"], url_path="stats")
+    def stats(self, request):
+        missing_duration = (
+            Audio.objects.filter(audiobook__isnull=False, audio_file__isnull=False)
+            .exclude(audio_file="")
+            .filter(Q(duration_seconds__isnull=True) | Q(duration_seconds__lte=0))
+            .count()
+        )
+        return Response(
+            {
+                "total": Audiobook.objects.count(),
+                "standalone": Audiobook.objects.filter(story__isnull=True).count(),
+                "series_count": AudiobookSeries.objects.count(),
+                "missing_duration": missing_duration,
+            }
+        )
+
+    @action(detail=False, methods=["get"], url_path="story-search")
+    def story_search(self, request):
+        q = (request.query_params.get("q") or "").strip()
+        stories = (
+            Story.objects.select_related("author")
+            .annotate(_audiobook_count=Count("audiobooks", distinct=True))
+            .order_by("title", "id")
+        )
+        if q:
+            stories = stories.filter(
+                Q(title__icontains=q) | Q(author__name__icontains=q) | Q(slug__icontains=q)
+            )
+        results = []
+        for story in stories[:10]:
+            results.append(
+                {
+                    "id": story.id,
+                    "title": story.title,
+                    "slug": story.slug,
+                    "author": story.author.name if story.author_id else "",
+                    "cover": get_cover_image_url(
+                        story.cover_image_file, story.cover_image, request, size=CARD_COVER_SIZE
+                    ),
+                    "audiobook_count": story._audiobook_count,
+                }
+            )
+        return Response(results)
+
+    def _next_track_order(self, audiobook: Audiobook) -> int:
+        max_ab = audiobook.tracks.aggregate(m=Max("order")).get("m") or 0
+        max_story = 0
+        if audiobook.story_id is not None:
+            max_story = Audio.objects.filter(story_id=audiobook.story_id).aggregate(m=Max("order")).get("m") or 0
+        return max(max_ab, max_story) + 1
+
+    def _close_track_order_gap(self, audiobook: Audiobook, deleted_order: int):
+        later_tracks = list(
+            Audio.objects.filter(audiobook=audiobook, order__gt=deleted_order).order_by("order", "id")
+        )
+        for track in later_tracks:
+            track.order = max(1, track.order - 1)
+            track.save(update_fields=["order"])
+
+    @action(detail=True, methods=["post"], url_path="tracks")
+    def upload_tracks(self, request, pk=None):
+        from . import reading_time
+        from .audio_processing import normalize_uploaded_audio
+        from .models import MAX_AUDIO_UPLOAD_SIZE
+
+        audiobook = self.get_object()
+        files = request.FILES.getlist("files") or request.FILES.getlist("file")
+        if not files:
+            return Response(
+                {"detail": "No audio files provided."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        created = []
+        errors = []
+        next_order = self._next_track_order(audiobook)
+
+        for uploaded in files:
+            filename = getattr(uploaded, "name", "") or "track.mp3"
+            ext = os.path.splitext(filename)[1].lower()
+            if ext != ".mp3":
+                errors.append({"filename": filename, "error": "Only .mp3 files are supported."})
+                continue
+            file_size = getattr(uploaded, "size", 0) or 0
+            if file_size > MAX_AUDIO_UPLOAD_SIZE:
+                errors.append({"filename": filename, "error": "File exceeds maximum allowed size."})
+                continue
+            try:
+                normalized = normalize_uploaded_audio(uploaded)
+                raw_bytes = reading_time.read_local_upload_bytes(normalized)
+                duration = reading_time.probe_audio_duration_from_bytes(raw_bytes)
+                size_bytes = len(raw_bytes) if raw_bytes else (getattr(normalized, "size", 0) or 0)
+            except Exception as exc:
+                errors.append({"filename": filename, "error": str(exc)})
+                continue
+
+            title = _title_from_audio_filename(filename)
+            base_slug = slugify(title)[:240] or f"track-{next_order}"
+            track = Audio.objects.create(
+                audiobook=audiobook,
+                story=audiobook.story,
+                title=title,
+                slug=f"{base_slug}-{next_order}"[:256],
+                audio_file=normalized,
+                order=next_order,
+                duration_seconds=duration,
+                file_size_bytes=size_bytes,
+            )
+            created.append(track)
+            next_order += 1
+
+        audiobook.refresh_cache()
+        payload = {
+            "created": AudiobookTrackAdminSerializer(
+                created, many=True, context=self.get_serializer_context()
+            ).data,
+            "errors": errors,
+        }
+        if not created:
+            return Response(payload, status=status.HTTP_400_BAD_REQUEST)
+        if errors:
+            return Response(payload, status=status.HTTP_207_MULTI_STATUS)
+        return Response(payload, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["post"], url_path="tracks/reorder")
+    def reorder_tracks(self, request, pk=None):
+        audiobook = self.get_object()
+        ids = request.data.get("ids")
+        if not isinstance(ids, list) or not all(isinstance(x, int) for x in ids):
+            return Response(
+                {"ids": "Provide a list of track IDs."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        existing_ids = list(audiobook.tracks.values_list("id", flat=True))
+        if len(ids) != len(set(ids)) or set(ids) != set(existing_ids):
+            return Response(
+                {"ids": "Track IDs must match the exact tracks belonging to this audiobook."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        with transaction.atomic():
+            # Shift orders out of range first so neither (audiobook, order) nor
+            # (story, order) unique constraints collide mid-swap.
+            offset = 100000
+            Audio.objects.filter(audiobook=audiobook).update(order=F("order") + offset)
+            for idx, track_id in enumerate(ids, start=1):
+                Audio.objects.filter(pk=track_id, audiobook=audiobook).update(order=idx)
+
+        audiobook.refresh_cache()
+        ordered = (
+            audiobook.tracks.annotate(
+                _has_timed_cues=Exists(AudioTranscriptCue.objects.filter(audio=OuterRef("pk"))),
+                _cue_count=Count("transcript_cues", distinct=True),
+            )
+            .order_by("order", "id")
+        )
+        return Response(
+            AudiobookTrackAdminSerializer(
+                ordered, many=True, context=self.get_serializer_context()
+            ).data
+        )
+
+    @action(detail=True, methods=["patch", "delete"], url_path=r"tracks/(?P<track_id>\d+)")
+    def track_detail(self, request, pk=None, track_id=None):
+        audiobook = self.get_object()
+        track = get_object_or_404(Audio, pk=track_id, audiobook=audiobook)
+
+        if request.method == "DELETE":
+            deleted_order = track.order
+            with transaction.atomic():
+                track.delete()
+                self._close_track_order_gap(audiobook, deleted_order)
+            audiobook.refresh_cache()
+            return Response(status=status.HTTP_204_NO_CONTENT)
+
+        serializer = AudiobookTrackAdminSerializer(
+            track, data=request.data, partial=True, context=self.get_serializer_context()
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        audiobook.refresh_cache()
+        return Response(serializer.data)
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path=r"tracks/(?P<track_id>\d+)/reread-duration",
+    )
+    def reread_track_duration(self, request, pk=None, track_id=None):
+        from . import reading_time
+
+        audiobook = self.get_object()
+        track = get_object_or_404(Audio, pk=track_id, audiobook=audiobook)
+        duration = reading_time.probe_audio_duration_seconds(track.audio_file)
+        update_fields = ["duration_seconds"]
+        track.duration_seconds = duration
+        try:
+            if track.audio_file and track.audio_file.size:
+                track.file_size_bytes = track.audio_file.size
+                update_fields.append("file_size_bytes")
+        except Exception:
+            pass
+        track.save(update_fields=update_fields)
+        audiobook.refresh_cache()
+        return Response(
+            AudiobookTrackAdminSerializer(track, context=self.get_serializer_context()).data
+        )
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path=r"tracks/(?P<track_id>\d+)/move",
+    )
+    def move_track(self, request, pk=None, track_id=None):
+        source = self.get_object()
+        track = get_object_or_404(Audio, pk=track_id, audiobook=source)
+        target_id = request.data.get("audiobook_id")
+        if not target_id:
+            return Response(
+                {"audiobook_id": "Target audiobook is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        target = get_object_or_404(Audiobook, pk=target_id)
+        if target.pk == source.pk:
+            return Response(
+                {"audiobook_id": "Choose a different audiobook."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        old_order = track.order
+        with transaction.atomic():
+            next_order = self._next_track_order(target)
+            track.audiobook = target
+            track.story = target.story
+            track.order = next_order
+            track.save(update_fields=["audiobook", "story", "order"])
+            self._close_track_order_gap(source, old_order)
+
+        source.refresh_cache()
+        target.refresh_cache()
+        return Response(
+            AudiobookTrackAdminSerializer(track, context=self.get_serializer_context()).data
+        )
 
 
 class VideoAdminViewSet(ModelViewSet):
