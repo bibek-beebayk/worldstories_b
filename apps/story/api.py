@@ -947,12 +947,17 @@ class AudiobookViewSet(ReadOnlyModelViewSet):
                     "audiobook__story",
                     "audiobook__story__author",
                     "audiobook__author",
-                    "audiobook__series",
                 )
                 .prefetch_related(
                     "audiobook__genres",
                     "audiobook__story__genres",
                     "audiobook__tracks",
+                    Prefetch(
+                        "audiobook__series_items",
+                        queryset=AudiobookSeriesItem.objects.select_related("series").order_by(
+                            "order", "series__name"
+                        ),
+                    ),
                 )
                 .order_by("-updated_at")
             )

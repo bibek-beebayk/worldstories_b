@@ -1321,16 +1321,6 @@ class Audiobook(models.Model):
     )
     about = models.TextField(blank=True, default="")
     genres = models.ManyToManyField(Genre, blank=True, related_name="audiobooks")
-    # deprecated: remove after backfill_series_items shows zero missing pairs
-    series = models.ForeignKey(
-        AudiobookSeries,
-        null=True,
-        blank=True,
-        on_delete=models.SET_NULL,
-        related_name="audiobooks",
-    )
-    # deprecated: remove after backfill_series_items shows zero missing pairs
-    series_order = models.PositiveSmallIntegerField(default=0)
     cover_image_file = VersatileImageField(upload_to="audiobook_covers/", blank=True, null=True)
     is_published = models.BooleanField(default=True)
     publish_at = models.DateTimeField(null=True, blank=True)
@@ -1355,7 +1345,6 @@ class Audiobook(models.Model):
         ordering = ["-created_at", "-id"]
         indexes = [
             models.Index(fields=["is_published", "publish_at"]),
-            models.Index(fields=["series", "series_order"]),
         ]
 
     def __str__(self):

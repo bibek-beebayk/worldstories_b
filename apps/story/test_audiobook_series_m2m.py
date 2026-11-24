@@ -24,8 +24,6 @@ class AudiobookSeriesItemModelTests(TestCase):
             author=self.author,
             language="en",
             about="A journey through time.",
-            series=self.series_a,
-            series_order=3,
         )
 
     def test_unique_series_audiobook_pair(self):
@@ -34,25 +32,14 @@ class AudiobookSeriesItemModelTests(TestCase):
         with self.assertRaises(IntegrityError):
             AudiobookSeriesItem.objects.create(series=self.series_a, audiobook=self.ab, order=5)
 
-    def test_backfill_series_items_and_audit(self):
-        with self.assertRaises(SystemExit) as ctx:
-            call_command("audit_audiobooks", stdout=StringIO(), stderr=StringIO())
-        self.assertEqual(ctx.exception.code, 1)
-
+    def test_backfill_series_items_noop_and_audit(self):
         out_dry = StringIO()
         call_command("backfill_series_items", "--dry-run", stdout=out_dry)
-        self.assertIn("created=1, skipped=0", out_dry.getvalue())
-        self.assertEqual(AudiobookSeriesItem.objects.count(), 0)
+        self.assertIn("nothing to do", out_dry.getvalue())
 
         out_real = StringIO()
         call_command("backfill_series_items", stdout=out_real)
-        self.assertIn("created=1, skipped=0", out_real.getvalue())
-        item = AudiobookSeriesItem.objects.get(series=self.series_a, audiobook=self.ab)
-        self.assertEqual(item.order, 3)
-
-        out_second = StringIO()
-        call_command("backfill_series_items", stdout=out_second)
-        self.assertIn("created=0, skipped=1", out_second.getvalue())
+        self.assertIn("nothing to do", out_real.getvalue())
 
         out_audit = StringIO()
         call_command("audit_audiobooks", stdout=out_audit)

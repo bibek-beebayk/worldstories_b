@@ -95,4 +95,4 @@ Superuser-only endpoints for managing standalone and story-linked audiobooks, tr
     - `python manage.py backfill_audiobooks [--dry-run]` — creates missing `Audiobook` rows for legacy story `Audio` tracks and attaches them.
     - `python manage.py backfill_audio_progress [--dry-run]` — moves `AudioReadingProgress` rows with `audiobook IS NULL` onto audiobook keys (batches of 500, idempotent).
     - `python manage.py recompute_audiobook_totals [--dry-run]` — recomputes `track_count` and `total_duration_seconds` on all audiobooks (batches of 500, idempotent).
-    - `python manage.py backfill_series_items [--dry-run]` — copies legacy `Audiobook.series` / `series_order` into `AudiobookSeriesItem` rows (batches of 500, idempotent). Legacy `Audiobook.series` and `Audiobook.series_order` fields are deprecated and will be dropped in a follow-up migration once `backfill_series_items` and `audit_audiobooks` confirm zero missing pairs in production.
+    - `python manage.py backfill_series_items [--dry-run]` — retained as a safe no-op; the legacy `Audiobook.series` and `Audiobook.series_order` columns were dropped in `story.0108_drop_legacy_audiobook_series_fields`.

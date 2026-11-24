@@ -419,11 +419,10 @@ class AdminAudiobooksApiTests(APITestCase):
             author=self.author,
             language="en",
             about="Soft.",
-            series_id=series_id,
         )
+        AudiobookSeriesItem.objects.create(series_id=series_id, audiobook=ab, order=1)
 
         res_del = self.client.delete(f"/api/admin/audiobook-series/{series_id}/")
         self.assertEqual(res_del.status_code, 204)
-        ab.refresh_from_db()
-        self.assertIsNone(ab.series_id)
+        self.assertEqual(AudiobookSeriesItem.objects.filter(audiobook=ab).count(), 0)
         self.assertTrue(Audiobook.objects.filter(pk=ab.pk).exists())

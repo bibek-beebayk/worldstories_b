@@ -126,22 +126,6 @@ class Command(BaseCommand):
             .count()
         )
 
-        # 10. Audiobooks with legacy series set but no matching AudiobookSeriesItem
-        from django.db.models import Exists, OuterRef
-
-        missing_series_items = (
-            Audiobook.objects.filter(series__isnull=False)
-            .filter(
-                ~Exists(
-                    AudiobookSeriesItem.objects.filter(
-                        audiobook_id=OuterRef("pk"),
-                        series_id=OuterRef("series_id"),
-                    )
-                )
-            )
-            .count()
-        )
-
         self.stdout.write("=== Audiobook Audit Report ===")
         self.stdout.write(f"1. Audio rows with audiobook IS NULL: {orphan_audios}")
         self.stdout.write(
@@ -168,9 +152,6 @@ class Command(BaseCommand):
         self.stdout.write(
             f"9. Duplicate (user, audiobook, audio) progress rows: {dup_progress_keys}"
         )
-        self.stdout.write(
-            f"10. Audiobooks with legacy series set but missing AudiobookSeriesItem: {missing_series_items}"
-        )
 
         violations = (
             orphan_audios
@@ -180,7 +161,6 @@ class Command(BaseCommand):
             + mismatched_progress
             + slug_collisions
             + dup_progress_keys
-            + missing_series_items
         )
         if violations > 0:
             self.stderr.write(self.style.ERROR(f"Audit FAILED with {violations} violation(s)."))

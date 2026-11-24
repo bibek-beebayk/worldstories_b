@@ -213,9 +213,10 @@ class PublicAudiobookApiTests(APITestCase):
             slug="midnight-mystery",
             narrator="Bob Voice",
             language="fr",
-            series=self.series,
-            series_order=2,
             is_published=True,
+        )
+        AudiobookSeriesItem.objects.create(
+            series=self.series, audiobook=self.ab_standalone, order=2
         )
         self.ab_standalone.genres.add(self.genre_mystery)
         Audio.objects.create(
