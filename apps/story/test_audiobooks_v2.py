@@ -7,7 +7,15 @@ from django.test.utils import CaptureQueriesContext
 from rest_framework.test import APITestCase
 
 from apps.stats.models import AudioReadingProgress
-from apps.story.models import Audio, Audiobook, AudiobookSeries, Author, Genre, Story
+from apps.story.models import (
+    Audio,
+    Audiobook,
+    AudiobookSeries,
+    AudiobookSeriesItem,
+    Author,
+    Genre,
+    Story,
+)
 from apps.users.models import User
 
 
@@ -168,10 +176,9 @@ class PublicAudiobookApiTests(APITestCase):
             title="",
             slug="frankenstein",
             narrator="Jane Narrator",
-            series=self.series,
-            series_order=1,
             is_published=True,
         )
+        AudiobookSeriesItem.objects.create(series=self.series, audiobook=self.ab_story, order=1)
         self.t1 = Audio.objects.create(
             story=self.story,
             audiobook=self.ab_story,

@@ -1321,6 +1321,7 @@ class Audiobook(models.Model):
     )
     about = models.TextField(blank=True, default="")
     genres = models.ManyToManyField(Genre, blank=True, related_name="audiobooks")
+    # deprecated: remove after backfill_series_items shows zero missing pairs
     series = models.ForeignKey(
         AudiobookSeries,
         null=True,
@@ -1328,6 +1329,7 @@ class Audiobook(models.Model):
         on_delete=models.SET_NULL,
         related_name="audiobooks",
     )
+    # deprecated: remove after backfill_series_items shows zero missing pairs
     series_order = models.PositiveSmallIntegerField(default=0)
     cover_image_file = VersatileImageField(upload_to="audiobook_covers/", blank=True, null=True)
     is_published = models.BooleanField(default=True)
@@ -1431,6 +1433,39 @@ class Audiobook(models.Model):
         else:
             self.total_duration_seconds = float(sum(durations))
         self.save(update_fields=["total_duration_seconds", "track_count"])
+
+
+class AudiobookSeriesItem(models.Model):
+    """Many-to-many membership placing an Audiobook inside an AudiobookSeries
+    with an explicit per-series order."""
+
+    audiobook = models.ForeignKey(
+        Audiobook,
+        on_delete=models.CASCADE,
+        related_name="series_items",
+    )
+    series = models.ForeignKey(
+        AudiobookSeries,
+        on_delete=models.CASCADE,
+        related_name="items",
+    )
+    order = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["order", "audiobook__title"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["series", "audiobook"],
+                name="story_audiobookseriesitem_series_audiobook_uniq",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["series", "order"], name="story_abseriesitem_ser_ord_idx"),
+        ]
+
+    def __str__(self):
+        return f"{self.series.name} #{self.order}: {self.audiobook.effective_title()}"
 
 
 class Audio(models.Model):

@@ -12,6 +12,7 @@ from apps.story.models import (
     Audio,
     Audiobook,
     AudiobookSeries,
+    AudiobookSeriesItem,
     AudioTranscriptCue,
     Author,
     Genre,
@@ -139,9 +140,9 @@ class AdminAudiobooksApiTests(APITestCase):
             story=self.story,
             title="Pride Audio",
             slug="pride-audio",
-            series=series,
             is_published=True,
         )
+        AudiobookSeriesItem.objects.create(series=series, audiobook=ab_linked, order=1)
         ab_standalone = Audiobook.objects.create(
             title="Solo Draft",
             slug="solo-draft",

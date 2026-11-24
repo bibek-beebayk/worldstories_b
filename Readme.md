@@ -62,8 +62,9 @@ DNS hostnames and verification values are account/domain-specific; copy them fro
 
 Superuser-only endpoints for managing standalone and story-linked audiobooks, tracks, and series:
 
-- `GET/POST /api/admin/audiobooks/` — list (filters: `q`, `story_link=all|linked|standalone`, `series`, `status=published|draft|scheduled`, `ordering`) and create audiobooks. Standalone audiobooks require `title`, `author`, `language`, and `about`.
-- `GET/PATCH/DELETE /api/admin/audiobooks/<id>/` — retrieve (with `effective` fallback fields and ordered `tracks`), update (supports `remove_cover=true`), or delete (cascades tracks, transcripts, cues, and listener progress; leaves linked `Story` intact).
+- `GET/POST /api/admin/audiobooks/` — list (filters: `q`, `story_link=all|linked|standalone`, `series`, `series_filter=none`, `exclude_series=<id>`, `status=published|draft|scheduled`, `ordering`) and create audiobooks (accepts `series_items: [{series_id, order?}]`). Standalone audiobooks require `title`, `author`, `language`, and `about`.
+- `GET/PATCH/DELETE /api/admin/audiobooks/<id>/` — retrieve (with `effective` fallback fields, ordered `tracks`, and `series` memberships), update (supports `remove_cover=true` and `series_items`), or delete (cascades tracks, transcripts, cues, and listener progress; leaves linked `Story` intact).
+- `POST /api/admin/audiobooks/bulk-series/` — bulk add or remove selected audiobooks (max 200) to/from up to 20 series (`{ids, series_ids, mode: "add"|"remove"}`), returns `{added, removed, skipped}`.
 - `GET /api/admin/audiobooks/stats/` — summary counts (`total`, `standalone`, `series_count`, `missing_duration`).
 - `GET /api/admin/audiobooks/story-search/?q=` — search up to 10 stories (published or draft) with `audiobook_count`.
 - `POST /api/admin/audiobooks/<id>/tracks/` — multi-file `.mp3` upload (`files`), derives titles from filenames, probes duration/size, skips invalid files and returns `{created, errors}`.
@@ -71,7 +72,10 @@ Superuser-only endpoints for managing standalone and story-linked audiobooks, tr
 - `PATCH/DELETE /api/admin/audiobooks/<id>/tracks/<track_id>/` — rename, replace audio file, or delete track (closes order gap and refreshes cache).
 - `POST /api/admin/audiobooks/<id>/tracks/<track_id>/reread-duration/` — re-probes duration from stored audio file.
 - `POST /api/admin/audiobooks/<id>/tracks/<track_id>/move/` — moves track (with transcript, cues, and progress preserved) to another audiobook (`{audiobook_id}`) and refreshes both caches.
-- `GET/POST/PATCH/DELETE /api/admin/audiobook-series/` — CRUD for audiobook series (deleting a series nulls `audiobook.series` and keeps audiobooks intact).
+- `GET/POST/PATCH/DELETE /api/admin/audiobook-series/` — CRUD for audiobook series; `GET /api/admin/audiobook-series/<id>/` returns ordered `audiobooks` from `AudiobookSeriesItem`. Deleting a series removes its `AudiobookSeriesItem` rows and keeps audiobooks intact.
+- `POST /api/admin/audiobook-series/<id>/add-audiobooks/` — append audiobooks (`{audiobook_ids}`), skips duplicates, returns `{added, skipped}`.
+- `POST /api/admin/audiobook-series/<id>/remove-audiobooks/` — remove audiobooks (`{audiobook_ids}`) and renumber remaining items `1..n`, returns `{removed}`.
+- `POST /api/admin/audiobook-series/<id>/reorder/` — atomic reorder by exact audiobook ID list (`{ids: [...]}`).
 
 ## Public audiobooks & progress (Phase 3)
 
@@ -91,3 +95,4 @@ Superuser-only endpoints for managing standalone and story-linked audiobooks, tr
     - `python manage.py backfill_audiobooks [--dry-run]` — creates missing `Audiobook` rows for legacy story `Audio` tracks and attaches them.
     - `python manage.py backfill_audio_progress [--dry-run]` — moves `AudioReadingProgress` rows with `audiobook IS NULL` onto audiobook keys (batches of 500, idempotent).
     - `python manage.py recompute_audiobook_totals [--dry-run]` — recomputes `track_count` and `total_duration_seconds` on all audiobooks (batches of 500, idempotent).
+    - `python manage.py backfill_series_items [--dry-run]` — copies legacy `Audiobook.series` / `series_order` into `AudiobookSeriesItem` rows (batches of 500, idempotent). Legacy `Audiobook.series` and `Audiobook.series_order` fields are deprecated and will be dropped in a follow-up migration once `backfill_series_items` and `audit_audiobooks` confirm zero missing pairs in production.

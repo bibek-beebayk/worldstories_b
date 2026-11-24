@@ -54,6 +54,7 @@ from .models import (
     Audio,
     Audiobook,
     AudiobookSeries,
+    AudiobookSeriesItem,
     AudioTranscriptCue,
     audiobook_published_q,
     Video,
@@ -162,6 +163,7 @@ from .serializers import (
     ChapterAdminSerializer,
     AudioAdminSerializer,
     AudiobookSeriesAdminSerializer,
+    AudiobookSeriesAdminDetailSerializer,
     AudiobookTrackAdminSerializer,
     AudiobookAdminListSerializer,
     AudiobookAdminDetailSerializer,
@@ -722,10 +724,16 @@ class AudiobookViewSet(ReadOnlyModelViewSet):
         return (
             Audiobook.objects.published()
             .filter(has_playable_track)
-            .select_related("story", "story__author", "author", "series")
+            .select_related("story", "story__author", "author")
             .prefetch_related(
                 "genres",
                 "story__genres",
+                Prefetch(
+                    "series_items",
+                    queryset=AudiobookSeriesItem.objects.select_related("series").order_by(
+                        "order", "series__name"
+                    ),
+                ),
                 Prefetch(
                     "tracks",
                     queryset=Audio.objects.annotate(
@@ -786,7 +794,10 @@ class AudiobookViewSet(ReadOnlyModelViewSet):
 
         series = (params.get("series") or "").strip()
         if series:
-            queryset = queryset.filter(series__slug=series)
+            if series.isdigit():
+                queryset = queryset.filter(series_items__series_id=int(series)).distinct()
+            else:
+                queryset = queryset.filter(series_items__series__slug=series).distinct()
 
         narrator = (params.get("narrator") or "").strip()
         if narrator:
@@ -862,7 +873,7 @@ class AudiobookViewSet(ReadOnlyModelViewSet):
 
     @action(detail=False, methods=["get"])
     def overview(self, request):
-        cache_key = "audiobook-overview-v1"
+        cache_key = "audiobook-overview-v2"
         anonymous = cache.get(cache_key)
         ctx = self.get_serializer_context()
         if anonymous is None:
@@ -873,11 +884,40 @@ class AudiobookViewSet(ReadOnlyModelViewSet):
                 | (Q(story__cover_image__isnull=False) & ~Q(story__cover_image=""))
             )
             featured = self._order_by_popular(base.filter(has_cover_q)).first()
+            has_playable = Exists(
+                Audio.objects.filter(
+                    audiobook=OuterRef("audiobook_id"),
+                    audio_file__isnull=False,
+                ).exclude(audio_file="")
+            )
             shelves = []
             for series in AudiobookSeries.objects.filter(is_active=True).order_by("order", "name"):
-                items = list(
-                    base.filter(series=series).order_by("series_order", "-created_at", "-id")[:13]
+                series_items = list(
+                    AudiobookSeriesItem.objects.filter(series=series)
+                    .filter(audiobook_published_q("audiobook"))
+                    .filter(has_playable)
+                    .select_related(
+                        "audiobook",
+                        "audiobook__story",
+                        "audiobook__story__author",
+                        "audiobook__author",
+                    )
+                    .prefetch_related(
+                        "audiobook__genres",
+                        "audiobook__story__genres",
+                        "audiobook__tracks",
+                        Prefetch(
+                            "audiobook__series_items",
+                            queryset=AudiobookSeriesItem.objects.select_related("series").order_by(
+                                "order", "series__name"
+                            ),
+                        ),
+                    )
+                    .order_by("order", "-audiobook__created_at", "-audiobook__id")[:13]
                 )
+                items = [si.audiobook for si in series_items]
+                if not items:
+                    continue
                 shelves.append(
                     {
                         "series": AudiobookSeriesSerializer(series).data,
@@ -3035,19 +3075,152 @@ def _title_from_audio_filename(filename: str) -> str:
     return cleaned.title()
 
 
+def _renumber_series_items(series_id: int) -> None:
+    remaining = list(
+        AudiobookSeriesItem.objects.filter(series_id=series_id).order_by(
+            "order", "audiobook__title", "id"
+        )
+    )
+    for idx, item in enumerate(remaining, start=1):
+        if item.order != idx:
+            item.order = idx
+            item.save(update_fields=["order"])
+
+
 class AudiobookSeriesAdminViewSet(ModelViewSet):
-    serializer_class = AudiobookSeriesAdminSerializer
     permission_classes = [IsSuperUser]
     pagination_class = None
     filter_backends = [SearchFilter]
     search_fields = ["name", "slug", "description"]
 
+    def get_serializer_class(self):
+        if self.action == "retrieve":
+            return AudiobookSeriesAdminDetailSerializer
+        return AudiobookSeriesAdminSerializer
+
     def get_queryset(self):
-        return (
+        qs = (
             AudiobookSeries.objects.annotate(
-                _audiobook_count=Count("audiobooks", distinct=True)
+                _audiobook_count=Count("items", distinct=True)
             )
             .order_by("order", "name", "id")
+        )
+        if self.action == "retrieve":
+            qs = qs.prefetch_related(
+                Prefetch(
+                    "items",
+                    queryset=AudiobookSeriesItem.objects.select_related(
+                        "audiobook",
+                        "audiobook__author",
+                        "audiobook__story",
+                        "audiobook__story__author",
+                    ).order_by("order", "audiobook__title", "id"),
+                )
+            )
+        return qs
+
+    @action(detail=True, methods=["post"], url_path="add-audiobooks")
+    def add_audiobooks(self, request, pk=None):
+        series = self.get_object()
+        raw_ids = request.data.get("audiobook_ids")
+        if not isinstance(raw_ids, list) or not raw_ids or not all(
+            isinstance(x, int) and not isinstance(x, bool) for x in raw_ids
+        ):
+            return Response(
+                {"audiobook_ids": "Provide a non-empty list of audiobook IDs."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        deduped_ids = list(dict.fromkeys(raw_ids))
+        valid_ids = set(Audiobook.objects.filter(pk__in=deduped_ids).values_list("pk", flat=True))
+        missing = [i for i in deduped_ids if i not in valid_ids]
+        if missing:
+            return Response(
+                {"audiobook_ids": f"Unknown audiobook ID(s): {missing}"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        added = 0
+        skipped = 0
+        with transaction.atomic():
+            existing_ab_ids = set(
+                AudiobookSeriesItem.objects.filter(
+                    series=series, audiobook_id__in=deduped_ids
+                ).values_list("audiobook_id", flat=True)
+            )
+            next_order = (
+                AudiobookSeriesItem.objects.filter(series=series)
+                .aggregate(m=Max("order"))
+                .get("m")
+                or 0
+            )
+            for ab_id in deduped_ids:
+                if ab_id in existing_ab_ids:
+                    skipped += 1
+                    continue
+                next_order += 1
+                AudiobookSeriesItem.objects.create(
+                    series=series, audiobook_id=ab_id, order=next_order
+                )
+                added += 1
+
+        cache.delete("audiobook-overview-v2")
+        return Response({"added": added, "skipped": skipped})
+
+    @action(detail=True, methods=["post"], url_path="remove-audiobooks")
+    def remove_audiobooks(self, request, pk=None):
+        series = self.get_object()
+        raw_ids = request.data.get("audiobook_ids")
+        if not isinstance(raw_ids, list) or not raw_ids or not all(
+            isinstance(x, int) and not isinstance(x, bool) for x in raw_ids
+        ):
+            return Response(
+                {"audiobook_ids": "Provide a non-empty list of audiobook IDs."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        with transaction.atomic():
+            removed, _ = AudiobookSeriesItem.objects.filter(
+                series=series, audiobook_id__in=raw_ids
+            ).delete()
+            _renumber_series_items(series.pk)
+
+        cache.delete("audiobook-overview-v2")
+        return Response({"removed": removed})
+
+    @action(detail=True, methods=["post"], url_path="reorder")
+    def reorder(self, request, pk=None):
+        series = self.get_object()
+        ids = request.data.get("ids")
+        if not isinstance(ids, list) or not all(
+            isinstance(x, int) and not isinstance(x, bool) for x in ids
+        ):
+            return Response(
+                {"ids": "Provide a list of audiobook IDs."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        existing_ids = list(
+            AudiobookSeriesItem.objects.filter(series=series).values_list("audiobook_id", flat=True)
+        )
+        if len(ids) != len(set(ids)) or set(ids) != set(existing_ids):
+            return Response(
+                {"ids": "IDs must match the exact audiobooks in this series."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        with transaction.atomic():
+            for idx, ab_id in enumerate(ids, start=1):
+                AudiobookSeriesItem.objects.filter(
+                    series=series, audiobook_id=ab_id
+                ).update(order=idx)
+
+        cache.delete("audiobook-overview-v2")
+        refreshed = self.get_queryset().get(pk=series.pk)
+        return Response(
+            AudiobookSeriesAdminDetailSerializer(
+                refreshed, context=self.get_serializer_context()
+            ).data
         )
 
 
@@ -3064,8 +3237,17 @@ class AudiobookAdminViewSet(ModelViewSet):
     def get_queryset(self):
         track_with_file = Q(tracks__audio_file__isnull=False) & ~Q(tracks__audio_file="")
         qs = (
-            Audiobook.objects.select_related("story", "story__author", "author", "series")
-            .prefetch_related("genres", "story__genres")
+            Audiobook.objects.select_related("story", "story__author", "author")
+            .prefetch_related(
+                "genres",
+                "story__genres",
+                Prefetch(
+                    "series_items",
+                    queryset=AudiobookSeriesItem.objects.select_related("series").order_by(
+                        "order", "series__name"
+                    ),
+                ),
+            )
             .annotate(
                 _track_count=Count("tracks", filter=track_with_file, distinct=True),
                 _total_duration_seconds=Sum(
@@ -3113,9 +3295,17 @@ class AudiobookAdminViewSet(ModelViewSet):
             elif story_link == "standalone":
                 qs = qs.filter(story__isnull=True)
 
+            series_filter = (params.get("series_filter") or "").strip().lower()
             series_param = (params.get("series") or "").strip()
-            if series_param and series_param.isdigit():
-                qs = qs.filter(series_id=int(series_param))
+            exclude_series = (params.get("exclude_series") or "").strip()
+
+            if series_filter == "none":
+                qs = qs.filter(series_items__isnull=True)
+            elif series_param and series_param.isdigit():
+                qs = qs.filter(series_items__series_id=int(series_param)).distinct()
+
+            if exclude_series and exclude_series.isdigit():
+                qs = qs.exclude(series_items__series_id=int(exclude_series))
 
             status_param = (params.get("status") or "").strip().lower()
             now = timezone.now()
@@ -3162,6 +3352,107 @@ class AudiobookAdminViewSet(ModelViewSet):
                 "missing_duration": missing_duration,
             }
         )
+
+    @action(detail=False, methods=["post"], url_path="bulk-series")
+    def bulk_series(self, request):
+        ids = request.data.get("ids")
+        series_ids = request.data.get("series_ids")
+        mode = (request.data.get("mode") or "").strip().lower()
+
+        if mode not in {"add", "remove"}:
+            return Response(
+                {"mode": 'Mode must be "add" or "remove".'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not isinstance(ids, list) or not ids or not all(
+            isinstance(x, int) and not isinstance(x, bool) for x in ids
+        ):
+            return Response(
+                {"ids": "Provide a non-empty list of audiobook IDs."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if len(ids) > 200:
+            return Response(
+                {"ids": "Select at most 200 audiobooks at a time."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not isinstance(series_ids, list) or not series_ids or not all(
+            isinstance(x, int) and not isinstance(x, bool) for x in series_ids
+        ):
+            return Response(
+                {"series_ids": "Provide a non-empty list of series IDs."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if len(series_ids) > 20:
+            return Response(
+                {"series_ids": "Select at most 20 series at a time."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        deduped_ids = list(dict.fromkeys(ids))
+        deduped_series_ids = list(dict.fromkeys(series_ids))
+
+        valid_ab_ids = set(
+            Audiobook.objects.filter(pk__in=deduped_ids).values_list("pk", flat=True)
+        )
+        missing_ab = [i for i in deduped_ids if i not in valid_ab_ids]
+        if missing_ab:
+            return Response(
+                {"ids": f"Unknown audiobook ID(s): {missing_ab}"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        valid_series_ids = set(
+            AudiobookSeries.objects.filter(pk__in=deduped_series_ids).values_list("pk", flat=True)
+        )
+        missing_series = [i for i in deduped_series_ids if i not in valid_series_ids]
+        if missing_series:
+            return Response(
+                {"series_ids": f"Unknown series ID(s): {missing_series}"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        added = 0
+        removed = 0
+        skipped = 0
+
+        with transaction.atomic():
+            if mode == "add":
+                existing_pairs = set(
+                    AudiobookSeriesItem.objects.filter(
+                        series_id__in=deduped_series_ids,
+                        audiobook_id__in=deduped_ids,
+                    ).values_list("series_id", "audiobook_id")
+                )
+                max_by_series = dict(
+                    AudiobookSeriesItem.objects.filter(series_id__in=deduped_series_ids)
+                    .values("series_id")
+                    .annotate(m=Max("order"))
+                    .values_list("series_id", "m")
+                )
+                for sid in deduped_series_ids:
+                    next_order = max_by_series.get(sid) or 0
+                    for ab_id in deduped_ids:
+                        if (sid, ab_id) in existing_pairs:
+                            skipped += 1
+                            continue
+                        next_order += 1
+                        AudiobookSeriesItem.objects.create(
+                            series_id=sid, audiobook_id=ab_id, order=next_order
+                        )
+                        added += 1
+            else:
+                for sid in deduped_series_ids:
+                    deleted_count, _ = AudiobookSeriesItem.objects.filter(
+                        series_id=sid, audiobook_id__in=deduped_ids
+                    ).delete()
+                    removed += deleted_count
+                    skipped += len(deduped_ids) - deleted_count
+                    if deleted_count > 0:
+                        _renumber_series_items(sid)
+
+        cache.delete("audiobook-overview-v2")
+        return Response({"added": added, "removed": removed, "skipped": skipped})
 
     @action(detail=False, methods=["get"], url_path="story-search")
     def story_search(self, request):
