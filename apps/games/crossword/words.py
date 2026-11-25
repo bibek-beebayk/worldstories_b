@@ -16,7 +16,8 @@ _ALPHA_3_5_RE = re.compile(r"^[A-Z]{3,5}$")
 _TOKEN_RE = re.compile(r"[A-Za-z]{3,5}")
 
 COMMON_ZIPF_THRESHOLD = 4.0
-RARE_ZIPF_THRESHOLD = 3.5
+RARE_ZIPF_THRESHOLD = 3.0
+MISSING_WORD_ZIPF_DEFAULT = 3.0
 SOLVER_MIN_ZIPF = 3.2
 SOLVER_BANK_MIN_ZIPF = 2.5
 DEFAULT_MIN_NON_NAME_WORDS = 30
@@ -240,18 +241,30 @@ def clear_word_caches() -> None:
     clear_bank_word_cache()
 
 
-def zipf(word: str) -> float:
+def zipf(word: str, is_name_word: bool | None = None) -> float:
     if not word:
         return 0.0
-    return float(get_word_scores().get(word.strip().upper(), 0.0))
+    up = word.strip().upper()
+    if not up:
+        return 0.0
+    scores = get_word_scores()
+    if up in scores:
+        return float(scores[up])
+    if is_name_word is True or (is_name_word is None and up in get_names_list()):
+        return 0.0
+    return MISSING_WORD_ZIPF_DEFAULT
 
 
 def is_common(word: str) -> bool:
     return zipf(word) >= COMMON_ZIPF_THRESHOLD
 
 
-def is_rare(word: str) -> bool:
-    return zipf(word) < RARE_ZIPF_THRESHOLD
+def is_rare(word: str, clue_bank_flag: bool = False) -> bool:
+    if not word:
+        return False
+    if is_name(word, clue_bank_flag=clue_bank_flag):
+        return False
+    return zipf(word, is_name_word=False) < RARE_ZIPF_THRESHOLD
 
 
 def is_name(word: str, clue_bank_flag: bool = False) -> bool:

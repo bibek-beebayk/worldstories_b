@@ -305,8 +305,15 @@ class CrosswordServicesTestCase(TestCase):
         self.assertTrue(is_name("POE"))
         self.assertFalse(is_name("ROSE"))  # Everyday common word is NOT a name
         self.assertTrue(is_common("ROSE"))
-        self.assertEqual(zipf("ZZZZQ"), 0.0)
-        self.assertTrue(is_rare("ZZZZQ"))
+        # Missing non-name word defaults to 3.0; names return normal value and are excluded from is_rare
+        self.assertEqual(zipf("ZZZZQ"), 3.0)
+        self.assertFalse(is_rare("ZZZZQ"))
+        self.assertFalse(is_rare("OGDEN"))
+        self.assertFalse(is_rare("POE"))
+        self.assertFalse(is_rare("AAAS", clue_bank_flag=True))
+        # Real low-Zipf (< 3.0) non-name word is flagged as rare
+        self.assertLess(zipf("AAAS"), 3.0)
+        self.assertTrue(is_rare("AAAS"))
         # Caches load once
         info1 = get_word_scores.cache_info()
         zipf("SPAM")
@@ -314,18 +321,23 @@ class CrosswordServicesTestCase(TestCase):
         self.assertEqual(info1.misses, info2.misses)
 
     def test_difficulty_scoring_override_solver_cap_and_warnings(self):
-        # Everyday high-Zipf symmetric grid -> Easy (PAST, AREAS, SENSE, TASTE, SEEN)
+        # 1. All-common high-Zipf symmetric grid -> Easy (PAST, AREAS, SENSE, TASTE, SEEN)
         easy_sol = ["PAST#", "AREAS", "SENSE", "TASTE", "#SEEN"]
         diff_easy = compute_difficulty(easy_sol, MOCK_PATTERN, include_db=False)
         self.assertEqual(diff_easy["names"], [])
         self.assertEqual(diff_easy["rare_words"], [])
         self.assertEqual(diff_easy["label"], "easy")
 
-        # Grid with 3+ rare/unknown words -> Hard
-        hard_sol = ["QQQQ#", "XXXXX", "ZZZZZ", "VVVVV", "#WWWW"]
+        # 2. Mixed grid (moderate avg_zipf ~3.8-3.9, score in [1.0, 1.45)) -> Medium
+        mixed_sol = ["SPAM#", "TALES", "AGILE", "RAVEN", "#NEEX"]
+        diff_mixed = compute_difficulty(mixed_sol, MOCK_PATTERN, include_db=False)
+        self.assertEqual(diff_mixed["label"], "medium")
+
+        # 3. Rare-heavy grid (low-Zipf < 3.0 words) -> Hard
+        hard_sol = ["AAAA#", "AAAHH", "AAASS", "AADDD", "#AAAS"]
         diff_hard = compute_difficulty(hard_sol, MOCK_PATTERN, include_db=False)
         self.assertEqual(diff_hard["label"], "hard")
-        self.assertGreaterEqual(len(diff_hard["rare_words"]), 3)
+        self.assertGreaterEqual(len(diff_hard["rare_words"]), 1)
 
         # Override preserved on recompute
         p = MiniCrossword.objects.create(

@@ -5,6 +5,12 @@ from apps.games.models import ClueBank, MiniCrossword
 from .grid import GRID_SIZE, extract_entry_answer, number_grid
 from .words import is_name, is_rare, zipf
 
+DIFFICULTY_BASE_ZIPF = 5.0
+DIFFICULTY_RARE_WEIGHT = 0.25
+DIFFICULTY_NAME_WEIGHT = 0.4
+DIFFICULTY_EASY_MAX_SCORE = 1.0
+DIFFICULTY_HARD_MIN_SCORE = 1.45
+
 _ALPHA_RE = re.compile(r"^[A-Z]+$")
 
 
@@ -43,17 +49,22 @@ def compute_difficulty(
             )
         )
 
-    zipf_vals = [zipf(a) for a in answers]
-    avg_zipf = round(sum(zipf_vals) / len(zipf_vals), 2)
-    rare_words = [a for a in answers if is_rare(a)]
     names = [a for a in answers if is_name(a, clue_bank_flag=(a in flagged_names))]
+    name_set = set(names)
+    rare_words = [a for a in answers if is_rare(a, clue_bank_flag=(a in flagged_names))]
+    zipf_vals = [zipf(a, is_name_word=(a in name_set)) for a in answers]
+    avg_zipf = round(sum(zipf_vals) / len(zipf_vals), 2)
 
-    raw_score = (5.5 - avg_zipf) + 0.6 * len(rare_words) + 0.6 * len(names)
+    raw_score = (
+        (DIFFICULTY_BASE_ZIPF - avg_zipf)
+        + DIFFICULTY_RARE_WEIGHT * len(rare_words)
+        + DIFFICULTY_NAME_WEIGHT * max(0, len(names) - 1)
+    )
     score = round(max(0.0, raw_score), 2)
 
-    if score < 1.0 and len(rare_words) == 0 and len(names) <= 1:
+    if score < DIFFICULTY_EASY_MAX_SCORE:
         label = MiniCrossword.DIFFICULTY_EASY
-    elif score >= 2.2 or len(rare_words) >= 3 or len(names) >= 3:
+    elif score >= DIFFICULTY_HARD_MIN_SCORE:
         label = MiniCrossword.DIFFICULTY_HARD
     else:
         label = MiniCrossword.DIFFICULTY_MEDIUM
