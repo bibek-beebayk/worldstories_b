@@ -444,7 +444,7 @@ urlpatterns = [
     ),
     path(
         "api/games/name-that-story/search/",
-        games_api.PuzzleSearchStoriesAPIView.as_view(),
+        games_api.PuzzleSearchAPIView.as_view(),
         name="nts-search",
     ),
     path(
@@ -473,6 +473,11 @@ urlpatterns = [
         name="nts-merge-guest",
     ),
     path(
+        "api/games/name-that-story/week/",
+        games_api.PuzzleWeekAPIView.as_view(),
+        name="nts-week",
+    ),
+    path(
         "api/admin/games/name-that-story/puzzles/",
         games_api.AdminPuzzlesListCreateAPIView.as_view(),
         name="admin-nts-puzzles",
@@ -483,9 +488,34 @@ urlpatterns = [
         name="admin-nts-puzzle-detail",
     ),
     path(
+        "api/admin/games/name-that-story/puzzles/<int:pk>/approve/",
+        games_api.AdminPuzzleApproveAPIView.as_view(),
+        name="admin-nts-puzzle-approve",
+    ),
+    path(
+        "api/admin/games/name-that-story/puzzles/<int:pk>/unapprove/",
+        games_api.AdminPuzzleUnapproveAPIView.as_view(),
+        name="admin-nts-puzzle-unapprove",
+    ),
+    path(
+        "api/admin/games/name-that-story/validate/",
+        games_api.AdminPuzzleValidateAPIView.as_view(),
+        name="admin-nts-validate",
+    ),
+    path(
         "api/admin/games/name-that-story/candidates/",
         games_api.AdminPuzzleCandidatesAPIView.as_view(),
         name="admin-nts-candidates",
+    ),
+    path(
+        "api/admin/games/name-that-story/build-clues/",
+        games_api.AdminBuildCluesAPIView.as_view(),
+        name="admin-nts-build-clues",
+    ),
+    path(
+        "api/admin/games/name-that-story/rotation/",
+        games_api.AdminPuzzleRotationAPIView.as_view(),
+        name="admin-nts-rotation",
     ),
     path(
         "api/admin/games/name-that-story/autofill/",
@@ -496,21 +526,6 @@ urlpatterns = [
         "api/admin/games/name-that-story/summary/",
         games_api.AdminPuzzleSummaryAPIView.as_view(),
         name="admin-nts-summary",
-    ),
-    path(
-        "api/admin/games/name-that-story/books/",
-        games_api.AdminPuzzleBooksListCreateAPIView.as_view(),
-        name="admin-nts-books",
-    ),
-    path(
-        "api/admin/games/name-that-story/books/import-csv/",
-        games_api.AdminPuzzleBooksImportCsvAPIView.as_view(),
-        name="admin-nts-books-import-csv",
-    ),
-    path(
-        "api/admin/games/name-that-story/books/<int:pk>/",
-        games_api.AdminPuzzleBookDetailAPIView.as_view(),
-        name="admin-nts-book-detail",
     ),
     path(
         "api/admin/analytics/audience/",

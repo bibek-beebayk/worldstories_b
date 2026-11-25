@@ -3,287 +3,388 @@ from datetime import date, datetime, timedelta, timezone as dt_timezone
 from django.contrib.auth import get_user_model
 from django.test import TestCase
 
-from apps.games.models import DailyPuzzle, PuzzleAttempt, PuzzleBook
+from apps.games.models import DailyPuzzle, PuzzleAttempt, PuzzleRotation
 from apps.games.services import (
-    author_initials,
+    DEFAULT_ROTATION,
+    AuthorBioBuilder,
+    AuthorResolver,
+    OpeningLineBuilder,
+    QuoteBuilder,
+    StoryResolver,
+    TriviaBuilder,
     auto_fill,
     clues_for,
-    compare_guess,
+    compare_years,
     compute_difficulty,
-    era_of,
-    extract_candidates,
-    facts_from_book,
-    facts_from_story,
-    length_label,
-    opening_line_in_story,
-    result_share_text,
+    decade_label,
+    format_initials,
+    html_to_plain_text,
+    leak_check,
+    result_share_tokens,
+    rotation_for_weekday,
+    split_sentences,
     stats_for,
+    validate_for_approval,
 )
 from apps.story.models import Author, Chapter, Genre, Story
 
 User = get_user_model()
 
 
-class GameServicesTests(TestCase):
+class GamesServicesTestCase(TestCase):
     def setUp(self):
-        self.author_poe = Author.objects.create(name="Edgar Allan Poe")
-        self.author_austen = Author.objects.create(name="Jane Austen")
-        self.genre_horror = Genre.objects.create(name="Horror")
-        self.genre_romance = Genre.objects.create(name="Romance")
+        self.g_gothic = Genre.objects.create(name="Gothic", slug="gothic")
+        self.g_mystery = Genre.objects.create(name="Mystery", slug="mystery")
+        self.g_scifi = Genre.objects.create(name="Sci-Fi", slug="sci-fi")
 
-        self.story_poe = Story.objects.create(
+        self.author_poe = Author.objects.create(
+            name="Edgar Allan Poe",
+            slug="edgar-allan-poe",
+            country="US",
+            birth_year=1809,
+            death_year=1849,
+        )
+        self.author_shelley = Author.objects.create(
+            name="Mary Shelley",
+            slug="mary-shelley",
+            country="",  # Intentionally blank to test derivation from stories
+            birth_year=None,
+        )
+        self.author_single = Author.objects.create(
+            name="Single Story Writer",
+            slug="single-story-writer",
+            country="FR",
+            birth_year=1920,
+        )
+
+        self.story_raven = Story.objects.create(
+            title="The Murders in the Rue Morgue",
+            slug="the-murders-in-the-rue-morgue",
+            author=self.author_poe,
+            country="US",
+            original_published_year=1841,
+            is_published=True,
+            views=800,
+        )
+        self.story_raven.genres.add(self.g_gothic, self.g_mystery)
+        Chapter.objects.create(
+            story=self.story_raven,
+            title="Chapter 1",
+            order=1,
+            content=(
+                "<h2>CHAPTER I</h2><p>IV.</p>"
+                "<p>THE MENTAL FEATURES DISCOURSED OF AS THE ANALYTICAL.</p>"
+                "<p>Residing in Paris during the spring and part of the summer of 1800, "
+                "I there became acquainted with a Monsieur Dupin.</p>"
+                "<p>He was a young gentleman of an excellent and illustrious family.</p>"
+            ),
+        )
+        Chapter.objects.create(
+            story=self.story_raven,
+            title="Chapter 2",
+            order=2,
+            content=(
+                "<p>The police were confounded by the seeming impossibility of the locked room "
+                "and the extraordinary strength displayed within the chamber.</p>"
+                "<p>A second paragraph discussed the Murders in great detail.</p>"
+            ),
+        )
+        Chapter.objects.create(
+            story=self.story_raven,
+            title="Chapter 3",
+            order=3,
+            content=(
+                "<p>In the end, the sailor confessed everything to the quiet investigator "
+                "sitting by the lamplight.</p>"
+            ),
+        )
+
+        self.story_poe_2 = Story.objects.create(
             title="The Tell-Tale Heart",
             slug="the-tell-tale-heart",
             author=self.author_poe,
             country="US",
             original_published_year=1843,
-            views=600,
             is_published=True,
+            views=600,
         )
-        self.story_poe.genres.add(self.genre_horror)
-        self.ch_poe = Chapter.objects.create(
-            story=self.story_poe,
-            title="Part 1",
-            slug="part-1",
+        self.story_poe_2.genres.add(self.g_gothic)
+        Chapter.objects.create(
+            story=self.story_poe_2,
+            title="Chapter 1",
             order=1,
             content=(
-                "<h2>CHAPTER I</h2><p>IV.</p><p>THE MADMAN</p>"
-                "<p>True! — nervous, very, very dreadfully nervous I had been and am; "
-                "but why will you say that I am mad? The disease had sharpened my senses, "
-                "not destroyed, not dulled them.</p>"
+                "<p>True! Nervous, very, very dreadfully nervous I had been and am, "
+                "but why will you say that I am mad?</p>"
+                "<p>The disease had sharpened my senses, not destroyed, not dulled them at all.</p>"
             ),
         )
 
-        self.story_austen = Story.objects.create(
-            title="Pride and Prejudice",
-            slug="pride-and-prejudice",
-            author=self.author_austen,
+        self.story_frank = Story.objects.create(
+            title="Frankenstein",
+            slug="frankenstein",
+            author=self.author_shelley,
             country="GB",
-            original_published_year=1813,
-            views=50,
+            original_published_year=1818,
             is_published=True,
+            views=400,
         )
-        self.story_austen.genres.add(self.genre_romance)
+        self.story_frank.genres.add(self.g_gothic, self.g_scifi)
         Chapter.objects.create(
-            story=self.story_austen,
-            title="Chapter 1",
-            slug="ch-1",
+            story=self.story_frank,
+            title="Letter 1",
             order=1,
-            content="<p>It is a truth universally acknowledged, that a single man in possession of a good fortune, must be in want of a wife.</p>",
+            content=(
+                "<p>You will rejoice to hear that no disaster has accompanied the commencement "
+                "of an enterprise which you have regarded with such evil forebodings.</p>"
+            ),
         )
+        self.story_frank_2 = Story.objects.create(
+            title="The Last Man",
+            slug="the-last-man",
+            author=self.author_shelley,
+            country="GB",
+            original_published_year=1826,
+            is_published=True,
+            views=200,
+        )
+        self.story_frank_2.genres.add(self.g_scifi)
 
-        self.story_minimal = Story.objects.create(
+        # Edge cases: story with no author, missing year, no genres, tiny chapter
+        self.story_bare = Story.objects.create(
             title="Untitled Fragment",
             slug="untitled-fragment",
             author=None,
             country="",
             original_published_year=None,
-            views=0,
             is_published=True,
+            views=10,
         )
         Chapter.objects.create(
-            story=self.story_minimal,
-            title="Only",
-            slug="only",
-            order=1,
-            content="<p>Short opening sentence that is still long enough to be picked.</p>",
-        )
-
-    def test_era_of(self):
-        self.assertEqual(era_of(1843), "1840s")
-        self.assertEqual(era_of(1900), "1900s")
-        self.assertIsNone(era_of(None))
-        self.assertIsNone(era_of(0))
-
-    def test_author_initials(self):
-        self.assertEqual(author_initials(self.story_poe), "E. A. P.")
-        self.assertEqual(author_initials(self.story_austen), "J. A.")
-        self.assertIsNone(author_initials(self.story_minimal))
-
-    def test_length_label(self):
-        self.assertEqual(length_label(self.story_poe), "Short story")
-        novella_story = Story.objects.create(title="Mid", slug="mid", is_published=True)
-        Chapter.objects.create(
-            story=novella_story,
+            story=self.story_bare,
             title="Ch 1",
-            slug="c1",
             order=1,
-            content="<p>" + ("word " * 15000) + "</p>",
+            content="<p>Hi.</p>",
         )
-        self.assertEqual(length_label(novella_story), "Novella")
 
-        novel_story = Story.objects.create(title="Long", slug="long", is_published=True)
-        Chapter.objects.create(
-            story=novel_story,
-            title="Ch 1",
-            slug="c1",
-            order=1,
-            content="<p>" + ("word " * 41000) + "</p>",
-        )
-        self.assertEqual(length_label(novel_story), "Novel")
-
-    def test_compare_guess_and_missing_fields(self):
-        same = compare_guess(self.story_poe, self.story_poe)
-        self.assertTrue(same["correct"])
-        self.assertEqual(same["matches"], {"genre": True, "country": True, "era": "same"})
-
-        close_story = Story.objects.create(
-            title="Close Era",
-            slug="close-era",
-            country="US",
-            original_published_year=1851,
+        # Single-story author
+        self.story_single = Story.objects.create(
+            title="One Solo Work",
+            slug="one-solo-work",
+            author=self.author_single,
+            country="FR",
+            original_published_year=1948,
             is_published=True,
+            views=100,
         )
-        close_story.genres.add(self.genre_romance)
-        res_close = compare_guess(self.story_poe, close_story)
-        self.assertFalse(res_close["correct"])
-        self.assertEqual(res_close["matches"], {"genre": False, "country": True, "era": "close"})
+        self.story_single.genres.add(self.g_mystery)
 
-        res_missing = compare_guess(self.story_minimal, self.story_poe)
-        self.assertEqual(res_missing["matches"], {"genre": False, "country": False, "era": "different"})
+    def test_text_helpers(self):
+        plain = html_to_plain_text("<h1>CHAPTER I</h1><p>IV.</p><p>It was a dark &amp; stormy night.</p>")
+        sentences = split_sentences(plain)
+        self.assertEqual(sentences, ["It was a dark & stormy night."])
+        self.assertEqual(format_initials("Edgar Allan Poe"), "E. A. P.")
+        self.assertEqual(decade_label(1841), "1840s")
+        self.assertIsNone(decade_label(None))
 
-    def test_clues_for_reveals_strictly_in_order(self):
+    def test_compare_years(self):
+        self.assertEqual(compare_years(1841, 1849), "same")
+        self.assertEqual(compare_years(1849, 1852), "close")
+        self.assertEqual(compare_years(1841, 1890), "different")
+        self.assertEqual(compare_years(1841, None), "different")
+
+    def test_story_resolver_attributes_and_compare(self):
+        resolver = StoryResolver()
+        attrs = resolver.attributes(self.story_raven)
+        self.assertEqual(attrs["genre"], "Gothic, Mystery")
+        self.assertEqual(attrs["country"], "United States")
+        self.assertEqual(attrs["era"], "1840s")
+        self.assertEqual(attrs["length"], "Short story")
+        self.assertEqual(attrs["initials"], "E. A. P.")
+
+        cmp_same = resolver.compare(self.story_raven, self.story_raven)
+        self.assertTrue(cmp_same["correct"])
+        self.assertTrue(cmp_same["matches"]["genre"])
+        self.assertTrue(cmp_same["matches"]["country"])
+        self.assertEqual(cmp_same["matches"]["era"], "same")
+
+        cmp_other = resolver.compare(self.story_raven, self.story_frank)
+        self.assertFalse(cmp_other["correct"])
+        self.assertTrue(cmp_other["matches"]["genre"])  # both Gothic
+        self.assertFalse(cmp_other["matches"]["country"])
+        self.assertEqual(cmp_other["matches"]["era"], "different")
+
+        # Missing values never match
+        cmp_bare = resolver.compare(self.story_bare, self.story_bare)
+        self.assertTrue(cmp_bare["correct"])
+        self.assertFalse(cmp_bare["matches"]["genre"])
+        self.assertFalse(cmp_bare["matches"]["country"])
+        self.assertEqual(cmp_bare["matches"]["era"], "different")
+
+    def test_author_resolver_derives_missing_country_era_genres(self):
+        resolver = AuthorResolver()
+        attrs = resolver.attributes(self.author_shelley)
+        # Derived from Frankenstein (GB, 1818) & The Last Man (GB, 1826)
+        self.assertEqual(attrs["country"], "United Kingdom")
+        self.assertEqual(attrs["era"], "1810s")
+        self.assertEqual(attrs["genre"], "Gothic, Sci-Fi")
+        self.assertEqual(attrs["works_count"], "2 stories on WorldStories")
+        self.assertEqual(attrs["works_sample"], "Frankenstein")
+
+        # Author with explicit birth_year/country uses them directly
+        poe_attrs = resolver.attributes(self.author_poe)
+        self.assertEqual(poe_attrs["country"], "United States")
+        self.assertEqual(poe_attrs["era"], "1800s")
+
+        # Close era comparison: 1809 vs 1818 -> diff 9 -> close
+        cmp_authors = resolver.compare(self.author_poe, self.author_shelley)
+        self.assertFalse(cmp_authors["correct"])
+        self.assertTrue(cmp_authors["matches"]["genre"])
+        self.assertFalse(cmp_authors["matches"]["country"])
+        self.assertEqual(cmp_authors["matches"]["era"], "close")
+
+    def test_opening_line_and_quote_builders_filter_headings_and_leaks(self):
+        ob = OpeningLineBuilder()
+        cands = ob.candidates(self.story_raven)
+        self.assertTrue(len(cands) >= 1)
+        self.assertTrue(cands[0]["text"].startswith("Residing in Paris"))
+
+        qb = QuoteBuilder()
+        q_cands = qb.candidates(self.story_raven)
+        self.assertTrue(len(q_cands) >= 1)
+        # Sentence containing "Murders" (title word) must be filtered out by leak check
+        for c in q_cands:
+            self.assertNotIn("Murders", c["text"])
+
+        # Tiny chapter yields no candidates
+        self.assertEqual(ob.candidates(self.story_bare), [])
+        self.assertEqual(TriviaBuilder().can_auto_build, False)
+        self.assertEqual(TriviaBuilder().default_clues(self.story_raven), [])
+
+    def test_leak_check_and_validation(self):
+        leaks = leak_check(
+            {
+                "puzzle_type": "trivia",
+                "answer_kind": "story",
+                "answer": self.story_raven,
+                "clues": [
+                    {"kind": "text", "label": "Clue 1", "value": "Set in Paris with a clever detective."},
+                    {"kind": "text", "label": "Clue 2", "value": "Written by Poe about famous murders."},
+                    {"kind": "attribute", "key": "genre", "label": "Genre"},
+                    {"kind": "attribute", "key": "country", "label": "Country"},
+                ],
+            }
+        )
+        leaked_terms = {item["term"] for item in leaks}
+        self.assertIn("poe", leaked_terms)
+        self.assertIn("murders", leaked_terms)
+
+        # Author leak check catches 3+ letter name tokens (and accented forms)
+        author_leaks = leak_check(
+            {
+                "puzzle_type": "author_bio",
+                "answer_kind": "author",
+                "answer": self.author_poe,
+                "clues": [
+                    {"kind": "text", "label": "Bio", "value": "Born in Boston, Édgar wrote macabre tales."},
+                ],
+            }
+        )
+        self.assertTrue(any(item["term"] == "edgar" for item in author_leaks))
+
+        # Validation passes for clean opening_line default clues
+        clues = OpeningLineBuilder().default_clues(self.story_raven)
+        errors = validate_for_approval(
+            {
+                "puzzle_type": "opening_line",
+                "answer_kind": "story",
+                "answer": self.story_raven,
+                "clues": clues,
+            }
+        )
+        self.assertEqual(errors, [])
+
+        # Validation fails for bare story with unresolvable attributes
+        bare_errors = validate_for_approval(
+            {
+                "puzzle_type": "opening_line",
+                "answer_kind": "story",
+                "answer": self.story_bare,
+                "clues": [
+                    {"kind": "text", "label": "Opening line", "value": "A mysterious opening sentence."},
+                    {"kind": "attribute", "key": "genre", "label": "Genre"},
+                    {"kind": "attribute", "key": "country", "label": "Country"},
+                    {"kind": "attribute", "key": "era", "label": "Era"},
+                ],
+            }
+        )
+        self.assertTrue(len(bare_errors) >= 3)
+
+    def test_clues_for_hides_locked_clues(self):
+        clues = OpeningLineBuilder().default_clues(self.story_raven)
         puzzle = DailyPuzzle.objects.create(
             date=date(2026, 11, 20),
-            story=self.story_poe,
-            opening_line="True! Nervous, very, very dreadfully nervous I had been and am.",
-            source_chapter=self.ch_poe,
+            puzzle_type="opening_line",
+            answer_kind="story",
+            answer_story=self.story_raven,
+            clues=clues,
+            status="approved",
         )
-        c1 = clues_for(puzzle, 1)
-        self.assertEqual([c["key"] for c in c1], ["genre"])
-        self.assertEqual(c1[0]["value"], "Horror")
+        res = clues_for(puzzle, unlocked_count=2)
+        self.assertEqual(len(res), 6)
+        self.assertFalse(res[0]["locked"])
+        self.assertFalse(res[1]["locked"])
+        self.assertEqual(res[1]["value"], "Gothic, Mystery")
+        for locked_item in res[2:]:
+            self.assertEqual(set(locked_item.keys()), {"position", "locked"})
+            self.assertTrue(locked_item["locked"])
 
-        c5 = clues_for(puzzle, 5)
-        self.assertEqual([c["key"] for c in c5], ["genre", "country", "era", "length", "author_initials"])
-        self.assertEqual(c5[4]["value"], "E. A. P.")
+    def test_auto_fill_respects_rotation_and_skips_trivia(self):
+        # 2026-11-23 is a Monday (weekday 0 -> opening_line, Tue -> trivia, Wed -> author_bio, Thu -> quote)
+        start = date(2026, 11, 23)
+        self.assertEqual(rotation_for_weekday(0), DEFAULT_ROTATION[0])
+        summary = auto_fill(start, days=4)
+        # Tuesday (2026-11-24) is trivia -> skipped_empty
+        self.assertIn("2026-11-24", summary["skipped_empty"])
+        self.assertTrue(DailyPuzzle.objects.filter(date=date(2026, 11, 23), puzzle_type="opening_line").exists())
+        self.assertTrue(DailyPuzzle.objects.filter(date=date(2026, 11, 25), puzzle_type="author_bio").exists())
+        # Single-story author should NOT be auto-picked for author_bio
+        wed = DailyPuzzle.objects.get(date=date(2026, 11, 25))
+        self.assertNotEqual(wed.answer_author_id, self.author_single.id)
 
-        c6 = clues_for(puzzle, 6)
-        self.assertEqual(len(c6), 6)
-        self.assertEqual(c6[5]["key"], "cover")
+        # Running auto_fill a second time is idempotent
+        summary2 = auto_fill(start, days=4)
+        self.assertEqual(summary2["created_count"], 0)
+        self.assertEqual(summary2["drafted_count"], 0)
 
-    def test_extract_candidates_skips_headings_and_prefers_good_lines(self):
-        cands = extract_candidates(self.story_poe, limit=5)
-        self.assertGreaterEqual(len(cands), 1)
-        self.assertNotIn("CHAPTER I", cands[0]["text"])
-        self.assertNotIn("THE MADMAN", cands[0]["text"])
-        self.assertTrue(cands[0]["text"].startswith("True!"))
-        self.assertTrue(opening_line_in_story(self.story_poe, cands[0]["text"]))
-        self.assertFalse(opening_line_in_story(self.story_poe, "Completely invented sentence."))
-
-    def test_compute_difficulty(self):
-        self.assertEqual(compute_difficulty("Short line here.", self.story_austen), "easy")
-        self.assertEqual(compute_difficulty(" ".join(["word"] * 20), self.story_poe), "easy")  # popular views=600
-        self.assertEqual(compute_difficulty(" ".join(["word"] * 20), self.story_austen), "medium")
-        self.assertEqual(compute_difficulty(" ".join(["word"] * 35), self.story_austen), "hard")
-
-    def test_auto_fill_deterministic_and_idempotent(self):
-        start = date(2026, 12, 1)
-        res1 = auto_fill(start, 3)
-        self.assertEqual(len(res1["created"]), 3)
-        self.assertEqual(len(res1["skipped"]), 0)
-
-        res2 = auto_fill(start, 3)
-        self.assertEqual(len(res2["created"]), 0)
-        self.assertEqual(len(res2["skipped"]), 3)
-
-    def test_result_share_text_and_stats_streak_excludes_archive(self):
-        user = User.objects.create_user(email="player@example.com", username="player1", password="pw")
-        d1 = date(2026, 11, 23)
-        d2 = date(2026, 11, 24)
-        d3 = date(2026, 11, 25)
-        p1 = DailyPuzzle.objects.create(date=d1, story=self.story_poe, opening_line="Line one.")
-        p2 = DailyPuzzle.objects.create(date=d2, story=self.story_austen, opening_line="Line two.")
-        p3 = DailyPuzzle.objects.create(date=d3, story=self.story_minimal, opening_line="Line three.")
-
-        # Solved p1 as archive on d3 -> must NOT count toward streak
-        PuzzleAttempt.objects.create(
-            puzzle=p1,
-            user=user,
-            guesses=[{"story_id": self.story_poe.id, "correct": True, "matches": {}, "skipped": False}],
-            status=PuzzleAttempt.STATUS_SOLVED,
-            guess_count=1,
-            completed_at=datetime(2026, 11, 25, 10, 0, tzinfo=dt_timezone.utc),
-        )
-        # Solved p2 on d2 and p3 on d3 -> streak = 2
-        a2 = PuzzleAttempt.objects.create(
-            puzzle=p2,
-            user=user,
-            guesses=[
-                {"story_id": self.story_poe.id, "correct": False, "matches": {}, "skipped": False},
-                {"story_id": self.story_austen.id, "correct": True, "matches": {}, "skipped": False},
-            ],
-            status=PuzzleAttempt.STATUS_SOLVED,
-            guess_count=2,
-            completed_at=datetime(2026, 11, 24, 12, 0, tzinfo=dt_timezone.utc),
-        )
-        PuzzleAttempt.objects.create(
-            puzzle=p3,
-            user=user,
-            guesses=[{"story_id": self.story_minimal.id, "correct": True, "matches": {}, "skipped": False}],
-            status=PuzzleAttempt.STATUS_SOLVED,
-            guess_count=1,
-            completed_at=datetime(2026, 11, 25, 12, 0, tzinfo=dt_timezone.utc),
-        )
-
-        share = result_share_text(p2, a2)
-        self.assertEqual(share["tokens"], ["wrong", "right", "empty", "empty", "empty", "empty"])
-        self.assertNotIn("Pride", share["header"])
-
-        stats = stats_for(user=user, today=d3)
-        self.assertEqual(stats["played"], 3)
-        self.assertEqual(stats["wins"], 3)
-        self.assertEqual(stats["win_percentage"], 100)
-        self.assertEqual(stats["current_streak"], 2)
-        self.assertEqual(stats["best_streak"], 2)
-        self.assertEqual(stats["guess_distribution"]["1"], 2)
-        self.assertEqual(stats["guess_distribution"]["2"], 1)
-
-    def test_external_book_facts_clues_matching_and_autofill_with_null_story(self):
-        book = PuzzleBook.objects.create(
-            title="The Great Gatsby",
-            author_name="F. Scott Fitzgerald",
-            country="US",
-            original_published_year=1925,
-            length_label=PuzzleBook.LENGTH_NOVEL,
-            cover_image="https://cdn.example.com/gatsby.jpg",
-        )
-        book.genres.add(self.genre_romance)
-
+    def test_stats_and_share_tokens(self):
+        clues = AuthorBioBuilder().default_clues(self.author_poe)
+        today = date.today()
         puzzle = DailyPuzzle.objects.create(
-            date=date(2026, 12, 10),
-            book=book,
-            opening_line="In my younger and more vulnerable years my father gave me some advice.",
+            date=today,
+            puzzle_type="author_bio",
+            answer_kind="author",
+            answer_author=self.author_poe,
+            clues=clues,
+            status="approved",
         )
-        self.assertEqual(puzzle.difficulty, "easy")  # 12 words < 14
-        self.assertIn("The Great Gatsby", str(puzzle))
-
-        # Clues from PuzzleBook via BookFacts
-        c6 = clues_for(puzzle, 6)
-        self.assertEqual([c["key"] for c in c6], ["genre", "country", "era", "length", "author_initials", "cover"])
-        self.assertEqual(c6[0]["value"], "Romance")
-        self.assertEqual(c6[2]["value"], "1920s")
-        self.assertEqual(c6[3]["value"], "Novel")
-        self.assertEqual(c6[4]["value"], "F. S. F.")
-
-        # Cross-kind matching (catalogue story vs external book)
-        cross = compare_guess(book, self.story_austen)
-        self.assertFalse(cross["correct"])
-        self.assertEqual(cross["matches"], {"genre": True, "country": False, "era": "different"})
-
-        # Normalized title + author match across kinds counts as correct
-        later_story = Story.objects.create(
-            title="  the  great gatsby ",
-            slug="the-great-gatsby-later",
-            author=Author.objects.create(name="F. Scott Fitzgerald"),
-            is_published=True,
+        attempt = PuzzleAttempt.objects.create(
+            puzzle=puzzle,
+            guest_key="guest-abc",
+            guesses=[
+                {"target_id": self.author_shelley.id, "correct": False, "matches": {}, "skipped": False},
+                {"target_id": self.author_poe.id, "correct": True, "matches": {}, "skipped": False},
+            ],
+            status="solved",
+            guess_count=2,
+            completed_at=datetime.now(dt_timezone.utc),
         )
-        self.assertTrue(compare_guess(facts_from_book(book), facts_from_story(later_story))["correct"])
+        tokens = result_share_tokens(puzzle, attempt)
+        self.assertEqual(tokens, ["wrong", "right", "empty", "empty", "empty", "empty"])
 
-        # External book difficulty ignores popularity (never popular)
-        long_line = " ".join(["word"] * 35)
-        self.assertEqual(compute_difficulty(long_line, book), "hard")
-
-        # Auto-fill handles existing puzzles with story=None cleanly
-        res = auto_fill(date(2026, 12, 10), 2)
-        self.assertEqual(len(res["skipped"]), 1)
-        self.assertEqual(len(res["created"]), 1)
+        st = stats_for(guest_key="guest-abc")
+        self.assertEqual(st["played"], 1)
+        self.assertEqual(st["wins"], 1)
+        self.assertEqual(st["win_percentage"], 100)
+        self.assertEqual(st["guess_distribution"]["2"], 1)
+        self.assertIn(compute_difficulty(puzzle), ("easy", "medium", "hard"))

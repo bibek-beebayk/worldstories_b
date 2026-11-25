@@ -1,38 +1,54 @@
 from django.contrib import admin
 
-from apps.games.models import DailyPuzzle, PuzzleAttempt, PuzzleBook
-
-
-@admin.register(PuzzleBook)
-class PuzzleBookAdmin(admin.ModelAdmin):
-    list_display = ("title", "author_name", "country", "original_published_year", "length_label", "created_at")
-    list_filter = ("length_label", "country")
-    search_fields = ("title", "author_name")
-    filter_horizontal = ("genres",)
+from apps.games.models import DailyPuzzle, PuzzleAttempt, PuzzleRotation
 
 
 @admin.register(DailyPuzzle)
 class DailyPuzzleAdmin(admin.ModelAdmin):
-    list_display = ("date", "number", "answer_title", "answer_source", "difficulty", "auto_filled", "created_at")
-    list_filter = ("difficulty", "auto_filled")
-    search_fields = ("story__title", "book__title", "book__author_name", "opening_line")
-    raw_id_fields = ("story", "book", "source_chapter", "created_by")
+    list_display = (
+        "date",
+        "puzzle_type",
+        "answer_kind",
+        "answer_label",
+        "status",
+        "difficulty",
+        "auto_filled",
+        "created_at",
+    )
+    list_filter = ("puzzle_type", "answer_kind", "status", "difficulty", "auto_filled")
+    search_fields = ("answer_story__title", "answer_author__name")
     date_hierarchy = "date"
+    raw_id_fields = (
+        "answer_story",
+        "answer_author",
+        "source_chapter",
+        "created_by",
+        "approved_by",
+    )
+    readonly_fields = ("created_at", "updated_at")
 
     @admin.display(description="Answer")
-    def answer_title(self, obj):
-        return obj.answer_facts.title if (obj.story_id or obj.book_id) else "—"
-
-    @admin.display(description="Source")
-    def answer_source(self, obj):
-        return "Catalogue" if obj.story_id else "External"
+    def answer_label(self, obj):
+        if obj.answer_kind == DailyPuzzle.ANSWER_KIND_AUTHOR and obj.answer_author_id:
+            return obj.answer_author.name
+        if obj.answer_story_id:
+            return obj.answer_story.title
+        return "Unassigned"
 
 
 @admin.register(PuzzleAttempt)
 class PuzzleAttemptAdmin(admin.ModelAdmin):
-    list_display = ("puzzle", "user", "guest_key", "status", "guess_count", "completed_at", "created_at")
-    list_filter = ("status",)
-    search_fields = ("user__email", "user__username", "guest_key", "puzzle__story__title", "puzzle__book__title")
+    list_display = (
+        "puzzle",
+        "user",
+        "guest_key",
+        "status",
+        "guess_count",
+        "completed_at",
+        "created_at",
+    )
+    list_filter = ("status", "puzzle__puzzle_type")
+    search_fields = ("user__username", "user__email", "guest_key")
     readonly_fields = (
         "puzzle",
         "user",
@@ -49,3 +65,9 @@ class PuzzleAttemptAdmin(admin.ModelAdmin):
 
     def has_change_permission(self, request, obj=None):
         return False
+
+
+@admin.register(PuzzleRotation)
+class PuzzleRotationAdmin(admin.ModelAdmin):
+    list_display = ("weekday", "puzzle_type")
+    ordering = ("weekday",)
