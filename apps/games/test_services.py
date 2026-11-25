@@ -3,7 +3,7 @@ from datetime import date, datetime, timedelta, timezone as dt_timezone
 from django.contrib.auth import get_user_model
 from django.test import TestCase
 
-from apps.games.models import DailyPuzzle, PuzzleAttempt
+from apps.games.models import DailyPuzzle, PuzzleAttempt, PuzzleBook
 from apps.games.services import (
     author_initials,
     auto_fill,
@@ -12,6 +12,8 @@ from apps.games.services import (
     compute_difficulty,
     era_of,
     extract_candidates,
+    facts_from_book,
+    facts_from_story,
     length_label,
     opening_line_in_story,
     result_share_text,
@@ -235,3 +237,53 @@ class GameServicesTests(TestCase):
         self.assertEqual(stats["best_streak"], 2)
         self.assertEqual(stats["guess_distribution"]["1"], 2)
         self.assertEqual(stats["guess_distribution"]["2"], 1)
+
+    def test_external_book_facts_clues_matching_and_autofill_with_null_story(self):
+        book = PuzzleBook.objects.create(
+            title="The Great Gatsby",
+            author_name="F. Scott Fitzgerald",
+            country="US",
+            original_published_year=1925,
+            length_label=PuzzleBook.LENGTH_NOVEL,
+            cover_image="https://cdn.example.com/gatsby.jpg",
+        )
+        book.genres.add(self.genre_romance)
+
+        puzzle = DailyPuzzle.objects.create(
+            date=date(2026, 12, 10),
+            book=book,
+            opening_line="In my younger and more vulnerable years my father gave me some advice.",
+        )
+        self.assertEqual(puzzle.difficulty, "easy")  # 12 words < 14
+        self.assertIn("The Great Gatsby", str(puzzle))
+
+        # Clues from PuzzleBook via BookFacts
+        c6 = clues_for(puzzle, 6)
+        self.assertEqual([c["key"] for c in c6], ["genre", "country", "era", "length", "author_initials", "cover"])
+        self.assertEqual(c6[0]["value"], "Romance")
+        self.assertEqual(c6[2]["value"], "1920s")
+        self.assertEqual(c6[3]["value"], "Novel")
+        self.assertEqual(c6[4]["value"], "F. S. F.")
+
+        # Cross-kind matching (catalogue story vs external book)
+        cross = compare_guess(book, self.story_austen)
+        self.assertFalse(cross["correct"])
+        self.assertEqual(cross["matches"], {"genre": True, "country": False, "era": "different"})
+
+        # Normalized title + author match across kinds counts as correct
+        later_story = Story.objects.create(
+            title="  the  great gatsby ",
+            slug="the-great-gatsby-later",
+            author=Author.objects.create(name="F. Scott Fitzgerald"),
+            is_published=True,
+        )
+        self.assertTrue(compare_guess(facts_from_book(book), facts_from_story(later_story))["correct"])
+
+        # External book difficulty ignores popularity (never popular)
+        long_line = " ".join(["word"] * 35)
+        self.assertEqual(compute_difficulty(long_line, book), "hard")
+
+        # Auto-fill handles existing puzzles with story=None cleanly
+        res = auto_fill(date(2026, 12, 10), 2)
+        self.assertEqual(len(res["skipped"]), 1)
+        self.assertEqual(len(res["created"]), 1)

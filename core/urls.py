@@ -498,6 +498,21 @@ urlpatterns = [
         name="admin-nts-summary",
     ),
     path(
+        "api/admin/games/name-that-story/books/",
+        games_api.AdminPuzzleBooksListCreateAPIView.as_view(),
+        name="admin-nts-books",
+    ),
+    path(
+        "api/admin/games/name-that-story/books/import-csv/",
+        games_api.AdminPuzzleBooksImportCsvAPIView.as_view(),
+        name="admin-nts-books-import-csv",
+    ),
+    path(
+        "api/admin/games/name-that-story/books/<int:pk>/",
+        games_api.AdminPuzzleBookDetailAPIView.as_view(),
+        name="admin-nts-book-detail",
+    ),
+    path(
         "api/admin/analytics/audience/",
         audience_api.AdminAnalyticsAudienceAPIView.as_view(),
         name="admin-analytics-audience",

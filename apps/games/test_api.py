@@ -2,10 +2,11 @@ from datetime import timedelta
 from io import StringIO
 
 from django.contrib.auth import get_user_model
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.core.management import call_command
 from rest_framework.test import APITestCase
 
-from apps.games.models import DailyPuzzle, PuzzleAttempt
+from apps.games.models import DailyPuzzle, PuzzleAttempt, PuzzleBook
 from apps.games.services import utc_today
 from apps.story.models import Author, Chapter, Genre, Story
 
@@ -245,3 +246,134 @@ class NameThatStoryApiTests(APITestCase):
         out2 = StringIO()
         call_command("autofill_puzzles", "--days", "3", stdout=out2)
         self.assertIn("created=0", out2.getvalue())
+
+    def test_external_book_puzzle_play_search_legacy_guesses_and_csv_import(self):
+        # Create an external book + duplicate-of-catalogue external book
+        ext_book = PuzzleBook.objects.create(
+            title="Dune",
+            author_name="Frank Herbert",
+            country="US",
+            original_published_year=1965,
+            length_label=PuzzleBook.LENGTH_NOVEL,
+        )
+        ext_book.genres.add(self.g_scifi)
+
+        # Duplicate of published catalogue story should be hidden in public search
+        PuzzleBook.objects.create(
+            title="The Black Cat",
+            author_name="Edgar Allan Poe",
+            country="US",
+            original_published_year=1843,
+            length_label=PuzzleBook.LENGTH_SHORT_STORY,
+        )
+
+        # Public search returns unified shape {key, title, author, cover_thumb} with no kind leak
+        s_res = self.client.get("/api/games/name-that-story/search/?q=Dune")
+        self.assertEqual(s_res.status_code, 200)
+        self.assertEqual(len(s_res.data["results"]), 1)
+        self.assertEqual(set(s_res.data["results"][0].keys()), {"key", "title", "author", "cover_thumb"})
+        self.assertEqual(s_res.data["results"][0]["key"], f"book:{ext_book.id}")
+
+        dup_search = self.client.get("/api/games/name-that-story/search/?q=Black Cat")
+        self.assertEqual(len(dup_search.data["results"]), 1)
+        self.assertTrue(dup_search.data["results"][0]["key"].startswith("story:"))
+
+        # Legacy guess entry with only story_id still reads and prevents duplicate guess
+        legacy_date = self.today - timedelta(days=2)
+        ext_puzzle = DailyPuzzle.objects.create(
+            date=legacy_date,
+            book=ext_book,
+            opening_line="A beginning is the time for taking the most delicate care.",
+        )
+        PuzzleAttempt.objects.create(
+            puzzle=ext_puzzle,
+            user=self.user,
+            guesses=[{"story_id": self.wrong_stories[1].id, "correct": False, "matches": {"genre": True, "country": False, "era": "different"}, "skipped": False}],
+            guess_count=1,
+            status=PuzzleAttempt.STATUS_IN_PROGRESS,
+        )
+
+        self.client.force_authenticate(user=self.user)
+        # Before completion, answer is never returned
+        p_res = self.client.get(f"/api/games/name-that-story/puzzles/{legacy_date.isoformat()}/")
+        self.assertEqual(p_res.status_code, 200)
+        self.assertNotIn("answer", p_res.data)
+        self.assertEqual(p_res.data["guesses"][0]["key"], f"story:{self.wrong_stories[1].id}")
+
+        # Duplicate guess against legacy entry rejected
+        dup_g = self.client.post(
+            "/api/games/name-that-story/guess/",
+            {"date": legacy_date.isoformat(), "story_id": self.wrong_stories[1].id},
+            format="json",
+        )
+        self.assertEqual(dup_g.status_code, 400)
+        self.assertEqual(dup_g.data["error"], "already_guessed")
+
+        # Exactly-one validation on guess
+        both_g = self.client.post(
+            "/api/games/name-that-story/guess/",
+            {"date": legacy_date.isoformat(), "story_id": self.wrong_stories[2].id, "book_id": ext_book.id},
+            format="json",
+        )
+        self.assertEqual(both_g.status_code, 400)
+
+        # Solve external book puzzle with book_id
+        win_g = self.client.post(
+            "/api/games/name-that-story/guess/",
+            {"date": legacy_date.isoformat(), "book_id": ext_book.id},
+            format="json",
+        )
+        self.assertEqual(win_g.status_code, 200)
+        self.assertEqual(win_g.data["status"], "solved")
+        self.assertEqual(win_g.data["answer"]["title"], "Dune")
+        self.assertIsNone(win_g.data["answer"]["slug"])
+        self.assertIsNone(win_g.data["answer"]["read_time"])
+        self.assertFalse(win_g.data["answer"]["has_audiobook"])
+
+        # Admin: cannot delete book used by puzzle, cannot create duplicate of catalogue story
+        self.client.force_authenticate(user=self.admin)
+        del_book = self.client.delete(f"/api/admin/games/name-that-story/books/{ext_book.id}/")
+        self.assertEqual(del_book.status_code, 409)
+
+        cat_dup = self.client.post(
+            "/api/admin/games/name-that-story/books/",
+            {"title": "The Black Cat", "author_name": "Edgar Allan Poe", "genres": [self.g_horror.id]},
+            format="json",
+        )
+        self.assertEqual(cat_dup.status_code, 400)
+
+        # Admin: candidates for book_id returns empty candidates + clues_preview
+        cand_res = self.client.get(f"/api/admin/games/name-that-story/candidates/?book_id={ext_book.id}")
+        self.assertEqual(cand_res.status_code, 200)
+        self.assertEqual(cand_res.data["candidates"], [])
+        self.assertEqual(len(cand_res.data["clues_preview"]), 6)
+
+        # Admin: switching puzzle from story to book clears story & source_chapter
+        patch_res = self.client.patch(
+            f"/api/admin/games/name-that-story/puzzles/{self.puzzle_today.id}/",
+            {"book_id": ext_book.id, "opening_line": "Custom line for Dune."},
+            format="json",
+        )
+        self.assertEqual(patch_res.status_code, 200)
+        self.assertFalse(patch_res.data["answer"]["in_catalogue"])
+        self.puzzle_today.refresh_from_db()
+        self.assertIsNone(self.puzzle_today.story_id)
+        self.assertIsNone(self.puzzle_today.source_chapter_id)
+
+        # Admin: CSV bulk import
+        csv_content = (
+            "title,author_name,genres,country,original_published_year,length_label,cover_image_link\n"
+            "Foundation,Isaac Asimov,Science Fiction,US,1951,Novel,https://cdn.example.com/found.jpg\n"
+            "Dune,Frank Herbert,Science Fiction,US,1965,Novel,\n"
+            "Bad Row,,Science Fiction,US,1990,Novel,\n"
+        ).encode("utf-8")
+        csv_file = SimpleUploadedFile("books.csv", csv_content, content_type="text/csv")
+        imp_res = self.client.post(
+            "/api/admin/games/name-that-story/books/import-csv/",
+            {"file": csv_file},
+            format="multipart",
+        )
+        self.assertEqual(imp_res.status_code, 200)
+        self.assertEqual(imp_res.data["created"], 1)
+        self.assertEqual(imp_res.data["skipped"], 1)
+        self.assertEqual(len(imp_res.data["errors"]), 1)

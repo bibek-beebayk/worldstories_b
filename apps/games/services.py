@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import date, timedelta, timezone as dt_timezone
 import html
 import random
@@ -32,6 +33,10 @@ def utc_today() -> date:
 
 def normalize_whitespace(text: str) -> str:
     return _WHITESPACE_RE.sub(" ", str(text or "")).strip()
+
+
+def normalize_identity(text: str) -> str:
+    return normalize_whitespace(text).lower()
 
 
 def strip_html_to_text(raw_html: str | None, preserve_blocks: bool = False) -> str:
@@ -71,9 +76,112 @@ def length_label(story: Story) -> str:
     return "Novel"
 
 
-def author_initials(story: Story) -> str | None:
-    author = getattr(story, "author", None)
-    name = (getattr(author, "name", "") or "").strip() if author else ""
+@dataclass(frozen=True)
+class BookFacts:
+    """Shared normalized representation for both catalogue Story and external PuzzleBook."""
+
+    key: str
+    story_id: int | None
+    book_id: int | None
+    title: str
+    author: str
+    genre_ids: frozenset[int]
+    genre_names: tuple[str, ...]
+    country: str
+    country_display: str
+    year: int | None
+    length: str
+    cover_image_file: object | None
+    cover_image: str | None
+    slug: str | None
+    views: int
+    read_time: int | None
+    in_catalogue: bool
+
+    def cover_url(self, request=None) -> str:
+        return (
+            get_cover_image_url(
+                self.cover_image_file,
+                self.cover_image,
+                request,
+                size=CARD_COVER_SIZE,
+            )
+            or ""
+        )
+
+
+def facts_from_story(story: Story) -> BookFacts:
+    genres = list(story.genres.order_by("name").values_list("id", "name"))
+    genre_ids = frozenset(gid for gid, _ in genres)
+    genre_names = tuple(name for _, name in genres)
+    author_name = story.author.name if story.author_id else ""
+    country_code = (story.country or "").strip().upper()
+    country_display = story.get_country_display() if country_code else ""
+    return BookFacts(
+        key=f"story:{story.pk}",
+        story_id=story.pk,
+        book_id=None,
+        title=story.title,
+        author=author_name,
+        genre_ids=genre_ids,
+        genre_names=genre_names,
+        country=country_code,
+        country_display=country_display,
+        year=story.original_published_year,
+        length=length_label(story),
+        cover_image_file=story.cover_image_file,
+        cover_image=story.cover_image,
+        slug=story.slug,
+        views=int(story.views or 0),
+        read_time=story.cached_chapter_reading_minutes,
+        in_catalogue=True,
+    )
+
+
+def facts_from_book(book) -> BookFacts:
+    genres = list(book.genres.order_by("name").values_list("id", "name"))
+    genre_ids = frozenset(gid for gid, _ in genres)
+    genre_names = tuple(name for _, name in genres)
+    country_code = (book.country or "").strip().upper()
+    country_display = book.get_country_display() if country_code else ""
+    return BookFacts(
+        key=f"book:{book.pk}",
+        story_id=None,
+        book_id=book.pk,
+        title=book.title,
+        author=book.author_name or "",
+        genre_ids=genre_ids,
+        genre_names=genre_names,
+        country=country_code,
+        country_display=country_display,
+        year=book.original_published_year,
+        length=book.length_label or "Novel",
+        cover_image_file=book.cover_image_file,
+        cover_image=book.cover_image,
+        slug=None,
+        views=0,
+        read_time=None,
+        in_catalogue=False,
+    )
+
+
+def to_book_facts(subject) -> BookFacts:
+    if isinstance(subject, BookFacts):
+        return subject
+    if isinstance(subject, Story):
+        return facts_from_story(subject)
+    from apps.games.models import DailyPuzzle, PuzzleBook
+
+    if isinstance(subject, PuzzleBook):
+        return facts_from_book(subject)
+    if isinstance(subject, DailyPuzzle):
+        return subject.answer_facts
+    raise TypeError(f"Cannot build BookFacts from {type(subject).__name__}")
+
+
+def author_initials(subject) -> str | None:
+    facts = to_book_facts(subject)
+    name = (facts.author or "").strip()
     if not name:
         return None
     parts = [p for p in re.split(r"[\s]+", name) if p]
@@ -85,24 +193,29 @@ def author_initials(story: Story) -> str | None:
     return " ".join(initials) if initials else None
 
 
-def compare_guess(answer_story: Story, guessed_story: Story) -> dict:
-    correct = answer_story.pk == guessed_story.pk
+def same_work(a: BookFacts, b: BookFacts) -> bool:
+    if a.key == b.key:
+        return True
+    title_a = normalize_identity(a.title)
+    title_b = normalize_identity(b.title)
+    if not title_a or title_a != title_b:
+        return False
+    return normalize_identity(a.author) == normalize_identity(b.author)
 
-    answer_genres = set(answer_story.genres.values_list("id", flat=True))
-    guessed_genres = set(guessed_story.genres.values_list("id", flat=True))
-    genre_match = bool(answer_genres and guessed_genres and (answer_genres & guessed_genres))
 
-    ans_country = (answer_story.country or "").strip().upper()
-    guess_country = (guessed_story.country or "").strip().upper()
-    country_match = bool(ans_country and guess_country and ans_country == guess_country)
+def compare_guess(answer_subject, guessed_subject) -> dict:
+    ans = to_book_facts(answer_subject)
+    gus = to_book_facts(guessed_subject)
+    correct = same_work(ans, gus)
 
-    ans_year = answer_story.original_published_year
-    guess_year = guessed_story.original_published_year
-    if ans_year is None or guess_year is None:
+    genre_match = bool(ans.genre_ids and gus.genre_ids and (ans.genre_ids & gus.genre_ids))
+    country_match = bool(ans.country and gus.country and ans.country == gus.country)
+
+    if ans.year is None or gus.year is None:
         era_match = "different"
-    elif era_of(ans_year) == era_of(guess_year):
+    elif era_of(ans.year) == era_of(gus.year):
         era_match = "same"
-    elif abs(int(ans_year) - int(guess_year)) <= 10:
+    elif abs(int(ans.year) - int(gus.year)) <= 10:
         era_match = "close"
     else:
         era_match = "different"
@@ -117,31 +230,29 @@ def compare_guess(answer_story: Story, guessed_story: Story) -> dict:
     }
 
 
-def clues_for(puzzle, unlocked_count: int, request=None) -> list[dict]:
+def clues_for(puzzle_or_facts, unlocked_count: int, request=None) -> list[dict]:
     """Return ONLY the first `unlocked_count` clues (1..6) in strict reveal order."""
     count = max(0, min(int(unlocked_count), MAX_GUESSES))
     if count == 0:
         return []
 
-    story = puzzle.story
+    facts = to_book_facts(puzzle_or_facts)
     clues: list[dict] = []
 
     if count >= 1:
-        genre_names = list(story.genres.order_by("name").values_list("name", flat=True))
         clues.append(
             {
                 "key": "genre",
                 "label": "Genre",
-                "value": ", ".join(genre_names) if genre_names else "Unknown",
+                "value": ", ".join(facts.genre_names) if facts.genre_names else "Unknown",
             }
         )
     if count >= 2:
-        country_name = story.get_country_display() if story.country else ""
         clues.append(
             {
                 "key": "country",
                 "label": "Country",
-                "value": country_name or "Unknown",
+                "value": facts.country_display or "Unknown",
             }
         )
     if count >= 3:
@@ -149,7 +260,7 @@ def clues_for(puzzle, unlocked_count: int, request=None) -> list[dict]:
             {
                 "key": "era",
                 "label": "Era",
-                "value": era_of(story.original_published_year) or "Unknown",
+                "value": era_of(facts.year) or "Unknown",
             }
         )
     if count >= 4:
@@ -157,7 +268,7 @@ def clues_for(puzzle, unlocked_count: int, request=None) -> list[dict]:
             {
                 "key": "length",
                 "label": "Length",
-                "value": length_label(story),
+                "value": facts.length,
             }
         )
     if count >= 5:
@@ -165,21 +276,15 @@ def clues_for(puzzle, unlocked_count: int, request=None) -> list[dict]:
             {
                 "key": "author_initials",
                 "label": "Author initials",
-                "value": author_initials(story) or "Unknown",
+                "value": author_initials(facts) or "Unknown",
             }
         )
     if count >= 6:
-        cover_url = get_cover_image_url(
-            story.cover_image_file,
-            story.cover_image,
-            request,
-            size=CARD_COVER_SIZE,
-        )
         clues.append(
             {
                 "key": "cover",
                 "label": "Blurred cover",
-                "value": cover_url or "",
+                "value": facts.cover_url(request),
             }
         )
 
@@ -230,7 +335,6 @@ def extract_candidates(story: Story, limit: int = 5) -> list[dict]:
     if not filtered:
         return []
 
-    # Prefer good opening lines (8..40 words), keeping the first qualifying sentence first.
     preferred = [c for c in filtered if 8 <= c["word_count"] <= 40]
     fallback = [c for c in filtered if c not in preferred]
     ordered = preferred + fallback
@@ -249,16 +353,30 @@ def opening_line_in_story(story: Story, opening_line: str) -> bool:
     return False
 
 
-def compute_difficulty(opening_line: str, story: Story) -> str:
-    """Auto-compute easy/medium/hard using line word count and Story.views popularity."""
+def compute_difficulty(opening_line: str, subject) -> str:
+    """Auto-compute easy/medium/hard using line word count and catalogue Story.views."""
+    facts = to_book_facts(subject)
     word_count = len(normalize_whitespace(opening_line).split())
-    # Popularity uses Story.views (top-read stories >= 500 views).
-    is_popular = (getattr(story, "views", 0) or 0) >= 500
+    # External books count as not popular (views = 0, in_catalogue = False).
+    is_popular = facts.in_catalogue and facts.views >= 500
     if word_count < 14 or is_popular:
         return "easy"
     if word_count > 30 and not is_popular:
         return "hard"
     return "medium"
+
+
+def find_matching_catalogue_story(title: str, author_name: str) -> Story | None:
+    norm_title = normalize_identity(title)
+    norm_author = normalize_identity(author_name)
+    if not norm_title:
+        return None
+    for story in Story.objects.select_related("author").filter(title__iexact=normalize_whitespace(title)):
+        s_title = normalize_identity(story.title)
+        s_author = normalize_identity(story.author.name if story.author_id else "")
+        if s_title == norm_title and s_author == norm_author:
+            return story
+    return None
 
 
 def auto_fill(start_date: date, days: int) -> dict:
@@ -284,9 +402,11 @@ def auto_fill(start_date: date, days: int) -> dict:
         window_start = target_date - timedelta(days=180)
         window_end = target_date + timedelta(days=180)
         recently_used_ids = set(
-            DailyPuzzle.objects.filter(date__gte=window_start, date__lte=window_end).values_list(
-                "story_id", flat=True
-            )
+            DailyPuzzle.objects.filter(
+                date__gte=window_start,
+                date__lte=window_end,
+                story_id__isnull=False,
+            ).values_list("story_id", flat=True)
         )
 
         pool = [s for s in published_stories if s.id not in recently_used_ids]
