@@ -11,6 +11,7 @@ import os
 from rest_framework.routers import DefaultRouter
 from rest_framework_simplejwt.views import TokenRefreshView
 from apps.story import api as story_api
+from apps.story import blog_images as blog_images_api
 from apps.story import analytics_api as story_analytics_api
 from apps.story import overview_api
 from apps.story import engagement_api
@@ -423,6 +424,11 @@ urlpatterns = [
         "api/admin/analytics/monetization/",
         audience_api.AdminAnalyticsMonetizationAPIView.as_view(),
         name="admin-analytics-monetization",
+    ),
+    path(
+        "api/admin/blog-images/",
+        blog_images_api.BlogImageUploadAPIView.as_view(),
+        name="admin-blog-images",
     ),
     path(
         "api/admin/analytics/audience/",

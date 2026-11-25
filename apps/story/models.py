@@ -1957,6 +1957,30 @@ class Blog(TimeStampModel):
         return self.title
 
 
+class BlogImage(models.Model):
+    """Uploaded image inserted into a blog post body."""
+
+    image = models.ImageField(upload_to="blog_images/%Y/%m/")
+    width = models.PositiveIntegerField(default=0)
+    height = models.PositiveIntegerField(default=0)
+    size_bytes = models.PositiveIntegerField(default=0)
+    original_name = models.CharField(max_length=255, blank=True, default="")
+    uploaded_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="uploaded_blog_images",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+
+    def __str__(self):
+        return self.original_name or (self.image.name if self.image else f"BlogImage #{self.pk}")
+
+
 def _warm_cover_image(instance):
     """
     Generates and uploads the resized cover renditions right after save, so

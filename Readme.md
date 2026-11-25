@@ -96,3 +96,8 @@ Superuser-only endpoints for managing standalone and story-linked audiobooks, tr
     - `python manage.py backfill_audio_progress [--dry-run]` — moves `AudioReadingProgress` rows with `audiobook IS NULL` onto audiobook keys (batches of 500, idempotent).
     - `python manage.py recompute_audiobook_totals [--dry-run]` — recomputes `track_count` and `total_duration_seconds` on all audiobooks (batches of 500, idempotent).
     - `python manage.py backfill_series_items [--dry-run]` — retained as a safe no-op; the legacy `Audiobook.series` and `Audiobook.series_order` columns were dropped in `story.0108_drop_legacy_audiobook_series_fields`.
+
+## Admin blog body images
+
+- `POST /api/admin/blog-images/` (superuser-only, multipart field `image`) — validates image bytes with Pillow (`JPEG`, `PNG`, `WebP`, `GIF`; max `8 MB`; max `8000 × 8000 px`), applies EXIF orientation, strips EXIF/GPS metadata, resizes images wider than `1600 px` (preserving aspect ratio), converts JPEG/PNG/WebP/static GIF to WebP quality `82` (keeps animated GIFs as uploaded), stores via default storage under `blog_images/%Y/%m/` (`BlogImage` model, `story.0109_blogimage`), and returns `201 {id, url, width, height, size_bytes}` (or `400 {error}` with a plain-language message).
+- `Blog.content` is **not** sanitized on the backend; public rendering sanitizes through `sanitizeBlogContent` in `worldstories_f/src/lib/sanitizeHtml.ts`. Story/chapter and EPUB allow-lists (`apps/story/rich_text.py`, `apps/story/epub_import.py`) are untouched.
