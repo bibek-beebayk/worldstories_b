@@ -252,3 +252,176 @@ class PuzzleRotation(models.Model):
 
     def __str__(self):
         return f"{self.get_weekday_display()} -> {self.puzzle_type}"
+
+
+class MiniCrossword(models.Model):
+    STATUS_DRAFT = "draft"
+    STATUS_APPROVED = "approved"
+    STATUS_CHOICES = [
+        (STATUS_DRAFT, "Draft"),
+        (STATUS_APPROVED, "Approved"),
+    ]
+
+    date = models.DateField(unique=True, db_index=True)
+    title = models.CharField(max_length=160, blank=True, default="")
+    pattern = models.JSONField(default=list)
+    solution = models.JSONField(default=list)
+    clues = models.JSONField(default=list, blank=True)
+    status = models.CharField(
+        max_length=16,
+        choices=STATUS_CHOICES,
+        default=STATUS_DRAFT,
+    )
+    auto_generated = models.BooleanField(default=False)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="created_mini_crosswords",
+    )
+    approved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="approved_mini_crosswords",
+    )
+    approved_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-date"]
+        indexes = [
+            models.Index(fields=["date", "status"], name="games_mini_date_status_idx"),
+        ]
+
+    @property
+    def number(self) -> int:
+        first_date = (
+            MiniCrossword.objects.order_by("date").values_list("date", flat=True).first()
+        )
+        if first_date is None or self.date < first_date:
+            return 1
+        return (self.date - first_date).days + 1
+
+    def __str__(self):
+        suffix = f" — {self.title}" if self.title else ""
+        return f"Mini #{self.number} ({self.date}){suffix}"
+
+
+class MiniAttempt(models.Model):
+    STATUS_IN_PROGRESS = "in_progress"
+    STATUS_SOLVED = "solved"
+    STATUS_CHOICES = [
+        (STATUS_IN_PROGRESS, "In progress"),
+        (STATUS_SOLVED, "Solved"),
+    ]
+
+    puzzle = models.ForeignKey(
+        MiniCrossword,
+        on_delete=models.CASCADE,
+        related_name="attempts",
+    )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.CASCADE,
+        related_name="mini_attempts",
+    )
+    guest_key = models.CharField(max_length=64, blank=True, default="", db_index=True)
+    letters = models.JSONField(default=list, blank=True)
+    revealed = models.JSONField(default=list, blank=True)
+    status = models.CharField(
+        max_length=16,
+        choices=STATUS_CHOICES,
+        default=STATUS_IN_PROGRESS,
+    )
+    started_at = models.DateTimeField(auto_now_add=True)
+    last_saved_at = models.DateTimeField(auto_now=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    hints_used = models.PositiveSmallIntegerField(default=0)
+    checks_used = models.PositiveSmallIntegerField(default=0)
+    elapsed_seconds = models.PositiveIntegerField(null=True, blank=True)
+    is_archive = models.BooleanField(default=False)
+
+    class Meta:
+        ordering = ["-started_at"]
+        constraints = [
+            models.CheckConstraint(
+                check=(
+                    (models.Q(user__isnull=False) & models.Q(guest_key=""))
+                    | (models.Q(user__isnull=True) & ~models.Q(guest_key=""))
+                ),
+                name="games_mini_attempt_one_owner",
+            ),
+            models.UniqueConstraint(
+                fields=["puzzle", "user"],
+                condition=models.Q(user__isnull=False),
+                name="games_mini_attempt_unique_user",
+            ),
+            models.UniqueConstraint(
+                fields=["puzzle", "guest_key"],
+                condition=~models.Q(guest_key=""),
+                name="games_mini_attempt_unique_guest",
+            ),
+        ]
+
+    def __str__(self):
+        owner = f"user={self.user_id}" if self.user_id else f"guest={self.guest_key[:8]}"
+        return f"MiniAttempt({self.puzzle.date}, {owner}, {self.status})"
+
+
+class ClueBank(models.Model):
+    answer = models.CharField(max_length=32, db_index=True)
+    clue = models.TextField()
+    story = models.ForeignKey(
+        "story.Story",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="crossword_clues",
+    )
+    times_used = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["answer", "times_used", "id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["answer", "clue"],
+                name="games_cluebank_unique_answer_clue",
+            ),
+        ]
+
+    def save(self, *args, **kwargs):
+        self.answer = (self.answer or "").strip().upper()
+        self.clue = (self.clue or "").strip()
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.answer}: {self.clue[:50]}"
+
+
+class CrosswordWord(models.Model):
+    word = models.CharField(max_length=32, unique=True)
+    added_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="added_crossword_words",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["word"]
+
+    def save(self, *args, **kwargs):
+        self.word = (self.word or "").strip().upper()
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return self.word

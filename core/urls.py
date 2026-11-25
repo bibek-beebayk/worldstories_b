@@ -13,6 +13,7 @@ from rest_framework_simplejwt.views import TokenRefreshView
 from apps.story import api as story_api
 from apps.story import blog_images as blog_images_api
 from apps.games import api as games_api
+from apps.games import api_mini as games_mini_api
 from apps.story import analytics_api as story_analytics_api
 from apps.story import overview_api
 from apps.story import engagement_api
@@ -526,6 +527,122 @@ urlpatterns = [
         "api/admin/games/name-that-story/summary/",
         games_api.AdminPuzzleSummaryAPIView.as_view(),
         name="admin-nts-summary",
+    ),
+    # Mini Crossword daily puzzle game (public + admin)
+    path(
+        "api/games/mini-crossword/today/",
+        games_mini_api.MiniTodayAPIView.as_view(),
+        name="mini-today",
+    ),
+    path(
+        "api/games/mini-crossword/puzzles/<str:puzzle_date>/",
+        games_mini_api.MiniByDateAPIView.as_view(),
+        name="mini-by-date",
+    ),
+    path(
+        "api/games/mini-crossword/start/",
+        games_mini_api.MiniStartAPIView.as_view(),
+        name="mini-start",
+    ),
+    path(
+        "api/games/mini-crossword/save/",
+        games_mini_api.MiniSaveAPIView.as_view(),
+        name="mini-save",
+    ),
+    path(
+        "api/games/mini-crossword/check/",
+        games_mini_api.MiniCheckAPIView.as_view(),
+        name="mini-check",
+    ),
+    path(
+        "api/games/mini-crossword/reveal/",
+        games_mini_api.MiniRevealAPIView.as_view(),
+        name="mini-reveal",
+    ),
+    path(
+        "api/games/mini-crossword/submit/",
+        games_mini_api.MiniSubmitAPIView.as_view(),
+        name="mini-submit",
+    ),
+    path(
+        "api/games/mini-crossword/stats/",
+        games_mini_api.MiniStatsAPIView.as_view(),
+        name="mini-stats",
+    ),
+    path(
+        "api/games/mini-crossword/archive/",
+        games_mini_api.MiniArchiveAPIView.as_view(),
+        name="mini-archive",
+    ),
+    path(
+        "api/games/mini-crossword/merge-guest/",
+        games_mini_api.MiniMergeGuestAPIView.as_view(),
+        name="mini-merge-guest",
+    ),
+    path(
+        "api/admin/games/mini-crossword/puzzles/",
+        games_mini_api.AdminMiniListCreateAPIView.as_view(),
+        name="admin-mini-puzzles",
+    ),
+    path(
+        "api/admin/games/mini-crossword/puzzles/<int:pk>/",
+        games_mini_api.AdminMiniDetailAPIView.as_view(),
+        name="admin-mini-puzzle-detail",
+    ),
+    path(
+        "api/admin/games/mini-crossword/puzzles/<int:pk>/approve/",
+        games_mini_api.AdminMiniApproveAPIView.as_view(),
+        name="admin-mini-puzzle-approve",
+    ),
+    path(
+        "api/admin/games/mini-crossword/puzzles/<int:pk>/unapprove/",
+        games_mini_api.AdminMiniUnapproveAPIView.as_view(),
+        name="admin-mini-puzzle-unapprove",
+    ),
+    path(
+        "api/admin/games/mini-crossword/validate/",
+        games_mini_api.AdminMiniValidateAPIView.as_view(),
+        name="admin-mini-validate",
+    ),
+    path(
+        "api/admin/games/mini-crossword/generate-fill/",
+        games_mini_api.AdminMiniGenerateFillAPIView.as_view(),
+        name="admin-mini-generate-fill",
+    ),
+    path(
+        "api/admin/games/mini-crossword/draft-clues/",
+        games_mini_api.AdminMiniDraftCluesAPIView.as_view(),
+        name="admin-mini-draft-clues",
+    ),
+    path(
+        "api/admin/games/mini-crossword/clue-suggestions/",
+        games_mini_api.AdminMiniClueSuggestionsAPIView.as_view(),
+        name="admin-mini-clue-suggestions",
+    ),
+    path(
+        "api/admin/games/mini-crossword/autogenerate/",
+        games_mini_api.AdminMiniAutogenerateAPIView.as_view(),
+        name="admin-mini-autogenerate",
+    ),
+    path(
+        "api/admin/games/mini-crossword/summary/",
+        games_mini_api.AdminMiniSummaryAPIView.as_view(),
+        name="admin-mini-summary",
+    ),
+    path(
+        "api/admin/games/mini-crossword/clue-bank/",
+        games_mini_api.AdminClueBankListCreateAPIView.as_view(),
+        name="admin-mini-clue-bank",
+    ),
+    path(
+        "api/admin/games/mini-crossword/clue-bank/<int:pk>/",
+        games_mini_api.AdminClueBankDetailAPIView.as_view(),
+        name="admin-mini-clue-bank-detail",
+    ),
+    path(
+        "api/admin/games/mini-crossword/clue-bank/import/",
+        games_mini_api.AdminClueBankImportAPIView.as_view(),
+        name="admin-mini-clue-bank-import",
     ),
     path(
         "api/admin/analytics/audience/",

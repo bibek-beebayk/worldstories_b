@@ -211,6 +211,7 @@ REST_FRAMEWORK = {
         "newsletter_subscribe": "5/hour",
         "newsletter_public": "30/hour",
         "game_search": "60/min",
+        "mini_save": "120/min",
     },
 }
 

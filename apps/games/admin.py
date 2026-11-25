@@ -1,6 +1,14 @@
 from django.contrib import admin
 
-from apps.games.models import DailyPuzzle, PuzzleAttempt, PuzzleRotation
+from apps.games.models import (
+    ClueBank,
+    CrosswordWord,
+    DailyPuzzle,
+    MiniAttempt,
+    MiniCrossword,
+    PuzzleAttempt,
+    PuzzleRotation,
+)
 
 
 @admin.register(DailyPuzzle)
@@ -71,3 +79,64 @@ class PuzzleAttemptAdmin(admin.ModelAdmin):
 class PuzzleRotationAdmin(admin.ModelAdmin):
     list_display = ("weekday", "puzzle_type")
     ordering = ("weekday",)
+
+
+@admin.register(MiniCrossword)
+class MiniCrosswordAdmin(admin.ModelAdmin):
+    list_display = ("date", "title", "status", "auto_generated", "created_at")
+    list_filter = ("status", "auto_generated")
+    search_fields = ("title",)
+    date_hierarchy = "date"
+    raw_id_fields = ("created_by", "approved_by")
+    readonly_fields = ("created_at", "updated_at")
+
+
+@admin.register(MiniAttempt)
+class MiniAttemptAdmin(admin.ModelAdmin):
+    list_display = (
+        "puzzle",
+        "user",
+        "guest_key",
+        "status",
+        "hints_used",
+        "elapsed_seconds",
+        "is_archive",
+        "started_at",
+    )
+    list_filter = ("status", "is_archive")
+    search_fields = ("user__username", "user__email", "guest_key")
+    readonly_fields = (
+        "puzzle",
+        "user",
+        "guest_key",
+        "letters",
+        "revealed",
+        "status",
+        "started_at",
+        "last_saved_at",
+        "completed_at",
+        "hints_used",
+        "checks_used",
+        "elapsed_seconds",
+        "is_archive",
+    )
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(ClueBank)
+class ClueBankAdmin(admin.ModelAdmin):
+    list_display = ("answer", "clue", "story", "times_used", "created_at")
+    search_fields = ("answer", "clue")
+    raw_id_fields = ("story",)
+
+
+@admin.register(CrosswordWord)
+class CrosswordWordAdmin(admin.ModelAdmin):
+    list_display = ("word", "added_by", "created_at")
+    search_fields = ("word",)
+    raw_id_fields = ("added_by",)

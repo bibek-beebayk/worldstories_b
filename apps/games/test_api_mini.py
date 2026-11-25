@@ -1,0 +1,279 @@
+import json
+from datetime import timedelta
+
+from django.contrib.auth import get_user_model
+from django.core.management import call_command
+from django.test import TestCase
+from rest_framework.test import APIClient
+
+from apps.games.models import ClueBank, MiniAttempt, MiniCrossword
+from apps.games.services.engine import utc_today
+from apps.story.models import Author, Story
+
+User = get_user_model()
+
+MOCK_PATTERN = ["....#", ".....", ".....", ".....", "#...."]
+MOCK_SOLUTION = ["SPAM#", "TALES", "AGILE", "RAVEN", "#NEED"]
+
+
+def make_clues(story_id=None):
+    return [
+        {"number": 1, "direction": "across", "answer": "SPAM", "clue": "Unwanted inbox messages", "story_id": None},
+        {"number": 5, "direction": "across", "answer": "TALES", "clue": "Short stories of wonder", "story_id": None},
+        {"number": 7, "direction": "across", "answer": "AGILE", "clue": "Quick and nimble", "story_id": None},
+        {"number": 8, "direction": "across", "answer": "RAVEN", "clue": "Poe's midnight bird", "story_id": story_id},
+        {"number": 9, "direction": "across", "answer": "NEED", "clue": "Strong requirement", "story_id": None},
+        {"number": 1, "direction": "down", "answer": "STAR", "clue": "Bright night-sky point", "story_id": None},
+        {"number": 2, "direction": "down", "answer": "PAGAN", "clue": "Ancient polytheistic belief", "story_id": None},
+        {"number": 3, "direction": "down", "answer": "ALIVE", "clue": "Breathing and well", "story_id": None},
+        {"number": 4, "direction": "down", "answer": "MELEE", "clue": "Chaotic close-quarters brawl", "story_id": None},
+        {"number": 6, "direction": "down", "answer": "SEND", "clue": "Dispatch a letter", "story_id": None},
+    ]
+
+
+class MiniCrosswordAPITestCase(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.today = utc_today()
+
+        self.user = User.objects.create_user(
+            username="miniuser", email="mini@example.com", password="password123"
+        )
+        self.staff = User.objects.create_superuser(
+            username="miniadmin", email="miniadmin@example.com", password="password123"
+        )
+
+        self.author = Author.objects.create(name="Edgar Allan Poe", slug="edgar-allan-poe")
+        self.story = Story.objects.create(
+            title="The Raven",
+            slug="the-raven",
+            author=self.author,
+            is_published=True,
+        )
+
+        self.today_mini = MiniCrossword.objects.create(
+            date=self.today,
+            title="Poe and Gothic",
+            pattern=MOCK_PATTERN,
+            solution=MOCK_SOLUTION,
+            clues=make_clues(self.story.id),
+            status="approved",
+        )
+        self.yesterday_mini = MiniCrossword.objects.create(
+            date=self.today - timedelta(days=1),
+            title="Yesterday Mini",
+            pattern=MOCK_PATTERN,
+            solution=MOCK_SOLUTION,
+            clues=make_clues(self.story.id),
+            status="approved",
+        )
+        self.draft_mini = MiniCrossword.objects.create(
+            date=self.today - timedelta(days=2),
+            title="Draft Mini",
+            pattern=MOCK_PATTERN,
+            solution=MOCK_SOLUTION,
+            clues=make_clues(),
+            status="draft",
+        )
+        self.future_mini = MiniCrossword.objects.create(
+            date=self.today + timedelta(days=1),
+            title="Future Mini",
+            pattern=MOCK_PATTERN,
+            solution=MOCK_SOLUTION,
+            clues=make_clues(),
+            status="approved",
+        )
+
+    def test_solution_answers_and_story_links_never_sent_before_solve(self):
+        r = self.client.get("/api/games/mini-crossword/today/")
+        self.assertEqual(r.status_code, 200)
+        data = r.json()
+        self.assertIsNone(data["attempt"])
+        self.assertNotIn("solution", data)
+        self.assertNotIn("linked_stories", data)
+        self.assertNotIn("share_tokens", data)
+        for c in data["clues"]:
+            self.assertNotIn("answer", c)
+            self.assertNotIn("story_id", c)
+        body = json.dumps(data)
+        self.assertNotIn("SPAM", body)
+        self.assertNotIn("RAVEN", body)
+        self.assertNotIn("the-raven", body)
+
+    def test_draft_and_future_return_404(self):
+        d_draft = (self.today - timedelta(days=2)).isoformat()
+        d_future = (self.today + timedelta(days=1)).isoformat()
+        self.assertEqual(
+            self.client.get(f"/api/games/mini-crossword/puzzles/{d_draft}/").status_code, 404
+        )
+        self.assertEqual(
+            self.client.get(f"/api/games/mini-crossword/puzzles/{d_future}/").status_code, 404
+        )
+
+    def test_full_play_flow_check_reveal_submit_and_streak(self):
+        headers = {"HTTP_X_GUEST_KEY": "guest-mini-play"}
+
+        # Start
+        r_start = self.client.post("/api/games/mini-crossword/start/", {}, format="json", **headers)
+        self.assertEqual(r_start.status_code, 200)
+        self.assertEqual(r_start.json()["attempt"]["status"], "in_progress")
+
+        # Save partial with one wrong letter at (0,2)
+        r_save = self.client.put(
+            "/api/games/mini-crossword/save/",
+            {"letters": ["SPXM#", "TALES", ".....", ".....", "#...."]},
+            format="json",
+            **headers,
+        )
+        self.assertEqual(r_save.status_code, 200)
+
+        # Check returns wrong cells ONLY, never correct letters
+        r_chk = self.client.post(
+            "/api/games/mini-crossword/check/",
+            {"scope": "grid"},
+            format="json",
+            **headers,
+        )
+        self.assertEqual(r_chk.status_code, 200)
+        self.assertEqual(r_chk.json(), {"wrong": [[0, 2]]})
+
+        # Reveal (0,2) twice -> hints_used counts once
+        r_rev1 = self.client.post(
+            "/api/games/mini-crossword/reveal/", {"row": 0, "col": 2}, format="json", **headers
+        )
+        self.assertEqual(r_rev1.status_code, 200)
+        self.assertEqual(r_rev1.json()["letter"], "A")
+        self.assertEqual(r_rev1.json()["hints_used"], 1)
+
+        r_rev2 = self.client.post(
+            "/api/games/mini-crossword/reveal/", {"row": 0, "col": 2}, format="json", **headers
+        )
+        self.assertEqual(r_rev2.json()["hints_used"], 1)
+
+        # Save cannot overwrite revealed cell (0,2)
+        r_over = self.client.put(
+            "/api/games/mini-crossword/save/",
+            {"letters": ["SPZM#", "TALES", ".....", ".....", "#...."]},
+            format="json",
+            **headers,
+        )
+        self.assertEqual(r_over.json()["letters"][0][2], "A")
+
+        # Submit wrong grid
+        r_wrong = self.client.post(
+            "/api/games/mini-crossword/submit/",
+            {"letters": ["SPAM#", "TALES", "AGILE", "RAVEN", "#NOOD"]},
+            format="json",
+            **headers,
+        )
+        self.assertEqual(r_wrong.status_code, 200)
+        self.assertFalse(r_wrong.json()["solved"])
+
+        # Submit right grid -> solved payload includes solution, linked_stories, share_tokens
+        r_right = self.client.post(
+            "/api/games/mini-crossword/submit/",
+            {"letters": MOCK_SOLUTION},
+            format="json",
+            **headers,
+        )
+        self.assertEqual(r_right.status_code, 200)
+        self.assertTrue(r_right.json()["solved"])
+        solved_p = r_right.json()["puzzle"]
+        self.assertEqual(solved_p["solution"], MOCK_SOLUTION)
+        self.assertEqual(len(solved_p["linked_stories"]), 1)
+        self.assertEqual(solved_p["linked_stories"][0]["slug"], "the-raven")
+        self.assertEqual(solved_p["share_tokens"][0], "GGYGK")
+
+        # Hints do NOT break streak
+        st = self.client.get("/api/games/mini-crossword/stats/", **headers).json()
+        self.assertEqual(st["current_streak"], 1)
+
+        # Merge guest to user (idempotent)
+        self.client.force_authenticate(user=self.user)
+        m1 = self.client.post(
+            "/api/games/mini-crossword/merge-guest/",
+            {"guest_key": "guest-mini-play"},
+            format="json",
+        )
+        self.assertEqual(m1.json()["merged"], 1)
+        m2 = self.client.post(
+            "/api/games/mini-crossword/merge-guest/",
+            {"guest_key": "guest-mini-play"},
+            format="json",
+        )
+        self.assertEqual(m2.json()["merged"], 0)
+
+    def test_archive_play_excluded_from_streak(self):
+        headers = {"HTTP_X_GUEST_KEY": "guest-mini-archive"}
+        yday = (self.today - timedelta(days=1)).isoformat()
+        self.client.post("/api/games/mini-crossword/start/", {"date": yday}, format="json", **headers)
+        r = self.client.post(
+            "/api/games/mini-crossword/submit/",
+            {"date": yday, "letters": MOCK_SOLUTION},
+            format="json",
+            **headers,
+        )
+        self.assertTrue(r.json()["solved"])
+        st = self.client.get("/api/games/mini-crossword/stats/", **headers).json()
+        self.assertEqual(st["solved"], 1)
+        self.assertEqual(st["current_streak"], 0)
+
+    def test_admin_permissions_approval_block_autogenerate_and_clue_bank(self):
+        self.client.force_authenticate(user=self.user)
+        self.assertEqual(
+            self.client.get("/api/admin/games/mini-crossword/puzzles/").status_code, 403
+        )
+
+        self.client.force_authenticate(user=self.staff)
+        # Create draft with a clue containing its own answer -> approve blocked
+        bad_clues = make_clues()
+        bad_clues[3]["clue"] = "The raven in Poe's poem"
+        d_new = (self.today + timedelta(days=5)).isoformat()
+        r_cr = self.client.post(
+            "/api/admin/games/mini-crossword/puzzles/",
+            {
+                "date": d_new,
+                "title": "Test",
+                "pattern": MOCK_PATTERN,
+                "solution": MOCK_SOLUTION,
+                "clues": bad_clues,
+            },
+            format="json",
+        )
+        self.assertEqual(r_cr.status_code, 201)
+        pid = r_cr.json()["id"]
+        self.assertEqual(r_cr.json()["approval_status"], "draft")
+
+        r_bad = self.client.post(f"/api/admin/games/mini-crossword/puzzles/{pid}/approve/")
+        self.assertEqual(r_bad.status_code, 400)
+        self.assertTrue(any("contains its own answer" in e for e in r_bad.json()["errors"]))
+
+        # Fix and approve
+        self.client.patch(
+            f"/api/admin/games/mini-crossword/puzzles/{pid}/",
+            {"clues": make_clues()},
+            format="json",
+        )
+        r_ok = self.client.post(f"/api/admin/games/mini-crossword/puzzles/{pid}/approve/")
+        self.assertEqual(r_ok.status_code, 200)
+        self.assertEqual(r_ok.json()["approval_status"], "approved")
+
+        # CSV import into ClueBank
+        csv_body = "answer,clue,story_slug\nRAVEN,Midnight visitor of Poe,the-raven\nBAD,Too short,\n"
+        r_imp = self.client.post(
+            "/api/admin/games/mini-crossword/clue-bank/import/",
+            {"csv": csv_body},
+            format="json",
+        )
+        self.assertEqual(r_imp.status_code, 200)
+        self.assertEqual(r_imp.json()["imported"], 2)  # BAD is 3 letters so valid!
+        self.assertTrue(ClueBank.objects.filter(answer="RAVEN", story=self.story).exists())
+
+        # Autogenerate stays draft & is idempotent
+        r_ag = self.client.post(
+            "/api/admin/games/mini-crossword/autogenerate/", {"days": 3}, format="json"
+        )
+        self.assertEqual(r_ag.status_code, 200)
+        count1 = MiniCrossword.objects.count()
+        call_command("autogenerate_minis", days=3)
+        self.assertEqual(MiniCrossword.objects.count(), count1)
