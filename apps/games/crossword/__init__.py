@@ -22,16 +22,27 @@ from .grid import (
     number_grid,
     validate_pattern,
 )
-from .solver import generate_fill
+from .solver import (
+    DEFAULT_MAX_NAMES,
+    DEFAULT_PER_PATTERN_TIMEOUT,
+    canonical_solution_keys,
+    generate_fill,
+)
 from .validation import validate_solution
 from .words import (
     COMMON_ZIPF_THRESHOLD,
+    DEFAULT_MIN_NON_NAME_WORDS,
     RARE_ZIPF_THRESHOLD,
+    SCARCE_LETTER_THRESHOLD,
     SOLVER_BANK_MIN_ZIPF,
     SOLVER_MIN_ZIPF,
+    BankWordIndex,
+    clear_bank_word_cache,
     clear_word_caches,
+    compute_bank_health,
     get_allowed_words,
     get_author_name_tokens,
+    get_bank_word_index,
     get_base_wordlist,
     get_blocklist,
     get_names_list,

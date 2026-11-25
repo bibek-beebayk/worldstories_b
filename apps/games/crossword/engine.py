@@ -1,4 +1,6 @@
 from datetime import date, timedelta
+import random
+import time
 
 from apps.games.models import ClueBank, MiniAttempt, MiniCrossword
 from apps.games.services.engine import utc_today
@@ -6,9 +8,16 @@ from apps.stats.streaks import compute_streak
 
 from .difficulty import compute_difficulty
 from .grid import GRID_SIZE, entry_cells, extract_entry_answer, number_grid
-from .solver import generate_fill
+from .solver import (
+    DEFAULT_MAX_NAMES,
+    DEFAULT_PER_PATTERN_TIMEOUT,
+    canonical_solution_keys,
+    generate_fill,
+)
+from .words import DEFAULT_MIN_NON_NAME_WORDS, compute_bank_health
 
 MAX_ELAPSED_SECONDS = 24 * 60 * 60  # 24 hours cap
+DEFAULT_TOTAL_AUTO_TIMEOUT = 60.0
 
 WEEKDAY_TARGET_DIFFICULTY: dict[int, str] = {
     0: MiniCrossword.DIFFICULTY_EASY,    # Monday
@@ -24,6 +33,11 @@ DEFAULT_AUTO_PATTERNS: list[list[str]] = [
     ["....#", ".....", ".....", ".....", "#...."],  # blacks at (0,4), (4,0)
     ["#....", ".....", ".....", ".....", "....#"],  # blacks at (0,0), (4,4)
     ["#...#", ".....", ".....", ".....", "....."],  # blacks at (0,0), (0,4)
+    [".....", ".....", ".....", ".....", "#...#"],  # blacks at (4,0), (4,4)
+    ["...##", ".....", ".....", ".....", "##..."],  # 3/5 across, 4/5 down
+    ["##...", ".....", ".....", ".....", "...##"],  # 3/5 across, 4/5 down
+    ["#...#", ".....", ".....", ".....", "#...#"],  # 4 corners black (3/5)
+    [".....", ".....", ".....", ".....", "....."],  # full 5x5
 ]
 
 
@@ -31,18 +45,27 @@ def empty_letters_for_pattern(pattern: list[str]) -> list[str]:
     return [str(row) for row in pattern]
 
 
-def draft_clues(solution: list[str], pattern: list[str]) -> list[dict]:
+def draft_clues(
+    solution: list[str],
+    pattern: list[str],
+    rng: random.Random | None = None,
+) -> list[dict]:
     entries = number_grid(pattern)["entries"]
     answers = {extract_entry_answer(solution, e) for e in entries}
     bank_by_answer: dict[str, list[ClueBank]] = {}
     for row in ClueBank.objects.filter(answer__in=answers).order_by("times_used", "id"):
         bank_by_answer.setdefault(row.answer, []).append(row)
 
+    picker = rng if rng is not None else random
     result: list[dict] = []
     for entry in entries:
         ans = extract_entry_answer(solution, entry)
         candidates = bank_by_answer.get(ans) or []
-        chosen = candidates[0] if candidates else None
+        chosen = None
+        if candidates:
+            min_used = candidates[0].times_used
+            tied = [c for c in candidates if c.times_used == min_used]
+            chosen = picker.choice(tied)
         result.append(
             {
                 "number": entry["number"],
@@ -220,42 +243,87 @@ def stats_for(user=None, guest_key: str = "") -> dict:
 def auto_generate(
     start_date: date,
     days: int = 14,
+    count: int | None = None,
+    seed: int | str | None = None,
     patterns: list[list[str]] | None = None,
+    per_pattern_timeout: float = DEFAULT_PER_PATTERN_TIMEOUT,
+    total_timeout: float = DEFAULT_TOTAL_AUTO_TIMEOUT,
+    max_names: int = DEFAULT_MAX_NAMES,
+    min_non_name_words: int = DEFAULT_MIN_NON_NAME_WORDS,
 ) -> dict:
-    days = max(1, min(int(days), 90))
-    pattern_list = patterns or DEFAULT_AUTO_PATTERNS
+    t_start = time.monotonic()
+    deadline = t_start + max(0.5, float(total_timeout))
+    pattern_list = list(patterns or DEFAULT_AUTO_PATTERNS)
+    rng = random.Random(seed)
 
-    existing_dates = set(
-        MiniCrossword.objects.filter(
-            date__gte=start_date, date__lt=start_date + timedelta(days=days)
-        ).values_list("date", flat=True)
-    )
+    # Determine target empty dates
+    if count is not None:
+        target_count = max(1, min(int(count), 90))
+        scan_horizon = max(target_count * 3, 90)
+        existing_dates = set(
+            MiniCrossword.objects.filter(
+                date__gte=start_date, date__lt=start_date + timedelta(days=scan_horizon)
+            ).values_list("date", flat=True)
+        )
+        target_dates: list[date] = []
+        offset = 0
+        while len(target_dates) < target_count and offset < scan_horizon:
+            d = start_date + timedelta(days=offset)
+            if d not in existing_dates:
+                target_dates.append(d)
+            offset += 1
+        requested = target_count
+    else:
+        days = max(1, min(int(days), 90))
+        existing_dates = set(
+            MiniCrossword.objects.filter(
+                date__gte=start_date, date__lt=start_date + timedelta(days=days)
+            ).values_list("date", flat=True)
+        )
+        target_dates = [
+            start_date + timedelta(days=offset)
+            for offset in range(days)
+            if (start_date + timedelta(days=offset)) not in existing_dates
+        ]
+        requested = len(target_dates)
 
-    created: list[str] = []
-    skipped: list[str] = []
+    # Preload existing full grids (and their 180-degree rotations) to avoid duplicates
+    exclude_solutions: set[tuple[str, ...]] = set()
+    for sol in MiniCrossword.objects.values_list("solution", flat=True):
+        if isinstance(sol, list) and len(sol) == GRID_SIZE:
+            sig_norm, sig_rot = canonical_solution_keys([str(r) for r in sol])
+            exclude_solutions.add(sig_norm)
+            exclude_solutions.add(sig_rot)
 
-    for offset in range(days):
-        target_date = start_date + timedelta(days=offset)
-        if target_date in existing_dates:
+    created_dates: list[str] = []
+    skipped_dates: list[str] = []
+
+    for idx, target_date in enumerate(target_dates):
+        if time.monotonic() >= deadline:
+            skipped_dates.append(target_date.isoformat())
             continue
 
-        start_idx = target_date.toordinal() % len(pattern_list)
-        ordered_patterns = [
-            pattern_list[(start_idx + i) % len(pattern_list)]
-            for i in range(len(pattern_list))
-        ]
-        seed = int(target_date.strftime("%Y%m%d"))
+        ordered_patterns = list(pattern_list)
+        rng.shuffle(ordered_patterns)
+        grid_seed = rng.randrange(0, 1 << 31)
         target_diff = WEEKDAY_TARGET_DIFFICULTY[target_date.weekday()]
 
         chosen_pattern = None
         chosen_solution = None
-        for pat in ordered_patterns:
+        for p_idx, pat in enumerate(ordered_patterns):
+            remaining_total = deadline - time.monotonic()
+            if remaining_total <= 0.05:
+                break
+            pat_budget = min(float(per_pattern_timeout), remaining_total)
             sols = generate_fill(
                 pat,
-                seed=seed,
+                seed=f"{grid_seed}:{p_idx}",
                 limit=1,
-                timeout_seconds=2.0,
+                timeout_seconds=pat_budget,
                 target_difficulty=target_diff,
+                max_names=max_names,
+                min_non_name_words=min_non_name_words,
+                exclude_solutions=exclude_solutions,
             )
             if sols:
                 chosen_pattern = pat
@@ -263,10 +331,14 @@ def auto_generate(
                 break
 
         if chosen_pattern is None or chosen_solution is None:
-            skipped.append(target_date.isoformat())
+            skipped_dates.append(target_date.isoformat())
             continue
 
-        clues = draft_clues(chosen_solution, chosen_pattern)
+        sig_norm, sig_rot = canonical_solution_keys(chosen_solution)
+        exclude_solutions.add(sig_norm)
+        exclude_solutions.add(sig_rot)
+
+        clues = draft_clues(chosen_solution, chosen_pattern, rng=rng)
         diff = compute_difficulty(chosen_solution, chosen_pattern)
         MiniCrossword.objects.create(
             date=target_date,
@@ -280,11 +352,25 @@ def auto_generate(
             status=MiniCrossword.STATUS_DRAFT,  # NEVER auto-approve
             auto_generated=True,
         )
-        created.append(target_date.isoformat())
+        created_dates.append(target_date.isoformat())
+
+    health = compute_bank_health()
+    reason = "bank_too_small" if (len(created_dates) == 0 and requested > 0) else None
+    suggestion = health["suggestion"] if reason == "bank_too_small" else ""
 
     return {
-        "created": created,
-        "skipped": skipped,
-        "created_count": len(created),
-        "skipped_count": len(skipped),
+        "created": len(created_dates),
+        "created_count": len(created_dates),
+        "created_dates": created_dates,
+        "requested": requested,
+        "skipped": skipped_dates,
+        "skipped_count": len(skipped_dates),
+        "reason": reason,
+        "bank": {
+            "total_answers": health["total_answers"],
+            "by_length": health["by_length"],
+            "scarce_letters": health["scarce_letters"],
+        },
+        "suggestion": suggestion,
+        "elapsed_seconds": round(time.monotonic() - t_start, 2),
     }

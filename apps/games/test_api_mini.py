@@ -614,3 +614,47 @@ class MiniCrosswordAPITestCase(TestCase):
             rows_use = list(csv.reader(out_usage.open("r", encoding="utf-8")))
             self.assertEqual(rows_use[0], ["answer", "clue", "story_slug", "is_name", "times_used"])
             self.assertEqual(len(rows_use), 5)
+
+    def test_clue_bank_health_and_bank_too_small_autogenerate_api(self):
+        # Staff-only
+        self.client.force_authenticate(user=None)
+        self.assertIn(
+            self.client.get("/api/admin/games/mini-crossword/clue-bank/health/").status_code,
+            (401, 403),
+        )
+        self.client.force_authenticate(user=self.user)
+        self.assertEqual(
+            self.client.get("/api/admin/games/mini-crossword/clue-bank/health/").status_code,
+            403,
+        )
+
+        ClueBank.objects.all().delete()
+        ClueBank.objects.create(answer="RAVEN", clue="Bird one")
+        ClueBank.objects.create(answer="RAVEN", clue="Bird two")
+        ClueBank.objects.create(answer="STAR", clue="Night light")
+        ClueBank.objects.create(answer="POE", clue="Gothic writer", is_name=True)
+
+        self.client.force_authenticate(user=self.staff)
+        r_health = self.client.get("/api/admin/games/mini-crossword/clue-bank/health/")
+        self.assertEqual(r_health.status_code, 200)
+        h = r_health.json()
+        self.assertEqual(h["total"], 4)
+        self.assertEqual(h["total_answers"], 3)
+        self.assertEqual(h["by_length"], {"3": 1, "4": 1, "5": 1})
+        self.assertEqual(h["multi_clue_answers"], 1)
+        self.assertEqual(len(h["scarce_letters"]), 5)
+        self.assertIn("Add more clues", h["suggestion"])
+
+        # Autogenerate with tiny bank returns structured bank_too_small report
+        r_ag = self.client.post(
+            "/api/admin/games/mini-crossword/autogenerate/",
+            {"count": 3, "seed": 1},
+            format="json",
+        )
+        self.assertEqual(r_ag.status_code, 200)
+        ag = r_ag.json()
+        self.assertEqual(ag["created"], 0)
+        self.assertEqual(ag["requested"], 3)
+        self.assertEqual(ag["reason"], "bank_too_small")
+        self.assertEqual(ag["bank"]["total_answers"], 3)
+        self.assertIn("Add more clues", ag["suggestion"])

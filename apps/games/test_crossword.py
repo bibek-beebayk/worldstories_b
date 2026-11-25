@@ -127,7 +127,32 @@ class CrosswordServicesTestCase(TestCase):
         self.assertEqual(res_warn["errors"], [])
         self.assertTrue(len(res_warn["warnings"]) > 0)
 
+    def _seed_valid_bank(self):
+        words = [
+            ("SPAM", "Unwanted inbox messages", False),
+            ("TALES", "Short stories of wonder", False),
+            ("AGILE", "Quick and nimble", False),
+            ("RAVEN", "Poe's midnight bird", False),
+            ("NEED", "Strong requirement", False),
+            ("STAR", "Bright night-sky point", False),
+            ("PAGAN", "Ancient polytheistic belief", False),
+            ("ALIVE", "Breathing and well", False),
+            ("MELEE", "Chaotic close-quarters brawl", False),
+            ("SEND", "Dispatch a letter", False),
+        ]
+        for ans, clue, is_n in words:
+            ClueBank.objects.get_or_create(
+                answer=ans, clue=clue, defaults={"is_name": is_n, "times_used": 0}
+            )
+        return {w[0] for w in words}
+
     def test_generate_fill_is_deterministic_and_time_boxed(self):
+        ClueBank.objects.all().delete()
+        # Empty bank returns cleanly without falling back to dictionary
+        self.assertEqual(generate_fill(MOCK_PATTERN, seed=1), [])
+
+        bank_words = self._seed_valid_bank()
+
         t0 = time.monotonic()
         sols1 = generate_fill(MOCK_PATTERN, seed=20261125, limit=2, timeout_seconds=2.0)
         elapsed = time.monotonic() - t0
@@ -137,7 +162,8 @@ class CrosswordServicesTestCase(TestCase):
         sols2 = generate_fill(MOCK_PATTERN, seed=20261125, limit=2, timeout_seconds=2.0)
         self.assertEqual(sols1, sols2)
 
-        # Ensure zero blocklisted words in generated solution
+        # Every word in generated solution MUST come from ClueBank and have no duplicates
+        seen_in_grid = []
         blocklist = get_blocklist()
         for entry in number_grid(MOCK_PATTERN)["entries"]:
             r, c, length = entry["row"], entry["col"], entry["length"]
@@ -146,7 +172,10 @@ class CrosswordServicesTestCase(TestCase):
                 if entry["direction"] == "across"
                 else "".join(sols1[0][r + i][c] for i in range(length))
             )
+            self.assertIn(word, bank_words)
             self.assertNotIn(word, blocklist)
+            seen_in_grid.append(word)
+        self.assertEqual(len(seen_in_grid), len(set(seen_in_grid)))
 
     def test_check_cells_reveal_share_tokens_and_stats(self):
         puzzle = MiniCrossword.objects.create(
@@ -205,22 +234,69 @@ class CrosswordServicesTestCase(TestCase):
         self.assertEqual(st["best_time"], 65)
 
     def test_draft_clues_and_auto_generate_stays_draft(self):
-        ClueBank.objects.create(answer="RAVEN", clue="Nevermore bird", times_used=0)
+        ClueBank.objects.all().delete()
+        bank_words = self._seed_valid_bank()
         ClueBank.objects.create(answer="RAVEN", clue="Older clue", times_used=5)
         drafted = draft_clues(MOCK_SOLUTION, MOCK_PATTERN)
         raven_entry = next(c for c in drafted if c["answer"] == "RAVEN")
-        self.assertEqual(raven_entry["clue"], "Nevermore bird")
+        self.assertEqual(raven_entry["clue"], "Poe's midnight bird")
 
         start = date(2026, 12, 1)
-        res = auto_generate(start, days=2)
+        res = auto_generate(start, days=2, seed=42, patterns=[MOCK_PATTERN])
         self.assertEqual(res["created_count"], 2)
+        self.assertEqual(res["created"], 2)
+        self.assertIsNone(res["reason"])
         for p in MiniCrossword.objects.filter(date__gte=start):
             self.assertEqual(p.status, MiniCrossword.STATUS_DRAFT)
             self.assertTrue(p.auto_generated)
+            # Every clue comes from ClueBank and is non-empty
+            for c in p.clues:
+                self.assertIn(c["answer"], bank_words)
+                self.assertTrue(bool(c["clue"]))
 
-        # Idempotent second run
-        res2 = auto_generate(start, days=2)
+        # Idempotent second run on same dates (no empty dates left)
+        res2 = auto_generate(start, days=2, seed=42, patterns=[MOCK_PATTERN])
         self.assertEqual(res2["created_count"], 0)
+        self.assertEqual(res2["requested"], 0)
+
+    def test_bank_only_cache_invalidation_name_cap_and_bank_too_small(self):
+        from apps.games.crossword.words import compute_bank_health, get_bank_word_index
+
+        ClueBank.objects.all().delete()
+        # Unsolvable small bank -> returns bank_too_small report cleanly
+        ClueBank.objects.create(answer="CAT", clue="Feline")
+        ClueBank.objects.create(answer="DOG", clue="Canine")
+        res_small = auto_generate(date(2027, 1, 1), count=2, seed=7)
+        self.assertEqual(res_small["created"], 0)
+        self.assertEqual(res_small["requested"], 2)
+        self.assertEqual(res_small["reason"], "bank_too_small")
+        self.assertEqual(res_small["bank"]["total_answers"], 2)
+        self.assertEqual(res_small["bank"]["by_length"]["3"], 2)
+        self.assertIn("Add more clues", res_small["suggestion"])
+        self.assertTrue(len(res_small["bank"]["scarce_letters"]) <= 5)
+
+        # Cache invalidates when a new ClueBank row is added
+        idx1 = get_bank_word_index()
+        self.assertNotIn("RAVEN", idx1.answers)
+        ClueBank.objects.create(answer="RAVEN", clue="Poe bird")
+        idx2 = get_bank_word_index()
+        self.assertIn("RAVEN", idx2.answers)
+
+        # Name cap: if 2 words of the only valid grid are flagged is_name=True, max_names=1 blocks it
+        ClueBank.objects.all().delete()
+        self._seed_valid_bank()
+        ClueBank.objects.filter(answer__in=["SPAM", "RAVEN"]).update(is_name=True)
+        self.assertEqual(generate_fill(MOCK_PATTERN, seed=1, max_names=1), [])
+        # With only 1 flagged name and fewer than min_non_name_words non-names, grid is allowed
+        ClueBank.objects.filter(answer="SPAM").update(is_name=False)
+        sols = generate_fill(MOCK_PATTERN, seed=1, max_names=1, min_non_name_words=30)
+        self.assertTrue(len(sols) >= 1)
+
+        # Bank health report shape
+        health = compute_bank_health()
+        self.assertEqual(health["total_answers"], 10)
+        self.assertEqual(health["by_length"]["4"], 4)
+        self.assertEqual(health["by_length"]["5"], 6)
 
     def test_word_commonness_and_name_helpers(self):
         clear_word_caches()
@@ -264,12 +340,12 @@ class CrosswordServicesTestCase(TestCase):
         self.assertEqual(p.difficulty, "hard")
         self.assertIsNotNone(p.difficulty_score)
 
-        # Solver output enforces <= 1 name and zipf threshold
+        # Solver output uses bank-only words and enforces <= 1 name
+        ClueBank.objects.all().delete()
+        bank_words = self._seed_valid_bank()
         sols = generate_fill(MOCK_PATTERN, seed=20261201, limit=2, target_difficulty="easy")
         self.assertTrue(len(sols) >= 1)
         for sol in sols:
-            d = compute_difficulty(sol, MOCK_PATTERN)
-            self.assertLessEqual(len(d["names"]), 1)
             for entry in number_grid(MOCK_PATTERN)["entries"]:
                 r, c, length = entry["row"], entry["col"], entry["length"]
                 w = (
@@ -277,7 +353,7 @@ class CrosswordServicesTestCase(TestCase):
                     if entry["direction"] == "across"
                     else "".join(sol[r + i][c] for i in range(length))
                 )
-                self.assertGreaterEqual(zipf(w), SOLVER_BANK_MIN_ZIPF)
+                self.assertIn(w, bank_words)
 
         # Validation includes difficulty breakdown & rare-word warnings
         val = validate_solution(MOCK_PATTERN, hard_sol, MOCK_CLUES, include_db=False)

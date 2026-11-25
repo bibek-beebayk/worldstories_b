@@ -23,6 +23,7 @@ from apps.games.crossword import (
     apply_difficulty_to_puzzle,
     auto_generate,
     check_cells,
+    compute_bank_health,
     compute_difficulty,
     draft_clues,
     empty_letters_for_pattern,
@@ -927,7 +928,15 @@ class AdminMiniAutogenerateAPIView(APIView):
             days = int(request.data.get("days", 14))
         except (TypeError, ValueError):
             days = 14
-        return Response(auto_generate(utc_today(), days=days))
+        raw_count = request.data.get("count")
+        count = None
+        if raw_count is not None and str(raw_count).strip() != "":
+            try:
+                count = int(raw_count)
+            except (TypeError, ValueError):
+                count = None
+        seed = request.data.get("seed")
+        return Response(auto_generate(utc_today(), days=days, count=count, seed=seed))
 
 
 class AdminMiniSummaryAPIView(APIView):
@@ -1287,3 +1296,10 @@ class AdminClueBankExportAPIView(APIView):
         )
         response["Content-Disposition"] = f'attachment; filename="{filename}"'
         return response
+
+
+class AdminClueBankHealthAPIView(APIView):
+    permission_classes = [IsSuperUser]
+
+    def get(self, request):
+        return Response(compute_bank_health())

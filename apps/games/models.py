@@ -443,3 +443,21 @@ class CrosswordWord(models.Model):
 
     def __str__(self):
         return self.word
+
+
+def _invalidate_clue_bank_cache(**kwargs):
+    from apps.games.crossword.words import clear_bank_word_cache
+
+    clear_bank_word_cache()
+
+
+models.signals.post_save.connect(
+    _invalidate_clue_bank_cache,
+    sender=ClueBank,
+    dispatch_uid="games_cluebank_post_save_cache_invalidate",
+)
+models.signals.post_delete.connect(
+    _invalidate_clue_bank_cache,
+    sender=ClueBank,
+    dispatch_uid="games_cluebank_post_delete_cache_invalidate",
+)
