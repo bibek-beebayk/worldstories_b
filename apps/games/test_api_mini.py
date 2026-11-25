@@ -1,5 +1,9 @@
+import csv
+import io
 import json
+import tempfile
 from datetime import timedelta
+from pathlib import Path
 
 from django.contrib.auth import get_user_model
 from django.core.management import call_command
@@ -357,3 +361,256 @@ class MiniCrosswordAPITestCase(TestCase):
         self.assertEqual(pub["difficulty"], self.today_mini.difficulty)
         self.assertNotIn("difficulty_breakdown", pub)
         self.assertNotIn("solution", pub)
+
+    def test_clue_bank_cursor_pagination_and_filters(self):
+        # Staff-only enforcement
+        self.client.force_authenticate(user=None)
+        self.assertIn(
+            self.client.get("/api/admin/games/mini-crossword/clue-bank/").status_code,
+            (401, 403),
+        )
+        self.client.force_authenticate(user=self.user)
+        self.assertEqual(
+            self.client.get("/api/admin/games/mini-crossword/clue-bank/").status_code,
+            403,
+        )
+
+        # Seed 130 deterministic rows across 3-, 4-, and 5-letter answers
+        ClueBank.objects.all().delete()
+        rows_to_create = []
+        for idx in range(130):
+            # Mix 3, 4, and 5 letter uppercase alphabetic answers
+            a = chr(ord("A") + (idx // 26) % 26)
+            b = chr(ord("A") + idx % 26)
+            if idx % 3 == 0:
+                ans = f"A{a}{b}"
+            elif idx % 3 == 1:
+                ans = f"B{a}{b}X"
+            else:
+                ans = f"C{a}{b}XY"
+            rows_to_create.append(
+                ClueBank(
+                    answer=ans,
+                    clue=f"Clue number {idx:03d}" + (" needle" if idx % 10 == 0 else ""),
+                    story=self.story if idx % 5 == 0 else None,
+                    is_name=(idx % 4 == 0),
+                    times_used=idx % 7,
+                )
+            )
+        ClueBank.objects.bulk_create(rows_to_create)
+
+        self.client.force_authenticate(user=self.staff)
+
+        # Page 1 default size (50) + constant query count (SAVEPOINT + COUNT + SELECT + RELEASE)
+        with self.assertNumQueries(4):
+            r1 = self.client.get("/api/admin/games/mini-crossword/clue-bank/")
+        self.assertEqual(r1.status_code, 200)
+        d1 = r1.json()
+        self.assertEqual(d1["total"], 130)
+        self.assertEqual(len(d1["results"]), 50)
+        self.assertIsNotNone(d1["next_cursor"])
+
+        # Verify stable ordering (answer, clue, id)
+        keys1 = [(r["answer"], r["clue"], r["id"]) for r in d1["results"]]
+        self.assertEqual(keys1, sorted(keys1))
+
+        # Insert a row BEFORE the current cursor mid-scroll; must not cause dupes or skips
+        ClueBank.objects.create(answer="AAA", clue="Inserted before cursor", is_name=False)
+
+        # Follow next_cursor to collect remaining pages with constant query count
+        collected = list(d1["results"])
+        cursor = d1["next_cursor"]
+        while cursor:
+            with self.assertNumQueries(4):
+                resp = self.client.get(
+                    f"/api/admin/games/mini-crossword/clue-bank/?page_size=50&cursor={cursor}"
+                )
+            self.assertEqual(resp.status_code, 200)
+            payload = resp.json()
+            collected.extend(payload["results"])
+            cursor = payload["next_cursor"]
+
+        # Original 130 rows seen exactly once (the mid-scroll insert at AAA was before cursor)
+        ids = [r["id"] for r in collected]
+        self.assertEqual(len(ids), 130)
+        self.assertEqual(len(set(ids)), 130)
+
+        # Remove helper row so count is 130 again
+        ClueBank.objects.filter(answer="AAA", clue="Inserted before cursor").delete()
+
+        # Clamp page_size > 100 to 100
+        r_clamp = self.client.get("/api/admin/games/mini-crossword/clue-bank/?page_size=500")
+        self.assertEqual(r_clamp.status_code, 200)
+        self.assertEqual(len(r_clamp.json()["results"]), 100)
+        self.assertEqual(r_clamp.json()["total"], 130)
+
+        # Invalid cursor returns 400
+        r_bad = self.client.get("/api/admin/games/mini-crossword/clue-bank/?cursor=not-valid-base64!")
+        self.assertEqual(r_bad.status_code, 400)
+        self.assertIn("detail", r_bad.json())
+
+        # q + pagination
+        q_collected = []
+        q_cursor = None
+        while True:
+            url = "/api/admin/games/mini-crossword/clue-bank/?q=needle&page_size=5"
+            if q_cursor:
+                url += f"&cursor={q_cursor}"
+            rq = self.client.get(url)
+            self.assertEqual(rq.status_code, 200)
+            dq = rq.json()
+            self.assertEqual(dq["total"], 13)
+            q_collected.extend(dq["results"])
+            q_cursor = dq["next_cursor"]
+            if not q_cursor:
+                break
+        self.assertEqual(len(q_collected), 13)
+        self.assertEqual(len({r["id"] for r in q_collected}), 13)
+
+        # length filter
+        r_len3 = self.client.get("/api/admin/games/mini-crossword/clue-bank/?length=3&page_size=100")
+        self.assertEqual(r_len3.status_code, 200)
+        self.assertTrue(all(len(r["answer"]) == 3 for r in r_len3.json()["results"]))
+        self.assertEqual(r_len3.json()["total"], ClueBank.objects.filter(answer__regex=r"^.{3}$").count())
+
+        # story_id filter
+        r_story = self.client.get(
+            f"/api/admin/games/mini-crossword/clue-bank/?story_id={self.story.id}&page_size=100"
+        )
+        self.assertEqual(r_story.status_code, 200)
+        self.assertEqual(r_story.json()["total"], 26)
+        self.assertTrue(all(r["story_id"] == self.story.id for r in r_story.json()["results"]))
+
+        # is_name filter
+        r_name = self.client.get("/api/admin/games/mini-crossword/clue-bank/?is_name=true&page_size=100")
+        self.assertEqual(r_name.status_code, 200)
+        self.assertTrue(all(r["is_name"] is True for r in r_name.json()["results"]))
+
+        # exact answer filter
+        first_ans = d1["results"][0]["answer"]
+        r_ans = self.client.get(
+            f"/api/admin/games/mini-crossword/clue-bank/?answer={first_ans.lower()}"
+        )
+        self.assertEqual(r_ans.status_code, 200)
+        self.assertTrue(all(r["answer"] == first_ans for r in r_ans.json()["results"]))
+
+    def test_clue_bank_csv_export_roundtrip_and_command(self):
+        # Staff-only
+        self.client.force_authenticate(user=None)
+        self.assertIn(
+            self.client.get("/api/admin/games/mini-crossword/clue-bank/export/").status_code,
+            (401, 403),
+        )
+        self.client.force_authenticate(user=self.user)
+        self.assertEqual(
+            self.client.get("/api/admin/games/mini-crossword/clue-bank/export/").status_code,
+            403,
+        )
+
+        ClueBank.objects.all().delete()
+        ClueBank.objects.create(
+            answer="RAVEN",
+            clue='Bird that croaked, "Nevermore"\nin Poe\'s poem',
+            story=self.story,
+            is_name=False,
+            times_used=4,
+        )
+        ClueBank.objects.create(
+            answer="POE",
+            clue="Author of tales, macabre and eerie",
+            story=None,
+            is_name=True,
+            times_used=2,
+        )
+        ClueBank.objects.create(
+            answer="STAR",
+            clue="Night light",
+            story=None,
+            is_name=False,
+            times_used=1,
+        )
+
+        self.client.force_authenticate(user=self.staff)
+
+        # Full export
+        resp = self.client.get("/api/admin/games/mini-crossword/clue-bank/export/")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("text/csv", resp["Content-Type"])
+        self.assertIn(
+            f'filename="clue-bank-{utc_today().isoformat()}.csv"',
+            resp["Content-Disposition"],
+        )
+        csv_bytes = b"".join(resp.streaming_content)
+        csv_text = csv_bytes.decode("utf-8")
+
+        parsed = list(csv.reader(io.StringIO(csv_text)))
+        self.assertEqual(parsed[0], ["answer", "clue", "story_slug", "is_name", "times_used"])
+        self.assertEqual(len(parsed), 4)  # header + 3 rows
+        # Ordered by answer: POE, RAVEN, STAR
+        self.assertEqual(parsed[1], ["POE", "Author of tales, macabre and eerie", "", "true", "2"])
+        self.assertEqual(
+            parsed[2],
+            ["RAVEN", 'Bird that croaked, "Nevermore"\nin Poe\'s poem', "the-raven", "false", "4"],
+        )
+        self.assertEqual(parsed[3], ["STAR", "Night light", "", "false", "1"])
+
+        # Filtered export (length=3)
+        resp_f = self.client.get("/api/admin/games/mini-crossword/clue-bank/export/?length=3")
+        self.assertEqual(resp_f.status_code, 200)
+        parsed_f = list(csv.reader(io.StringIO(b"".join(resp_f.streaming_content).decode("utf-8"))))
+        self.assertEqual(len(parsed_f), 2)
+        self.assertEqual(parsed_f[1][0], "POE")
+
+        # Round-trip: import exported CSV into empty bank recreates identical rows (ignoring times_used)
+        ClueBank.objects.all().delete()
+        r_imp = self.client.post(
+            "/api/admin/games/mini-crossword/clue-bank/import/",
+            {"csv": csv_text},
+            format="json",
+        )
+        self.assertEqual(r_imp.status_code, 200)
+        self.assertEqual(r_imp.json(), {"imported": 3, "updated": 0, "skipped": 0})
+
+        reimported = list(ClueBank.objects.select_related("story").order_by("answer", "clue", "id"))
+        self.assertEqual(len(reimported), 3)
+        self.assertEqual(reimported[0].answer, "POE")
+        self.assertTrue(reimported[0].is_name)
+        self.assertIsNone(reimported[0].story)
+        self.assertEqual(reimported[0].times_used, 0)  # times_used ignored on import
+
+        self.assertEqual(reimported[1].answer, "RAVEN")
+        self.assertEqual(reimported[1].clue, 'Bird that croaked, "Nevermore"\nin Poe\'s poem')
+        self.assertEqual(reimported[1].story_id, self.story.id)
+        self.assertFalse(reimported[1].is_name)
+
+        # Unknown story_slug imports with story=None
+        r_unk = self.client.post(
+            "/api/admin/games/mini-crossword/clue-bank/import/",
+            {"csv": "answer,clue,story_slug,is_name,times_used\nMOON,Night orb,nonexistent-slug,yes,99\n"},
+            format="json",
+        )
+        self.assertEqual(r_unk.status_code, 200)
+        self.assertEqual(r_unk.json()["imported"], 1)
+        moon = ClueBank.objects.get(answer="MOON")
+        self.assertIsNone(moon.story)
+        self.assertTrue(moon.is_name)
+        self.assertEqual(moon.times_used, 0)
+
+        # Management command export_clue_bank (default omits times_used; --include-usage keeps it)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_default = Path(tmpdir) / "clues_default.csv"
+            out_usage = Path(tmpdir) / "clues_usage.csv"
+
+            stdout1 = io.StringIO()
+            call_command("export_clue_bank", str(out_default), stdout=stdout1)
+            self.assertIn("4", stdout1.getvalue())
+            rows_def = list(csv.reader(out_default.open("r", encoding="utf-8")))
+            self.assertEqual(rows_def[0], ["answer", "clue", "story_slug", "is_name"])
+            self.assertEqual(len(rows_def), 5)  # header + 4 rows
+
+            stdout2 = io.StringIO()
+            call_command("export_clue_bank", str(out_usage), include_usage=True, stdout=stdout2)
+            self.assertIn("4", stdout2.getvalue())
+            rows_use = list(csv.reader(out_usage.open("r", encoding="utf-8")))
+            self.assertEqual(rows_use[0], ["answer", "clue", "story_slug", "is_name", "times_used"])
+            self.assertEqual(len(rows_use), 5)

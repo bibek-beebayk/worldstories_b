@@ -1,10 +1,14 @@
+import base64
 import csv
 import io
+import json
 import re
 from datetime import timedelta
 
 from django.db import IntegrityError, transaction
 from django.db.models import Count, F, Q
+from django.db.models.functions import Length
+from django.http import StreamingHttpResponse
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.permissions import AllowAny, IsAuthenticated
@@ -987,15 +991,151 @@ class AdminMiniSummaryAPIView(APIView):
         )
 
 
+CLUE_BANK_DEFAULT_PAGE_SIZE = 50
+CLUE_BANK_MAX_PAGE_SIZE = 100
+
+
+def _encode_clue_bank_cursor(row: ClueBank) -> str:
+    payload = json.dumps(
+        {"a": row.answer, "c": row.clue, "i": row.id},
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return base64.urlsafe_b64encode(payload).decode("ascii")
+
+
+def _decode_clue_bank_cursor(token: str) -> tuple[str, str, int]:
+    if not token or not isinstance(token, str):
+        raise ValueError("Invalid cursor.")
+    try:
+        raw = base64.urlsafe_b64decode(token.encode("ascii"))
+        data = json.loads(raw.decode("utf-8"))
+    except Exception as exc:
+        raise ValueError("Invalid cursor.") from exc
+    if not isinstance(data, dict):
+        raise ValueError("Invalid cursor.")
+    ans = data.get("a")
+    clue = data.get("c")
+    row_id = data.get("i")
+    if (
+        not isinstance(ans, str)
+        or not isinstance(clue, str)
+        or not isinstance(row_id, int)
+        or isinstance(row_id, bool)
+    ):
+        raise ValueError("Invalid cursor.")
+    return ans, clue, row_id
+
+
+def _filter_clue_bank_queryset(params):
+    qs = ClueBank.objects.select_related("story").all()
+
+    q = (params.get("q") or "").strip()
+    if q:
+        qs = qs.filter(Q(answer__icontains=q) | Q(clue__icontains=q))
+
+    answer_exact = (params.get("answer") or "").strip().upper()
+    if answer_exact:
+        qs = qs.filter(answer=answer_exact)
+
+    length_raw = (params.get("length") or "").strip()
+    if length_raw:
+        try:
+            length_val = int(length_raw)
+        except ValueError as exc:
+            raise ValueError("length must be 3, 4, or 5.") from exc
+        if length_val not in (3, 4, 5):
+            raise ValueError("length must be 3, 4, or 5.")
+        qs = qs.annotate(_answer_len=Length("answer")).filter(_answer_len=length_val)
+
+    story_id_raw = (params.get("story_id") or "").strip()
+    if story_id_raw:
+        try:
+            story_id_val = int(story_id_raw)
+        except ValueError as exc:
+            raise ValueError("Invalid story_id.") from exc
+        qs = qs.filter(story_id=story_id_val)
+
+    is_name_raw = (params.get("is_name") or "").strip().lower()
+    if is_name_raw:
+        if is_name_raw in ("true", "1", "yes"):
+            qs = qs.filter(is_name=True)
+        elif is_name_raw in ("false", "0", "no"):
+            qs = qs.filter(is_name=False)
+        else:
+            raise ValueError("Invalid is_name filter.")
+
+    return qs.order_by("answer", "clue", "id")
+
+
+class _CsvEcho:
+    def write(self, value: str) -> str:
+        return value
+
+
+def iter_clue_bank_csv_rows(qs, include_usage: bool = True):
+    writer = csv.writer(_CsvEcho(), lineterminator="\n")
+    header = ["answer", "clue", "story_slug", "is_name"]
+    if include_usage:
+        header.append("times_used")
+    yield writer.writerow(header)
+
+    for row in qs.iterator(chunk_size=500):
+        fields = [
+            row.answer,
+            row.clue,
+            row.story.slug if row.story_id else "",
+            "true" if row.is_name else "false",
+        ]
+        if include_usage:
+            fields.append(str(row.times_used))
+        yield writer.writerow(fields)
+
+
 class AdminClueBankListCreateAPIView(APIView):
     permission_classes = [IsSuperUser]
 
     def get(self, request):
-        q = (request.query_params.get("q") or "").strip()
-        qs = ClueBank.objects.select_related("story").all()
-        if q:
-            qs = qs.filter(Q(answer__icontains=q) | Q(clue__icontains=q))
-        rows = qs[:200]
+        try:
+            base_qs = _filter_clue_bank_queryset(request.query_params)
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        page_size_raw = (request.query_params.get("page_size") or "").strip()
+        if page_size_raw:
+            try:
+                page_size = int(page_size_raw)
+            except ValueError:
+                return Response(
+                    {"detail": "page_size must be an integer."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            page_size = max(1, min(page_size, CLUE_BANK_MAX_PAGE_SIZE))
+        else:
+            page_size = CLUE_BANK_DEFAULT_PAGE_SIZE
+
+        cursor_raw = (request.query_params.get("cursor") or "").strip()
+        qs = base_qs
+        if cursor_raw:
+            try:
+                cur_answer, cur_clue, cur_id = _decode_clue_bank_cursor(cursor_raw)
+            except ValueError:
+                return Response(
+                    {"detail": "Invalid cursor."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            qs = qs.filter(
+                Q(answer__gt=cur_answer)
+                | Q(answer=cur_answer, clue__gt=cur_clue)
+                | Q(answer=cur_answer, clue=cur_clue, id__gt=cur_id)
+            )
+
+        total = base_qs.count()
+        fetched = list(qs[: page_size + 1])
+        has_more = len(fetched) > page_size
+        rows = fetched[:page_size]
+        next_cursor = _encode_clue_bank_cursor(rows[-1]) if has_more and rows else None
+
         return Response(
             {
                 "results": [
@@ -1010,7 +1150,9 @@ class AdminClueBankListCreateAPIView(APIView):
                         "times_used": r.times_used,
                     }
                     for r in rows
-                ]
+                ],
+                "next_cursor": next_cursor,
+                "total": total,
             }
         )
 
@@ -1083,13 +1225,19 @@ class AdminClueBankDetailAPIView(APIView):
 
 
 def import_clue_bank_csv_text(csv_text: str) -> dict:
-    reader = csv.DictReader(io.StringIO(csv_text.strip()))
+    cleaned = (csv_text or "").lstrip("\ufeff").strip()
+    reader = csv.DictReader(io.StringIO(cleaned))
     imported = 0
     updated = 0
     skipped = 0
 
     for row in reader:
-        norm = {(k or "").strip().lower(): (v or "").strip() for k, v in row.items()}
+        norm = {
+            k.strip().lower(): (v or "").strip()
+            for k, v in row.items()
+            if k is not None
+        }
+        # times_used column is accepted and intentionally ignored
         ans = norm.get("answer", "").upper()
         clue = norm.get("clue", "")
         slug = norm.get("story_slug", "")
@@ -1121,3 +1269,21 @@ class AdminClueBankImportAPIView(APIView):
         if not csv_text.strip():
             return Response({"detail": "csv text is required."}, status=status.HTTP_400_BAD_REQUEST)
         return Response(import_clue_bank_csv_text(csv_text))
+
+
+class AdminClueBankExportAPIView(APIView):
+    permission_classes = [IsSuperUser]
+
+    def get(self, request):
+        try:
+            qs = _filter_clue_bank_queryset(request.query_params)
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        filename = f"clue-bank-{utc_today().isoformat()}.csv"
+        response = StreamingHttpResponse(
+            iter_clue_bank_csv_rows(qs, include_usage=True),
+            content_type="text/csv; charset=utf-8",
+        )
+        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+        return response

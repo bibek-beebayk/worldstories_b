@@ -645,6 +645,11 @@ urlpatterns = [
         name="admin-mini-clue-bank-import",
     ),
     path(
+        "api/admin/games/mini-crossword/clue-bank/export/",
+        games_mini_api.AdminClueBankExportAPIView.as_view(),
+        name="admin-mini-clue-bank-export",
+    ),
+    path(
         "api/admin/analytics/audience/",
         audience_api.AdminAnalyticsAudienceAPIView.as_view(),
         name="admin-analytics-audience",
