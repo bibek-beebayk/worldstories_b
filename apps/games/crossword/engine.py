@@ -4,10 +4,21 @@ from apps.games.models import ClueBank, MiniAttempt, MiniCrossword
 from apps.games.services.engine import utc_today
 from apps.stats.streaks import compute_streak
 
+from .difficulty import compute_difficulty
 from .grid import GRID_SIZE, entry_cells, extract_entry_answer, number_grid
 from .solver import generate_fill
 
 MAX_ELAPSED_SECONDS = 24 * 60 * 60  # 24 hours cap
+
+WEEKDAY_TARGET_DIFFICULTY: dict[int, str] = {
+    0: MiniCrossword.DIFFICULTY_EASY,    # Monday
+    1: MiniCrossword.DIFFICULTY_EASY,    # Tuesday
+    2: MiniCrossword.DIFFICULTY_MEDIUM,  # Wednesday
+    3: MiniCrossword.DIFFICULTY_MEDIUM,  # Thursday
+    4: MiniCrossword.DIFFICULTY_MEDIUM,  # Friday
+    5: MiniCrossword.DIFFICULTY_MEDIUM,  # Saturday
+    6: MiniCrossword.DIFFICULTY_MEDIUM,  # Sunday
+}
 
 DEFAULT_AUTO_PATTERNS: list[list[str]] = [
     ["....#", ".....", ".....", ".....", "#...."],  # blacks at (0,4), (4,0)
@@ -234,11 +245,18 @@ def auto_generate(
             for i in range(len(pattern_list))
         ]
         seed = int(target_date.strftime("%Y%m%d"))
+        target_diff = WEEKDAY_TARGET_DIFFICULTY[target_date.weekday()]
 
         chosen_pattern = None
         chosen_solution = None
         for pat in ordered_patterns:
-            sols = generate_fill(pat, seed=seed, limit=1, timeout_seconds=2.0)
+            sols = generate_fill(
+                pat,
+                seed=seed,
+                limit=1,
+                timeout_seconds=2.0,
+                target_difficulty=target_diff,
+            )
             if sols:
                 chosen_pattern = pat
                 chosen_solution = sols[0]
@@ -249,12 +267,16 @@ def auto_generate(
             continue
 
         clues = draft_clues(chosen_solution, chosen_pattern)
+        diff = compute_difficulty(chosen_solution, chosen_pattern)
         MiniCrossword.objects.create(
             date=target_date,
             title="",
             pattern=chosen_pattern,
             solution=chosen_solution,
             clues=clues,
+            difficulty=diff["label"],
+            difficulty_score=diff["score"],
+            difficulty_override=False,
             status=MiniCrossword.STATUS_DRAFT,  # NEVER auto-approve
             auto_generated=True,
         )

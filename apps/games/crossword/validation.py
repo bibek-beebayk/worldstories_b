@@ -4,6 +4,7 @@ import re
 from apps.games.models import MiniCrossword
 from apps.games.services.engine import utc_today
 
+from .difficulty import compute_difficulty
 from .grid import GRID_SIZE, extract_entry_answer, number_grid, validate_pattern
 from .words import get_allowed_words, get_blocklist
 
@@ -20,10 +21,7 @@ def _clue_contains_answer(clue_text: str, answer: str) -> bool:
     norm_ans = _norm_text(answer)
     if not norm_clue or not norm_ans:
         return False
-    # Check whole word or exact token containment
-    if f" {norm_ans} " in f" {norm_clue} ":
-        return True
-    return False
+    return f" {norm_ans} " in f" {norm_clue} "
 
 
 def validate_solution(
@@ -38,10 +36,14 @@ def validate_solution(
 
     pattern_errors = validate_pattern(pattern)
     if pattern_errors:
-        return {"errors": pattern_errors, "warnings": []}
+        return {"errors": pattern_errors, "warnings": [], "difficulty": None}
 
     if not isinstance(solution, list) or len(solution) != GRID_SIZE:
-        return {"errors": [f"Solution must be a list of {GRID_SIZE} rows."], "warnings": []}
+        return {
+            "errors": [f"Solution must be a list of {GRID_SIZE} rows."],
+            "warnings": [],
+            "difficulty": None,
+        }
 
     for r in range(GRID_SIZE):
         row = solution[r]
@@ -59,12 +61,13 @@ def validate_solution(
                 )
 
     if errors:
-        return {"errors": errors, "warnings": warnings}
+        return {"errors": errors, "warnings": warnings, "difficulty": None}
 
     numbered = number_grid(pattern)
     entries = numbered["entries"]
     allowed = get_allowed_words(include_db=include_db)
     blocklist = get_blocklist()
+    difficulty = compute_difficulty(solution, pattern, include_db=include_db)
 
     entry_answers: dict[tuple[int, str], str] = {}
     seen_answers: dict[str, str] = {}
@@ -89,7 +92,7 @@ def validate_solution(
 
     if not isinstance(clues, list):
         errors.append("Clues must be a list.")
-        return {"errors": errors, "warnings": warnings}
+        return {"errors": errors, "warnings": warnings, "difficulty": difficulty}
 
     clue_map: dict[tuple[int, str], dict] = {}
     for item in clues:
@@ -118,6 +121,14 @@ def validate_solution(
             errors.append(f"Clue for {label} ({ans}) cannot be empty.")
         elif _clue_contains_answer(clue_text, ans):
             errors.append(f"Clue for {label} contains its own answer '{ans}'.")
+
+    # Non-blocking difficulty warnings (names & rare words)
+    if len(difficulty["names"]) > 1:
+        warnings.append(
+            f"This grid has {len(difficulty['names'])} names ({', '.join(difficulty['names'])})."
+        )
+    if difficulty["rare_words"]:
+        warnings.append(f"Rare words: {', '.join(difficulty['rare_words'])}.")
 
     # Non-blocking warnings: recently reused clues (60 days) or answers (30 days)
     if include_db:
@@ -154,4 +165,4 @@ def validate_solution(
                 if ct and ct in recent_clues_60:
                     warnings.append(f"{label} clue text was used in the last 60 days.")
 
-    return {"errors": errors, "warnings": warnings}
+    return {"errors": errors, "warnings": warnings, "difficulty": difficulty}

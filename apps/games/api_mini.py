@@ -16,8 +16,10 @@ from apps.games.api import _get_actor, _parse_iso_date
 from apps.games.crossword import (
     GRID_SIZE,
     MAX_ELAPSED_SECONDS,
+    apply_difficulty_to_puzzle,
     auto_generate,
     check_cells,
+    compute_difficulty,
     draft_clues,
     empty_letters_for_pattern,
     generate_fill,
@@ -127,6 +129,7 @@ def _serialize_public_mini(
         "number": puzzle.number,
         "date": puzzle.date.isoformat(),
         "title": puzzle.title,
+        "difficulty": puzzle.difficulty or "",
         "pattern": puzzle.pattern,
         "numbering": numbered["numbering"],
         "entries": numbered["entries"],
@@ -437,6 +440,7 @@ class MiniArchiveAPIView(APIView):
                     "number": p.number,
                     "date": p.date.isoformat(),
                     "title": p.title,
+                    "difficulty": p.difficulty or "",
                     "status": att.status if att else "unplayed",
                     "elapsed_seconds": att.elapsed_seconds if att else None,
                     "hints_used": att.hints_used if att else 0,
@@ -512,12 +516,41 @@ def _filled_clues_label(puzzle: MiniCrossword) -> str:
     return f"{filled} / {total}"
 
 
+def _parse_bool_flag(raw) -> bool:
+    if isinstance(raw, bool):
+        return raw
+    s = str(raw or "").strip().lower()
+    return s in ("true", "1", "yes", "y")
+
+
 def _serialize_admin_mini(puzzle: MiniCrossword) -> dict:
     today = utc_today()
     attempts_count = puzzle.attempts.count()
     val = validate_solution(
         puzzle.pattern, puzzle.solution, puzzle.clues or [], exclude_puzzle_id=puzzle.id
     )
+    # Mark which (answer, clue) pairs already exist in ClueBank
+    clues_list = puzzle.clues or []
+    answers = {
+        (c.get("answer") or "").strip().upper()
+        for c in clues_list
+        if isinstance(c, dict) and c.get("answer")
+    }
+    bank_pairs = set(
+        ClueBank.objects.filter(answer__in=answers).values_list("answer", "clue")
+    )
+    enriched_clues = []
+    for c in clues_list:
+        if not isinstance(c, dict):
+            continue
+        ans = (c.get("answer") or "").strip().upper()
+        ct = (c.get("clue") or "").strip()
+        item = dict(c)
+        item["in_bank"] = bool(ans and ct and (ans, ct) in bank_pairs)
+        if "save_to_bank" not in item:
+            item["save_to_bank"] = True
+        enriched_clues.append(item)
+
     return {
         "id": puzzle.id,
         "number": puzzle.number,
@@ -525,7 +558,11 @@ def _serialize_admin_mini(puzzle: MiniCrossword) -> dict:
         "title": puzzle.title,
         "pattern": puzzle.pattern,
         "solution": puzzle.solution,
-        "clues": puzzle.clues or [],
+        "clues": enriched_clues,
+        "difficulty": puzzle.difficulty or "",
+        "difficulty_score": puzzle.difficulty_score,
+        "difficulty_override": puzzle.difficulty_override,
+        "difficulty_breakdown": val.get("difficulty"),
         "approval_status": puzzle.status,
         "status": _admin_mini_status(puzzle, puzzle.date, today),
         "auto_generated": puzzle.auto_generated,
@@ -576,6 +613,9 @@ class AdminMiniListCreateAPIView(APIView):
                     "date": cursor.isoformat(),
                     "number": p.number,
                     "title": p.title,
+                    "difficulty": p.difficulty or "",
+                    "difficulty_score": p.difficulty_score,
+                    "difficulty_override": p.difficulty_override,
                     "filled_clues": _filled_clues_label(p),
                     "status": row_status,
                     "approval_status": p.status,
@@ -589,6 +629,9 @@ class AdminMiniListCreateAPIView(APIView):
                     "date": cursor.isoformat(),
                     "number": None,
                     "title": "",
+                    "difficulty": "",
+                    "difficulty_score": None,
+                    "difficulty_override": False,
                     "filled_clues": "0 / 0",
                     "status": "empty",
                     "approval_status": None,
@@ -613,17 +656,21 @@ class AdminMiniListCreateAPIView(APIView):
         clues = request.data.get("clues") or []
         title = (request.data.get("title") or "").strip()
 
+        puzzle = MiniCrossword(
+            date=parsed_date,
+            title=title,
+            pattern=pattern,
+            solution=solution,
+            clues=clues,
+            status=MiniCrossword.STATUS_DRAFT,  # Never auto-approve
+            auto_generated=False,
+            created_by=request.user,
+        )
+        _apply_difficulty_params(puzzle, request.data)
+        apply_difficulty_to_puzzle(puzzle)
+
         try:
-            puzzle = MiniCrossword.objects.create(
-                date=parsed_date,
-                title=title,
-                pattern=pattern,
-                solution=solution,
-                clues=clues,
-                status=MiniCrossword.STATUS_DRAFT,  # Never auto-approve
-                auto_generated=False,
-                created_by=request.user,
-            )
+            puzzle.save()
         except IntegrityError:
             return Response(
                 {"detail": "A mini crossword already exists for this date."},
@@ -631,6 +678,25 @@ class AdminMiniListCreateAPIView(APIView):
             )
 
         return Response(_serialize_admin_mini(puzzle), status=status.HTTP_201_CREATED)
+
+
+def _apply_difficulty_params(puzzle: MiniCrossword, data: dict) -> None:
+    valid_labels = {
+        MiniCrossword.DIFFICULTY_EASY,
+        MiniCrossword.DIFFICULTY_MEDIUM,
+        MiniCrossword.DIFFICULTY_HARD,
+    }
+    if "difficulty" in data:
+        raw = data.get("difficulty")
+        norm = (raw or "").strip().lower() if isinstance(raw, str) else ""
+        if norm in valid_labels:
+            puzzle.difficulty = norm
+            puzzle.difficulty_override = True
+        else:
+            # null, "", or "auto" resets to computed difficulty
+            puzzle.difficulty_override = False
+    elif "difficulty_override" in data:
+        puzzle.difficulty_override = _parse_bool_flag(data.get("difficulty_override"))
 
 
 class AdminMiniDetailAPIView(APIView):
@@ -668,6 +734,10 @@ class AdminMiniDetailAPIView(APIView):
             puzzle.solution = request.data["solution"]
         if "clues" in request.data:
             puzzle.clues = request.data["clues"]
+
+        _apply_difficulty_params(puzzle, request.data)
+        if any(f in request.data for f in ("pattern", "solution", "difficulty", "difficulty_override")):
+            apply_difficulty_to_puzzle(puzzle)
 
         if any(f in request.data for f in content_fields):
             puzzle.status = MiniCrossword.STATUS_DRAFT
@@ -711,25 +781,54 @@ class AdminMiniApproveAPIView(APIView):
         )
         if val["errors"]:
             return Response(
-                {"detail": "Validation failed.", "errors": val["errors"], "warnings": val["warnings"]},
+                {
+                    "detail": "Validation failed.",
+                    "errors": val["errors"],
+                    "warnings": val["warnings"],
+                    "difficulty": val.get("difficulty"),
+                },
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
         with transaction.atomic():
+            was_draft = puzzle.status == MiniCrossword.STATUS_DRAFT
+            apply_difficulty_to_puzzle(puzzle)
             puzzle.status = MiniCrossword.STATUS_APPROVED
             puzzle.approved_by = request.user
             puzzle.approved_at = timezone.now()
             puzzle.auto_generated = False
             puzzle.save(
-                update_fields=["status", "approved_by", "approved_at", "auto_generated", "updated_at"]
+                update_fields=[
+                    "status",
+                    "approved_by",
+                    "approved_at",
+                    "auto_generated",
+                    "difficulty",
+                    "difficulty_score",
+                    "updated_at",
+                ]
             )
-            for c in puzzle.clues or []:
-                ans = (c.get("answer") or "").strip().upper()
-                ct = (c.get("clue") or "").strip()
-                if ans and ct:
-                    ClueBank.objects.filter(answer=ans, clue=ct).update(
-                        times_used=F("times_used") + 1
+            if was_draft:
+                for c in puzzle.clues or []:
+                    if not isinstance(c, dict):
+                        continue
+                    if c.get("save_to_bank") is False:
+                        continue
+                    ans = (c.get("answer") or "").strip().upper()
+                    ct = (c.get("clue") or "").strip()
+                    if not ans or not ct:
+                        continue
+                    sid = c.get("story_id")
+                    story = Story.objects.filter(pk=sid).first() if sid else None
+                    obj, created = ClueBank.objects.get_or_create(
+                        answer=ans,
+                        clue=ct,
+                        defaults={"story": story, "times_used": 1},
                     )
+                    if not created:
+                        ClueBank.objects.filter(pk=obj.pk).update(
+                            times_used=F("times_used") + 1
+                        )
 
         return Response(_serialize_admin_mini(puzzle))
 
@@ -807,6 +906,7 @@ class AdminMiniClueSuggestionsAPIView(APIView):
                         "clue": r.clue,
                         "story_id": r.story_id,
                         "story_title": r.story.title if r.story_id else None,
+                        "is_name": r.is_name,
                         "times_used": r.times_used,
                     }
                     for r in rows
@@ -906,6 +1006,7 @@ class AdminClueBankListCreateAPIView(APIView):
                         "story_id": r.story_id,
                         "story_slug": r.story.slug if r.story_id else None,
                         "story_title": r.story.title if r.story_id else None,
+                        "is_name": r.is_name,
                         "times_used": r.times_used,
                     }
                     for r in rows
@@ -918,6 +1019,7 @@ class AdminClueBankListCreateAPIView(APIView):
         clue = (request.data.get("clue") or "").strip()
         story_slug = (request.data.get("story_slug") or "").strip()
         story_id = request.data.get("story_id") or None
+        is_name_flag = _parse_bool_flag(request.data.get("is_name", False))
 
         if not answer or not clue:
             return Response(
@@ -934,7 +1036,7 @@ class AdminClueBankListCreateAPIView(APIView):
         obj, created = ClueBank.objects.update_or_create(
             answer=answer,
             clue=clue,
-            defaults={"story": story},
+            defaults={"story": story, "is_name": is_name_flag},
         )
         return Response(
             {
@@ -943,6 +1045,7 @@ class AdminClueBankListCreateAPIView(APIView):
                 "clue": obj.clue,
                 "story_id": obj.story_id,
                 "story_title": obj.story.title if obj.story_id else None,
+                "is_name": obj.is_name,
                 "times_used": obj.times_used,
             },
             status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
@@ -951,6 +1054,25 @@ class AdminClueBankListCreateAPIView(APIView):
 
 class AdminClueBankDetailAPIView(APIView):
     permission_classes = [IsSuperUser]
+
+    def patch(self, request, pk: int):
+        obj = ClueBank.objects.select_related("story").filter(pk=pk).first()
+        if obj is None:
+            return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
+        if "is_name" in request.data:
+            obj.is_name = _parse_bool_flag(request.data.get("is_name"))
+            obj.save(update_fields=["is_name"])
+        return Response(
+            {
+                "id": obj.id,
+                "answer": obj.answer,
+                "clue": obj.clue,
+                "story_id": obj.story_id,
+                "story_title": obj.story.title if obj.story_id else None,
+                "is_name": obj.is_name,
+                "times_used": obj.times_used,
+            }
+        )
 
     def delete(self, request, pk: int):
         obj = ClueBank.objects.filter(pk=pk).first()
@@ -971,6 +1093,7 @@ def import_clue_bank_csv_text(csv_text: str) -> dict:
         ans = norm.get("answer", "").upper()
         clue = norm.get("clue", "")
         slug = norm.get("story_slug", "")
+        is_name_flag = _parse_bool_flag(norm.get("is_name", ""))
 
         if not ans or not clue or not (3 <= len(ans) <= 5) or not ans.isalpha():
             skipped += 1
@@ -980,7 +1103,7 @@ def import_clue_bank_csv_text(csv_text: str) -> dict:
         _, created = ClueBank.objects.update_or_create(
             answer=ans,
             clue=clue,
-            defaults={"story": story},
+            defaults={"story": story, "is_name": is_name_flag},
         )
         if created:
             imported += 1

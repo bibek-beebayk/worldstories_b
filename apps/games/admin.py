@@ -83,8 +83,17 @@ class PuzzleRotationAdmin(admin.ModelAdmin):
 
 @admin.register(MiniCrossword)
 class MiniCrosswordAdmin(admin.ModelAdmin):
-    list_display = ("date", "title", "status", "auto_generated", "created_at")
-    list_filter = ("status", "auto_generated")
+    list_display = (
+        "date",
+        "title",
+        "difficulty",
+        "difficulty_score",
+        "difficulty_override",
+        "status",
+        "auto_generated",
+        "created_at",
+    )
+    list_filter = ("status", "difficulty", "difficulty_override", "auto_generated")
     search_fields = ("title",)
     date_hierarchy = "date"
     raw_id_fields = ("created_by", "approved_by")
@@ -130,7 +139,8 @@ class MiniAttemptAdmin(admin.ModelAdmin):
 
 @admin.register(ClueBank)
 class ClueBankAdmin(admin.ModelAdmin):
-    list_display = ("answer", "clue", "story", "times_used", "created_at")
+    list_display = ("answer", "clue", "story", "is_name", "times_used", "created_at")
+    list_filter = ("is_name",)
     search_fields = ("answer", "clue")
     raw_id_fields = ("story",)
 

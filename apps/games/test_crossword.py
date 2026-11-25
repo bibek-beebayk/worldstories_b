@@ -5,12 +5,21 @@ from django.test import TestCase
 
 from apps.games.crossword import (
     DEFAULT_AUTO_PATTERNS,
+    SOLVER_BANK_MIN_ZIPF,
+    SOLVER_MIN_ZIPF,
+    apply_difficulty_to_puzzle,
     auto_generate,
     check_cells,
+    clear_word_caches,
+    compute_difficulty,
     draft_clues,
     generate_fill,
     get_allowed_words,
     get_blocklist,
+    get_word_scores,
+    is_common,
+    is_name,
+    is_rare,
     is_solved,
     number_grid,
     reveal_cell,
@@ -18,6 +27,7 @@ from apps.games.crossword import (
     stats_for,
     validate_pattern,
     validate_solution,
+    zipf,
 )
 from apps.games.models import ClueBank, CrosswordWord, MiniAttempt, MiniCrossword
 from apps.story.models import Author, Story
@@ -211,3 +221,65 @@ class CrosswordServicesTestCase(TestCase):
         # Idempotent second run
         res2 = auto_generate(start, days=2)
         self.assertEqual(res2["created_count"], 0)
+
+    def test_word_commonness_and_name_helpers(self):
+        clear_word_caches()
+        self.assertGreater(zipf("SPAM"), 0.0)
+        self.assertTrue(is_name("OGDEN"))
+        self.assertTrue(is_name("POE"))
+        self.assertFalse(is_name("ROSE"))  # Everyday common word is NOT a name
+        self.assertTrue(is_common("ROSE"))
+        self.assertEqual(zipf("ZZZZQ"), 0.0)
+        self.assertTrue(is_rare("ZZZZQ"))
+        # Caches load once
+        info1 = get_word_scores.cache_info()
+        zipf("SPAM")
+        info2 = get_word_scores.cache_info()
+        self.assertEqual(info1.misses, info2.misses)
+
+    def test_difficulty_scoring_override_solver_cap_and_warnings(self):
+        # Everyday high-Zipf symmetric grid -> Easy (PAST, AREAS, SENSE, TASTE, SEEN)
+        easy_sol = ["PAST#", "AREAS", "SENSE", "TASTE", "#SEEN"]
+        diff_easy = compute_difficulty(easy_sol, MOCK_PATTERN, include_db=False)
+        self.assertEqual(diff_easy["names"], [])
+        self.assertEqual(diff_easy["rare_words"], [])
+        self.assertEqual(diff_easy["label"], "easy")
+
+        # Grid with 3+ rare/unknown words -> Hard
+        hard_sol = ["QQQQ#", "XXXXX", "ZZZZZ", "VVVVV", "#WWWW"]
+        diff_hard = compute_difficulty(hard_sol, MOCK_PATTERN, include_db=False)
+        self.assertEqual(diff_hard["label"], "hard")
+        self.assertGreaterEqual(len(diff_hard["rare_words"]), 3)
+
+        # Override preserved on recompute
+        p = MiniCrossword.objects.create(
+            date=date(2026, 12, 10),
+            pattern=MOCK_PATTERN,
+            solution=MOCK_SOLUTION,
+            clues=MOCK_CLUES,
+            difficulty="hard",
+            difficulty_override=True,
+        )
+        apply_difficulty_to_puzzle(p)
+        self.assertEqual(p.difficulty, "hard")
+        self.assertIsNotNone(p.difficulty_score)
+
+        # Solver output enforces <= 1 name and zipf threshold
+        sols = generate_fill(MOCK_PATTERN, seed=20261201, limit=2, target_difficulty="easy")
+        self.assertTrue(len(sols) >= 1)
+        for sol in sols:
+            d = compute_difficulty(sol, MOCK_PATTERN)
+            self.assertLessEqual(len(d["names"]), 1)
+            for entry in number_grid(MOCK_PATTERN)["entries"]:
+                r, c, length = entry["row"], entry["col"], entry["length"]
+                w = (
+                    sol[r][c : c + length]
+                    if entry["direction"] == "across"
+                    else "".join(sol[r + i][c] for i in range(length))
+                )
+                self.assertGreaterEqual(zipf(w), SOLVER_BANK_MIN_ZIPF)
+
+        # Validation includes difficulty breakdown & rare-word warnings
+        val = validate_solution(MOCK_PATTERN, hard_sol, MOCK_CLUES, include_db=False)
+        self.assertIn("difficulty", val)
+        self.assertTrue(any("Rare words:" in w for w in val["warnings"]))

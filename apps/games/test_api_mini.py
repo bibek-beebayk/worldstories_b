@@ -277,3 +277,83 @@ class MiniCrosswordAPITestCase(TestCase):
         count1 = MiniCrossword.objects.count()
         call_command("autogenerate_minis", days=3)
         self.assertEqual(MiniCrossword.objects.count(), count1)
+
+    def test_difficulty_override_clue_bank_saving_and_recompute_command(self):
+        self.client.force_authenticate(user=self.staff)
+        d_new = (self.today + timedelta(days=9)).isoformat()
+
+        clues = make_clues(self.story.id)
+        # Mark first clue as save_to_bank=False
+        clues[0]["save_to_bank"] = False
+
+        r_cr = self.client.post(
+            "/api/admin/games/mini-crossword/puzzles/",
+            {
+                "date": d_new,
+                "title": "Bank Save Test",
+                "pattern": MOCK_PATTERN,
+                "solution": MOCK_SOLUTION,
+                "clues": clues,
+                "difficulty": "hard",
+            },
+            format="json",
+        )
+        self.assertEqual(r_cr.status_code, 201)
+        data = r_cr.json()
+        pid = data["id"]
+        self.assertEqual(data["difficulty"], "hard")
+        self.assertTrue(data["difficulty_override"])
+        self.assertIsNotNone(data["difficulty_score"])
+
+        # Reset override via difficulty="auto"
+        r_reset = self.client.patch(
+            f"/api/admin/games/mini-crossword/puzzles/{pid}/",
+            {"difficulty": "auto"},
+            format="json",
+        )
+        self.assertEqual(r_reset.status_code, 200)
+        self.assertFalse(r_reset.json()["difficulty_override"])
+
+        # Pre-seed one clue in ClueBank to verify increment vs create
+        ClueBank.objects.create(answer="RAVEN", clue="Poe's midnight bird", times_used=2)
+
+        # Approve (draft -> approved) creates new bank rows once & increments existing once; skips save_to_bank=False
+        r_app = self.client.post(f"/api/admin/games/mini-crossword/puzzles/{pid}/approve/")
+        self.assertEqual(r_app.status_code, 200)
+        self.assertFalse(ClueBank.objects.filter(answer="SPAM", clue="Unwanted inbox messages").exists())
+        self.assertTrue(ClueBank.objects.filter(answer="TALES", clue="Short stories of wonder", times_used=1).exists())
+        self.assertEqual(ClueBank.objects.get(answer="RAVEN", clue="Poe's midnight bird").times_used, 3)
+
+        # Re-approving an already-approved puzzle must NOT increment times_used again
+        r_app2 = self.client.post(f"/api/admin/games/mini-crossword/puzzles/{pid}/approve/")
+        self.assertEqual(r_app2.status_code, 200)
+        self.assertEqual(ClueBank.objects.get(answer="RAVEN", clue="Poe's midnight bird").times_used, 3)
+
+        # CSV import with is_name column
+        csv_body = "answer,clue,story_slug,is_name\nOGDEN,Poet Nash,,true\nSTAR,Night light,,false\n"
+        r_csv = self.client.post(
+            "/api/admin/games/mini-crossword/clue-bank/import/",
+            {"csv": csv_body},
+            format="json",
+        )
+        self.assertEqual(r_csv.status_code, 200)
+        self.assertTrue(ClueBank.objects.get(answer="OGDEN", clue="Poet Nash").is_name)
+        self.assertFalse(ClueBank.objects.get(answer="STAR", clue="Night light").is_name)
+
+        # recompute_mini_difficulty --dry-run changes nothing
+        self.today_mini.difficulty = ""
+        self.today_mini.difficulty_score = None
+        self.today_mini.save(update_fields=["difficulty", "difficulty_score"])
+        call_command("recompute_mini_difficulty", dry_run=True)
+        self.today_mini.refresh_from_db()
+        self.assertEqual(self.today_mini.difficulty, "")
+        call_command("recompute_mini_difficulty")
+        self.today_mini.refresh_from_db()
+        self.assertIn(self.today_mini.difficulty, ("easy", "medium", "hard"))
+
+        # Public payload includes difficulty label but never breakdown or solution
+        self.client.force_authenticate(user=None)
+        pub = self.client.get("/api/games/mini-crossword/today/").json()
+        self.assertEqual(pub["difficulty"], self.today_mini.difficulty)
+        self.assertNotIn("difficulty_breakdown", pub)
+        self.assertNotIn("solution", pub)

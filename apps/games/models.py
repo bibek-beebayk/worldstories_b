@@ -262,11 +262,28 @@ class MiniCrossword(models.Model):
         (STATUS_APPROVED, "Approved"),
     ]
 
+    DIFFICULTY_EASY = "easy"
+    DIFFICULTY_MEDIUM = "medium"
+    DIFFICULTY_HARD = "hard"
+    DIFFICULTY_CHOICES = [
+        (DIFFICULTY_EASY, "Easy"),
+        (DIFFICULTY_MEDIUM, "Medium"),
+        (DIFFICULTY_HARD, "Hard"),
+    ]
+
     date = models.DateField(unique=True, db_index=True)
     title = models.CharField(max_length=160, blank=True, default="")
     pattern = models.JSONField(default=list)
     solution = models.JSONField(default=list)
     clues = models.JSONField(default=list, blank=True)
+    difficulty = models.CharField(
+        max_length=16,
+        choices=DIFFICULTY_CHOICES,
+        blank=True,
+        default="",
+    )
+    difficulty_score = models.FloatField(null=True, blank=True)
+    difficulty_override = models.BooleanField(default=False)
     status = models.CharField(
         max_length=16,
         choices=STATUS_CHOICES,
@@ -384,6 +401,7 @@ class ClueBank(models.Model):
         on_delete=models.SET_NULL,
         related_name="crossword_clues",
     )
+    is_name = models.BooleanField(default=False)
     times_used = models.PositiveIntegerField(default=0)
     created_at = models.DateTimeField(auto_now_add=True)
 

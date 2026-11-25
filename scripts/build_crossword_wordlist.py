@@ -1,19 +1,22 @@
-"""Dev-only script to generate apps/games/data/crossword_words.txt using wordfreq.
+"""Dev-only script to generate apps/games/data/crossword_words.txt and
+apps/games/data/crossword_word_scores.json using wordfreq.
 
 Usage (dev environment only; do NOT add wordfreq to production requirements):
     pip install wordfreq
     python scripts/build_crossword_wordlist.py
 """
 
+import json
 from pathlib import Path
 import re
 
-from wordfreq import top_n_list
+from wordfreq import top_n_list, zipf_frequency
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "apps" / "games" / "data"
 BLOCKLIST_PATH = DATA_DIR / "crossword_blocklist.txt"
-OUTPUT_PATH = DATA_DIR / "crossword_words.txt"
+OUTPUT_WORDS_PATH = DATA_DIR / "crossword_words.txt"
+OUTPUT_SCORES_PATH = DATA_DIR / "crossword_word_scores.json"
 
 ASCII_ALPHA_RE = re.compile(r"^[a-z]{3,5}$")
 
@@ -43,7 +46,6 @@ def load_blocklist() -> set[str]:
 
 def main():
     blocklist = load_blocklist()
-    # Pull from top ~60,000 English words so we comfortably get 8,000+ clean 3-5 letter words
     raw_words = top_n_list("en", 65000)
 
     selected: set[str] = set()
@@ -60,9 +62,18 @@ def main():
             selected.add(req)
 
     sorted_words = sorted(selected)
+    scores = {
+        word: round(float(zipf_frequency(word.lower(), "en")), 2)
+        for word in sorted_words
+    }
+
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    OUTPUT_PATH.write_text("\n".join(sorted_words) + "\n", encoding="utf-8")
-    print(f"Wrote {len(sorted_words)} words to {OUTPUT_PATH}")
+    OUTPUT_WORDS_PATH.write_text("\n".join(sorted_words) + "\n", encoding="utf-8")
+    OUTPUT_SCORES_PATH.write_text(
+        json.dumps(scores, separators=(",", ":"), sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    print(f"Wrote {len(sorted_words)} words and scores to {DATA_DIR}")
 
 
 if __name__ == "__main__":
