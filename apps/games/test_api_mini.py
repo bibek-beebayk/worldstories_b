@@ -658,3 +658,72 @@ class MiniCrosswordAPITestCase(TestCase):
         self.assertEqual(ag["reason"], "bank_too_small")
         self.assertEqual(ag["bank"]["total_answers"], 3)
         self.assertIn("Add more clues", ag["suggestion"])
+
+    def test_today_summary_statuses_auth_no_leak_404_and_queries(self):
+        guest = "guest-summary-key-1"
+        headers = {"HTTP_X_GUEST_KEY": guest}
+
+        # 1. Not started (guest) + Cache-Control + no solution/clues/share_tokens + constant queries
+        # (SAVEPOINT + puzzle + first_date + attempt + solved_dates + RELEASE = 6)
+        with self.assertNumQueries(6):
+            r0 = self.client.get("/api/games/mini-crossword/today/summary/", **headers)
+        self.assertEqual(r0.status_code, 200)
+        self.assertEqual(r0["Cache-Control"], "private, no-store")
+        d0 = r0.json()
+        self.assertEqual(d0["date"], self.today.isoformat())
+        self.assertEqual(d0["status"], "not_started")
+        self.assertEqual(d0["white_cells"], 23)
+        self.assertEqual(d0["filled_cells"], 0)
+        self.assertIsNone(d0["elapsed_seconds"])
+        self.assertEqual(d0["hints_used"], 0)
+        self.assertEqual(d0["current_streak"], 0)
+        self.assertEqual(d0["pattern"], MOCK_PATTERN)
+        for forbidden in ("solution", "clues", "share_tokens"):
+            self.assertNotIn(forbidden, d0)
+
+        # 2. In progress with filled count
+        self.client.post("/api/games/mini-crossword/start/", {}, format="json", **headers)
+        self.client.put(
+            "/api/games/mini-crossword/save/",
+            {"letters": ["SPAM#", "T....", ".....", ".....", "#...."]},
+            format="json",
+            **headers,
+        )
+        r1 = self.client.get("/api/games/mini-crossword/today/summary/", **headers)
+        self.assertEqual(r1.status_code, 200)
+        d1 = r1.json()
+        self.assertEqual(d1["status"], "in_progress")
+        self.assertEqual(d1["filled_cells"], 5)
+        self.assertIsNotNone(d1["elapsed_seconds"])
+        self.assertNotIn("solution", d1)
+
+        # 3. Solved (guest) -> streak increments to 1, still no solution/clues/share_tokens
+        self.client.post(
+            "/api/games/mini-crossword/submit/",
+            {"letters": MOCK_SOLUTION},
+            format="json",
+            **headers,
+        )
+        r2 = self.client.get("/api/games/mini-crossword/today/summary/", **headers)
+        self.assertEqual(r2.status_code, 200)
+        d2 = r2.json()
+        self.assertEqual(d2["status"], "solved")
+        self.assertEqual(d2["filled_cells"], 23)
+        self.assertEqual(d2["current_streak"], 1)
+        for forbidden in ("solution", "clues", "share_tokens"):
+            self.assertNotIn(forbidden, d2)
+
+        # 4. Signed-in user sees their own status (not_started) independently of guest
+        self.client.force_authenticate(user=self.user)
+        r_user = self.client.get("/api/games/mini-crossword/today/summary/")
+        self.assertEqual(r_user.status_code, 200)
+        self.assertEqual(r_user.json()["status"], "not_started")
+        self.assertEqual(r_user.json()["current_streak"], 0)
+
+        # 5. 404 when no approved puzzle for today (same shape as today endpoint)
+        self.today_mini.status = MiniCrossword.STATUS_DRAFT
+        self.today_mini.save(update_fields=["status"])
+        r404 = self.client.get("/api/games/mini-crossword/today/summary/")
+        self.assertEqual(r404.status_code, 404)
+        self.assertEqual(r404["Cache-Control"], "private, no-store")
+        self.assertEqual(r404.json(), {"detail": "No mini crossword is available for today."})

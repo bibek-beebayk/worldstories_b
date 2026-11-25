@@ -38,6 +38,7 @@ from apps.games.crossword import (
 )
 from apps.games.models import ClueBank, MiniAttempt, MiniCrossword
 from apps.games.services.engine import utc_today
+from apps.stats.streaks import compute_streak
 from apps.story.api import IsSuperUser
 from apps.story.models import Story
 from core.libs.images import get_cover_image_url
@@ -194,6 +195,91 @@ class MiniTodayAPIView(APIView):
         user, guest_key = _get_actor(request)
         attempt = _get_mini_attempt(puzzle, user, guest_key)
         return Response(_serialize_public_mini(puzzle, attempt, request=request))
+
+
+class MiniTodaySummaryAPIView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        today = utc_today()
+        puzzle = _get_approved_mini(today)
+        if puzzle is None:
+            resp = Response(
+                {"detail": "No mini crossword is available for today."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+            resp["Cache-Control"] = "private, no-store"
+            return resp
+
+        user, guest_key = _get_actor(request)
+        attempt = _get_mini_attempt(puzzle, user, guest_key)
+
+        safe_pattern = [
+            "".join("#" if ch == "#" else "." for ch in str(row))
+            for row in (puzzle.pattern or [])
+        ]
+        white_cells = sum(row.count(".") for row in safe_pattern)
+
+        if attempt is None:
+            attempt_status = "not_started"
+            filled_cells = 0
+            elapsed_seconds = None
+            hints_used = 0
+        else:
+            attempt_status = attempt.status
+            letters = grid_state(attempt)
+            filled_cells = sum(
+                1
+                for r in range(min(GRID_SIZE, len(safe_pattern), len(letters)))
+                for c in range(min(GRID_SIZE, len(safe_pattern[r]), len(letters[r])))
+                if safe_pattern[r][c] == "." and letters[r][c] not in (".", "#")
+            )
+            if attempt.elapsed_seconds is not None:
+                elapsed_seconds = attempt.elapsed_seconds
+            elif attempt.status == MiniAttempt.STATUS_IN_PROGRESS and attempt.started_at:
+                delta = int((timezone.now() - attempt.started_at).total_seconds())
+                elapsed_seconds = max(0, min(MAX_ELAPSED_SECONDS, delta))
+            else:
+                elapsed_seconds = None
+            hints_used = attempt.hints_used
+
+        current_streak = 0
+        if user is not None and getattr(user, "is_authenticated", False):
+            solved_dates = set(
+                MiniAttempt.objects.filter(
+                    user=user,
+                    status=MiniAttempt.STATUS_SOLVED,
+                    is_archive=False,
+                ).values_list("puzzle__date", flat=True)
+            )
+            current_streak, _ = compute_streak(solved_dates, today)
+        elif guest_key:
+            solved_dates = set(
+                MiniAttempt.objects.filter(
+                    guest_key=guest_key,
+                    status=MiniAttempt.STATUS_SOLVED,
+                    is_archive=False,
+                ).values_list("puzzle__date", flat=True)
+            )
+            current_streak, _ = compute_streak(solved_dates, today)
+
+        resp = Response(
+            {
+                "date": puzzle.date.isoformat(),
+                "number": puzzle.number,
+                "title": puzzle.title,
+                "difficulty": puzzle.difficulty or "",
+                "pattern": safe_pattern,
+                "white_cells": white_cells,
+                "status": attempt_status,
+                "filled_cells": filled_cells,
+                "elapsed_seconds": elapsed_seconds,
+                "hints_used": hints_used,
+                "current_streak": current_streak,
+            }
+        )
+        resp["Cache-Control"] = "private, no-store"
+        return resp
 
 
 class MiniByDateAPIView(APIView):

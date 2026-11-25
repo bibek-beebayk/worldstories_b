@@ -535,6 +535,11 @@ urlpatterns = [
         name="mini-today",
     ),
     path(
+        "api/games/mini-crossword/today/summary/",
+        games_mini_api.MiniTodaySummaryAPIView.as_view(),
+        name="mini-today-summary",
+    ),
+    path(
         "api/games/mini-crossword/puzzles/<str:puzzle_date>/",
         games_mini_api.MiniByDateAPIView.as_view(),
         name="mini-by-date",
