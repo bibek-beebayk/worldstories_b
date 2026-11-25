@@ -12,6 +12,7 @@ from rest_framework.routers import DefaultRouter
 from rest_framework_simplejwt.views import TokenRefreshView
 from apps.story import api as story_api
 from apps.story import blog_images as blog_images_api
+from apps.games import api as games_api
 from apps.story import analytics_api as story_analytics_api
 from apps.story import overview_api
 from apps.story import engagement_api
@@ -429,6 +430,72 @@ urlpatterns = [
         "api/admin/blog-images/",
         blog_images_api.BlogImageUploadAPIView.as_view(),
         name="admin-blog-images",
+    ),
+    # Name That Story daily puzzle game (public + admin)
+    path(
+        "api/games/name-that-story/today/",
+        games_api.TodayPuzzleAPIView.as_view(),
+        name="nts-today",
+    ),
+    path(
+        "api/games/name-that-story/puzzles/<str:puzzle_date>/",
+        games_api.PuzzleByDateAPIView.as_view(),
+        name="nts-by-date",
+    ),
+    path(
+        "api/games/name-that-story/search/",
+        games_api.PuzzleSearchStoriesAPIView.as_view(),
+        name="nts-search",
+    ),
+    path(
+        "api/games/name-that-story/guess/",
+        games_api.PuzzleGuessAPIView.as_view(),
+        name="nts-guess",
+    ),
+    path(
+        "api/games/name-that-story/skip/",
+        games_api.PuzzleSkipAPIView.as_view(),
+        name="nts-skip",
+    ),
+    path(
+        "api/games/name-that-story/stats/",
+        games_api.PuzzleStatsAPIView.as_view(),
+        name="nts-stats",
+    ),
+    path(
+        "api/games/name-that-story/archive/",
+        games_api.PuzzleArchiveAPIView.as_view(),
+        name="nts-archive",
+    ),
+    path(
+        "api/games/name-that-story/merge-guest/",
+        games_api.MergeGuestAttemptsAPIView.as_view(),
+        name="nts-merge-guest",
+    ),
+    path(
+        "api/admin/games/name-that-story/puzzles/",
+        games_api.AdminPuzzlesListCreateAPIView.as_view(),
+        name="admin-nts-puzzles",
+    ),
+    path(
+        "api/admin/games/name-that-story/puzzles/<int:pk>/",
+        games_api.AdminPuzzleDetailAPIView.as_view(),
+        name="admin-nts-puzzle-detail",
+    ),
+    path(
+        "api/admin/games/name-that-story/candidates/",
+        games_api.AdminPuzzleCandidatesAPIView.as_view(),
+        name="admin-nts-candidates",
+    ),
+    path(
+        "api/admin/games/name-that-story/autofill/",
+        games_api.AdminPuzzleAutofillAPIView.as_view(),
+        name="admin-nts-autofill",
+    ),
+    path(
+        "api/admin/games/name-that-story/summary/",
+        games_api.AdminPuzzleSummaryAPIView.as_view(),
+        name="admin-nts-summary",
     ),
     path(
         "api/admin/analytics/audience/",

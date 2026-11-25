@@ -45,6 +45,7 @@ INSTALLED_APPS = [
     "apps.pages",
     "apps.feedback",
     "apps.newsletter",
+    "apps.games",
     # "apps.blog"
 ]
 
@@ -75,6 +76,8 @@ X_FRAME_OPTIONS = "SAMEORIGIN"
 # percentage in production, where the frontend and backend are different
 # origins.
 CORS_EXPOSE_HEADERS = ["Content-Length"]
+from corsheaders.defaults import default_headers as _default_cors_headers
+CORS_ALLOW_HEADERS = [*_default_cors_headers, "x-guest-key"]
 
 ROOT_URLCONF = "core.urls"
 
@@ -207,6 +210,7 @@ REST_FRAMEWORK = {
         "login": "5/min",
         "newsletter_subscribe": "5/hour",
         "newsletter_public": "30/hour",
+        "game_search": "60/min",
     },
 }
 
