@@ -109,6 +109,10 @@ class PublicPageTests(PageTestBase):
         self.assertIn("/pages/listed<", xml)
         self.assertNotIn("/pages/hidden-from-search", xml)
         self.assertNotIn("/pages/not-yet", xml)
+        self.assertIn("/games<", xml)
+        self.assertIn("/games/mini-crossword<", xml)
+        self.assertNotIn("name-that-story", xml)
+        self.assertNotIn("/games/mini-crossword/archive", xml)
 
 
 class AdminPageTests(PageTestBase):

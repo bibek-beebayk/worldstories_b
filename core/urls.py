@@ -97,6 +97,11 @@ def sitemap(request):
             "/audiobooks",
             "/watch",
             "/quick-reads",
+            # Dated puzzle pages (/games/mini-crossword/:date, /archive) are thin
+            # and Name That Story is hidden behind a feature flag, so only list the
+            # main games hub and daily Mini Crossword entry.
+            "/games",
+            "/games/mini-crossword",
             "/tags",
             "/themes",
             "/contest",
