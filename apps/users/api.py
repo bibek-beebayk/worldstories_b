@@ -20,7 +20,11 @@ from django.utils import timezone
 from .geo import record_login
 from .models import OTP
 from .recommendations import recommend_stories_for
-from .continue_reading import continue_reading_items
+from .continue_reading import (
+    FILE_FORMAT_LABELS,
+    continue_file_items,
+    continue_reading_items,
+)
 from apps.story.api import IsSuperUser
 from apps.story.models import Audio, Chapter, Favorite, Genre, Review, Story, Video
 from apps.story.serializers import StoryListSerializer
@@ -586,12 +590,16 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
     @action(detail=False, methods=["get"], url_path="library/continue-reading")
     def library_continue_reading(self, request):
         selected = continue_reading_items(request.user)
-        story_ids = [item["progress"].story_id for item in selected]
+        file_selected = continue_file_items(request.user)
+        story_ids = [item["progress"].story_id for item in selected] + [
+            item["file_progress"].story_id for item in file_selected
+        ]
         cards = card_stories_by_id(story_ids, request.user)
-        payload = []
+
+        entries = []
         for selected_item in selected:
             item = selected_item["progress"]
-            payload.append(
+            entries.append(
                 {
                     "story": cards.get(item.story_id, item.story),
                     "chapter_slug": item.chapter.slug if item.chapter else None,
@@ -600,8 +608,34 @@ class AuthenticationViewSet(viewsets.GenericViewSet):
                     "overall_progress": selected_item["overall_progress"],
                     "updated_at": item.updated_at,
                     "excerpt": excerpt_at_progress(item.chapter, item.progress) if item.chapter else "",
+                    "file_format": None,
                 }
             )
+        for selected_item in file_selected:
+            row = selected_item["file_progress"]
+            entries.append(
+                {
+                    "story": cards.get(row.story_id, row.story),
+                    "chapter_slug": None,
+                    "chapter_title": FILE_FORMAT_LABELS.get(row.format),
+                    "chapter_progress": selected_item["overall_progress"],
+                    "overall_progress": selected_item["overall_progress"],
+                    "updated_at": row.updated_at,
+                    "excerpt": "",
+                    "file_format": row.format,
+                }
+            )
+
+        # A story read both by chapter and through a file shows once, as
+        # whichever the reader touched last.
+        newest_by_story = {}
+        for entry in entries:
+            current = newest_by_story.get(entry["story"].id)
+            if current is None or entry["updated_at"] > current["updated_at"]:
+                newest_by_story[entry["story"].id] = entry
+        payload = sorted(
+            newest_by_story.values(), key=lambda entry: entry["updated_at"], reverse=True
+        )
 
         page = self.paginate_queryset(payload)
         if page is not None:

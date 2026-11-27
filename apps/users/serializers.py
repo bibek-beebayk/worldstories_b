@@ -220,6 +220,9 @@ class ContinueReadingItemSerializer(RemainingMinutesMixin):
     overall_progress = serializers.FloatField()
     updated_at = serializers.DateTimeField()
     excerpt = serializers.CharField(allow_blank=True)
+    # "epub" / "pdf" when the reader is partway through the story's file
+    # rather than its chapters; None for chapter reading.
+    file_format = serializers.CharField(allow_null=True, required=False)
 
 
 class ReadingHistoryItemSerializer(serializers.Serializer):

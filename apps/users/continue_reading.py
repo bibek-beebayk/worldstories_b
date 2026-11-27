@@ -1,6 +1,11 @@
 from django.db.models import Count
 
-from apps.stats.models import ChapterReadingProgress, ReadingProgress, StoryCompletion
+from apps.stats.models import (
+    ChapterReadingProgress,
+    FileReadingProgress,
+    ReadingProgress,
+    StoryCompletion,
+)
 from apps.story.models import Chapter, published_story_q
 
 
@@ -58,3 +63,43 @@ def continue_reading_items(user, since=None, published_only=False):
             }
         )
     return payload
+
+
+FILE_FORMAT_LABELS = {
+    FileReadingProgress.FORMAT_EPUB: "EPUB edition",
+    FileReadingProgress.FORMAT_PDF: "PDF edition",
+}
+
+
+def continue_file_items(user, since=None, published_only=False):
+    """In-progress EPUB/PDF reads, one row per story (the most recent format).
+
+    EPUB and PDF progress lives in FileReadingProgress, not in the chapter
+    tables, so `continue_reading_items` never sees it. A story read only
+    through its file has no chapter progress at all and used to be invisible
+    on every "continue" surface.
+    """
+    file_qs = FileReadingProgress.objects.filter(
+        user=user, progress__gt=0, progress__lt=1
+    ).select_related("story")
+    if since is not None:
+        file_qs = file_qs.filter(updated_at__gte=since)
+    if published_only:
+        file_qs = file_qs.filter(published_story_q("story"))
+    file_qs = file_qs.exclude(
+        story_id__in=StoryCompletion.objects.filter(user=user).values("story_id")
+    ).order_by("-updated_at")
+
+    items = []
+    seen_stories = set()
+    for row in file_qs:
+        if row.story_id in seen_stories:
+            continue
+        seen_stories.add(row.story_id)
+        items.append(
+            {
+                "file_progress": row,
+                "overall_progress": round(max(0.0, min(1.0, row.progress)), 4),
+            }
+        )
+    return items

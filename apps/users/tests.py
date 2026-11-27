@@ -324,6 +324,71 @@ class LibraryContinueReadingApiTests(APITestCase):
         self.assertIsNone(item["story"]["reading_time_minutes"])
         self.assertIsNone(item["remaining_minutes"])
 
+    def test_continue_reading_includes_an_in_progress_epub(self):
+        """EPUB progress lives in FileReadingProgress, not the chapter tables,
+        so a story read only as a file used to be missing from Continue."""
+        epub_story = Story.objects.create(
+            title="Epub Only", slug="epub-only-continue", is_published=True
+        )
+        FileReadingProgress.objects.create(
+            user=self.user,
+            story=epub_story,
+            format=FileReadingProgress.FORMAT_EPUB,
+            progress=0.05,
+            position="epubcfi(/6/2)",
+        )
+        self.client.force_authenticate(self.user)
+
+        response = self.client.get(reverse("auth-library-continue-reading"))
+
+        self.assertEqual(response.status_code, 200)
+        by_slug = {row["story"]["slug"]: row for row in response.data["results"]}
+        row = by_slug["epub-only-continue"]
+        self.assertEqual(row["file_format"], "epub")
+        self.assertIsNone(row["chapter_slug"])
+        self.assertAlmostEqual(row["overall_progress"], 0.05)
+        self.assertIsNone(by_slug["a-read-book-continue"]["file_format"])
+
+    def test_a_story_read_by_chapter_and_file_shows_once_as_the_latest(self):
+        FileReadingProgress.objects.create(
+            user=self.user,
+            story=self.story,
+            format=FileReadingProgress.FORMAT_PDF,
+            progress=0.3,
+            position="4",
+        )
+        self.client.force_authenticate(self.user)
+
+        response = self.client.get(reverse("auth-library-continue-reading"))
+
+        rows = [
+            row
+            for row in response.data["results"]
+            if row["story"]["slug"] == "a-read-book-continue"
+        ]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["file_format"], "pdf")
+
+    def test_a_completed_epub_is_not_offered_to_continue(self):
+        done = Story.objects.create(
+            title="Epub Done", slug="epub-done-continue", is_published=True
+        )
+        FileReadingProgress.objects.create(
+            user=self.user,
+            story=done,
+            format=FileReadingProgress.FORMAT_EPUB,
+            progress=0.6,
+        )
+        StoryCompletion.objects.create(
+            user=self.user, story=done, source=StoryCompletion.SOURCE_CHAPTERS
+        )
+        self.client.force_authenticate(self.user)
+
+        response = self.client.get(reverse("auth-library-continue-reading"))
+
+        slugs = [row["story"]["slug"] for row in response.data["results"]]
+        self.assertNotIn("epub-done-continue", slugs)
+
     def _reader_with_in_progress_stories(self, email, count):
         user = User.objects.create_user(
             email=email, username=email.split("@")[0], password="test-password"
